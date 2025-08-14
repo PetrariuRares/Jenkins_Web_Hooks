@@ -98,8 +98,9 @@ pipeline {
 
                         def pythonFiles = ""
                         try {
+                            // Use direct PowerShell command without variables
                             pythonFiles = powershell(
-                                script: "if (Test-Path '${folderName}') { Get-ChildItem -Path '${folderName}' -Filter '*.py' -Recurse | Select-Object -ExpandProperty FullName }",
+                                script: "Get-ChildItem '${folderName}' -Filter '*.py' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName",
                                 returnStdout: true
                             ).trim()
                         } catch (Exception e) {
@@ -155,13 +156,14 @@ pipeline {
                         // Fallback: treat all Python files as changed for first commit or git issues
                         foldersWithPython.each { folderName ->
                             try {
+                                // Use direct PowerShell command without variables
                                 def pythonFiles = powershell(
-                                    script: "if (Test-Path '${folderName}') { Get-ChildItem -Path '${folderName}' -Filter '*.py' -Recurse | Select-Object -ExpandProperty FullName }",
+                                    script: "Get-ChildItem '${folderName}' -Filter '*.py' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName",
                                     returnStdout: true
                                 ).trim()
 
                                 if (pythonFiles && pythonFiles != "") {
-                                    def fileList = pythonFiles.split('\n').findAll { it.trim() && !it.contains('File Not Found') }
+                                    def fileList = pythonFiles.split('\n').findAll { it.trim() }
                                     fileList.each { file ->
                                         // Convert absolute path to relative path
                                         def relativePath = file.trim().replace(env.WORKSPACE + '\\', '').replace('\\', '/')
@@ -266,8 +268,9 @@ pipeline {
                         // First, check if this folder actually contains Python files
                         def hasPythonFiles = false
                         try {
+                            // Use direct PowerShell command without variables
                             def pythonCheck = powershell(
-                                script: "if (Test-Path '${folderName}') { if (Get-ChildItem -Path '${folderName}' -Filter '*.py' -Recurse) { 'FOUND' } else { 'NONE' } } else { 'NONE' }",
+                                script: "if (Get-ChildItem '${folderName}' -Filter '*.py' -Recurse -ErrorAction SilentlyContinue) { 'FOUND' } else { 'NONE' }",
                                 returnStdout: true
                             ).trim()
                             hasPythonFiles = (pythonCheck && pythonCheck.contains("FOUND"))
@@ -308,8 +311,9 @@ pipeline {
                         // Validate Python files in the folder (recursive scan)
                         def pythonFiles = ""
                         try {
+                            // Use direct PowerShell command without variables
                             pythonFiles = powershell(
-                                script: "if (Test-Path '${folderName}') { Get-ChildItem -Path '${folderName}' -Filter '*.py' -Recurse | Select-Object -ExpandProperty FullName }",
+                                script: "Get-ChildItem '${folderName}' -Filter '*.py' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName",
                                 returnStdout: true
                             ).trim()
                         } catch (Exception e) {
