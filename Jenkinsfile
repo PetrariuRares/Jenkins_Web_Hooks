@@ -16,7 +16,7 @@ pipeline {
         DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
         DOCKER_REPO = 'dockertest-docker'
 
-        // Artifactory credentials
+        // Artifactory credentials (update ID to match your Jenkins credentials)
         ARTIFACTORY_CREDS = credentials('artifactory-credentials')
 
         // Build configuration
@@ -83,7 +83,11 @@ pipeline {
                         echo "[SCANNING] Checking ${folderName}/ for Python files..."
 
                         def pythonFiles = powershell(
-                            script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path + '\\', '').Replace('\\', '/') }",
+                            script: """
+                                Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object {
+                                    \$_.FullName.Replace((Get-Location).Path + '\\', '').Replace('\\', '/')
+                                }
+                            """,
                             returnStdout: true
                         ).trim()
 
@@ -231,7 +235,11 @@ pipeline {
 
                         // Validate Python files in the folder (recursive scan)
                         def pythonFiles = powershell(
-                            script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path + '\\', '').Replace('\\', '/') }",
+                            script: """
+                                Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object {
+                                    \$_.FullName.Replace((Get-Location).Path + '\\', '').Replace('\\', '/')
+                                }
+                            """,
                             returnStdout: true
                         ).trim()
 
