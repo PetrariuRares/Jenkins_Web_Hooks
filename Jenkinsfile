@@ -166,16 +166,39 @@ pipeline {
 
                             if (gitDiff) {
                                 changedFiles = gitDiff.split('\r?\n')
-                                echo "[CHANGED_FILES] Found ${changedFiles.size()} changed files"
+                                echo "[CHANGED_FILES] Found ${changedFiles.size()} changed files:"
+                                
+                                // List all changed files
+                                changedFiles.each { file ->
+                                    echo "  - ${file}"
+                                }
 
-                                // Determine which folders have changes
+                                // Group changes by folder
+                                def changesByFolder = [:]
                                 changedFiles.each { file ->
                                     def parts = file.split('/')
                                     if (parts.length > 0) {
                                         def folder = parts[0]
+                                        if (!changesByFolder[folder]) {
+                                            changesByFolder[folder] = []
+                                        }
+                                        changesByFolder[folder].add(file)
+                                        
                                         if (pythonFolders.contains(folder) && !changedFolders.contains(folder)) {
                                             changedFolders.add(folder)
                                         }
+                                    }
+                                }
+                                
+                                // Display changes grouped by folder
+                                echo "\n[CHANGES_BY_FOLDER]:"
+                                changesByFolder.each { folder, files ->
+                                    echo "  ${folder}/ (${files.size()} files):"
+                                    files.each { file ->
+                                        def fileType = file.endsWith('.py') ? '[Python]' : 
+                                                      file.endsWith('Dockerfile') ? '[Docker]' :
+                                                      file.endsWith('requirements.txt') ? '[Requirements]' : '[Other]'
+                                        echo "    ${fileType} ${file}"
                                     }
                                 }
                             }
@@ -315,40 +338,53 @@ pipeline {
                     def folders = env.VALID_FOLDERS.split(',')
                     def isWindows = isUnix() ? false : true
 
-                    // Login to Artifactory
-                    if (isWindows) {
-                        bat "docker login ${env.DOCKER_REGISTRY} -u ${env.ARTIFACTORY_CREDS_USR} -p ${env.ARTIFACTORY_CREDS_PSW}"
-                    } else {
-                        sh "docker login ${env.DOCKER_REGISTRY} -u ${env.ARTIFACTORY_CREDS_USR} -p ${env.ARTIFACTORY_CREDS_PSW}"
-                    }
+                    // Login to Artifactory using secure credential handling
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        // Use password-stdin for security
+                        if (isWindows) {
+                            bat '''
+                                echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin
+                            '''
+                        } else {
+                            sh '''
+                                echo $ARTIFACTORY_PASS | docker login $DOCKER_REGISTRY -u $ARTIFACTORY_USER --password-stdin
+                            '''
+                        }
+                        
+                        echo "[LOGIN] Successfully logged into Artifactory"
 
-                    def pushJobs = [:]
+                        def pushJobs = [:]
 
-                    folders.each { folder ->
-                        pushJobs[folder] = {
-                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${folder}"
-                            def imageTag = "${env.BUILD_VERSION}-${env.COMMIT_HASH}"
+                        folders.each { folder ->
+                            pushJobs[folder] = {
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${folder}"
+                                def imageTag = "${env.BUILD_VERSION}-${env.COMMIT_HASH}"
 
-                            try {
-                                if (isWindows) {
-                                    bat "docker push ${imageName}:${imageTag}"
-                                    bat "docker push ${imageName}:latest"
-                                } else {
-                                    sh "docker push ${imageName}:${imageTag}"
-                                    sh "docker push ${imageName}:latest"
+                                try {
+                                    if (isWindows) {
+                                        bat "docker push ${imageName}:${imageTag}"
+                                        bat "docker push ${imageName}:latest"
+                                    } else {
+                                        sh "docker push ${imageName}:${imageTag}"
+                                        sh "docker push ${imageName}:latest"
+                                    }
+
+                                    echo "[SUCCESS] Pushed ${imageName}:${imageTag} and ${imageName}:latest"
+
+                                } catch (Exception e) {
+                                    echo "[ERROR] Failed to push ${folder}: ${e.message}"
+                                    throw e
                                 }
-
-                                echo "[SUCCESS] Pushed ${imageName}:${imageTag} and ${imageName}:latest"
-
-                            } catch (Exception e) {
-                                echo "[ERROR] Failed to push ${folder}: ${e.message}"
-                                throw e
                             }
                         }
-                    }
 
-                    // Execute pushes in parallel
-                    parallel pushJobs
+                        // Execute pushes in parallel
+                        parallel pushJobs
+                    }
 
                     // Logout
                     if (isWindows) {
