@@ -98,11 +98,31 @@ pipeline {
 
                         def pythonFiles = ""
                         try {
-                            // Use direct PowerShell command without variables
-                            pythonFiles = powershell(
-                                script: "Get-ChildItem '${folderName}' -Filter '*.py' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName",
-                                returnStdout: true
-                            ).trim()
+                            // Use Jenkins native approach - scan known patterns
+                            if (fileExists("${folderName}")) {
+                                // Check common Python file locations
+                                def foundFiles = []
+
+                                // Check root level Python files
+                                def rootFiles = findFiles(glob: "${folderName}/*.py")
+                                rootFiles.each { file ->
+                                    foundFiles.add(file.path)
+                                }
+
+                                // Check subdirectories for Python files
+                                def subFiles = findFiles(glob: "${folderName}/**/*.py")
+                                subFiles.each { file ->
+                                    foundFiles.add(file.path)
+                                }
+
+                                if (foundFiles.size() > 0) {
+                                    pythonFiles = foundFiles.join('\n')
+                                } else {
+                                    pythonFiles = ""
+                                }
+                            } else {
+                                pythonFiles = ""
+                            }
                         } catch (Exception e) {
                             // No Python files found or folder doesn't exist
                             pythonFiles = ""
@@ -156,18 +176,24 @@ pipeline {
                         // Fallback: treat all Python files as changed for first commit or git issues
                         foldersWithPython.each { folderName ->
                             try {
-                                // Use direct PowerShell command without variables
-                                def pythonFiles = powershell(
-                                    script: "Get-ChildItem '${folderName}' -Filter '*.py' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName",
-                                    returnStdout: true
-                                ).trim()
+                                // Use Jenkins native approach - scan known patterns
+                                if (fileExists("${folderName}")) {
+                                    def foundFiles = []
 
-                                if (pythonFiles && pythonFiles != "") {
-                                    def fileList = pythonFiles.split('\n').findAll { it.trim() }
-                                    fileList.each { file ->
-                                        // Convert absolute path to relative path
-                                        def relativePath = file.trim().replace(env.WORKSPACE + '\\', '').replace('\\', '/')
-                                        changedFiles.add(relativePath)
+                                    // Check root level Python files
+                                    def rootFiles = findFiles(glob: "${folderName}/*.py")
+                                    rootFiles.each { file ->
+                                        foundFiles.add(file.path)
+                                    }
+
+                                    // Check subdirectories for Python files
+                                    def subFiles = findFiles(glob: "${folderName}/**/*.py")
+                                    subFiles.each { file ->
+                                        foundFiles.add(file.path)
+                                    }
+
+                                    foundFiles.each { file ->
+                                        changedFiles.add(file.replace('\\', '/'))
                                     }
                                 }
                             } catch (Exception ex) {
@@ -268,12 +294,14 @@ pipeline {
                         // First, check if this folder actually contains Python files
                         def hasPythonFiles = false
                         try {
-                            // Use direct PowerShell command without variables
-                            def pythonCheck = powershell(
-                                script: "if (Get-ChildItem '${folderName}' -Filter '*.py' -Recurse -ErrorAction SilentlyContinue) { 'FOUND' } else { 'NONE' }",
-                                returnStdout: true
-                            ).trim()
-                            hasPythonFiles = (pythonCheck && pythonCheck.contains("FOUND"))
+                            // Use Jenkins native approach - check for Python files
+                            if (fileExists("${folderName}")) {
+                                def rootFiles = findFiles(glob: "${folderName}/*.py")
+                                def subFiles = findFiles(glob: "${folderName}/**/*.py")
+                                hasPythonFiles = (rootFiles.size() > 0 || subFiles.size() > 0)
+                            } else {
+                                hasPythonFiles = false
+                            }
                         } catch (Exception e) {
                             hasPythonFiles = false
                         }
@@ -311,11 +339,30 @@ pipeline {
                         // Validate Python files in the folder (recursive scan)
                         def pythonFiles = ""
                         try {
-                            // Use direct PowerShell command without variables
-                            pythonFiles = powershell(
-                                script: "Get-ChildItem '${folderName}' -Filter '*.py' -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName",
-                                returnStdout: true
-                            ).trim()
+                            // Use Jenkins native approach - scan known patterns
+                            if (fileExists("${folderName}")) {
+                                def foundFiles = []
+
+                                // Check root level Python files
+                                def rootFiles = findFiles(glob: "${folderName}/*.py")
+                                rootFiles.each { file ->
+                                    foundFiles.add(file.path)
+                                }
+
+                                // Check subdirectories for Python files
+                                def subFiles = findFiles(glob: "${folderName}/**/*.py")
+                                subFiles.each { file ->
+                                    foundFiles.add(file.path)
+                                }
+
+                                if (foundFiles.size() > 0) {
+                                    pythonFiles = foundFiles.join('\n')
+                                } else {
+                                    pythonFiles = ""
+                                }
+                            } else {
+                                pythonFiles = ""
+                            }
                         } catch (Exception e) {
                             // No Python files found or folder doesn't exist
                             pythonFiles = ""
