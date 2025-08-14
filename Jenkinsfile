@@ -13,8 +13,8 @@ pipeline {
         PYTHON_VERSION = '3.11'
 
         // Docker configuration
-        DOCKER_REGISTRY = 'your-artifactory-server.com:8082'
-        DOCKER_REPO = 'docker-local'
+        DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
+        DOCKER_REPO = 'dockertest-docker'
 
         // Artifactory credentials
         ARTIFACTORY_CREDS = credentials('artifactory-credentials')
@@ -23,9 +23,9 @@ pipeline {
         BUILD_VERSION = "${BUILD_NUMBER}"
         COMMIT_HASH = "${GIT_COMMIT.take(8)}"
 
-        // Multi-app configuration - will be auto-discovered
-        PREDEFINED_APP_FOLDERS = 'app1,app2,app3'
-        AUTO_DISCOVER_APPS = 'true'
+        // Universal folder discovery - no naming restrictions
+        DISCOVER_ALL_FOLDERS = 'true'
+        PYTHON_FILE_EXTENSIONS = '*.py'
     }
 
     stages {
@@ -58,33 +58,58 @@ pipeline {
             }
         }
         
-        stage('Discover and Detect App Changes') {
+        stage('Universal Folder Discovery') {
             steps {
                 script {
-                    echo "[DISCOVERY] Auto-discovering application folders..."
+                    echo "[DISCOVERY] Scanning repository for all folders with Python files..."
 
-                    // Auto-discover app folders
-                    def discoveredApps = []
-                    if (env.AUTO_DISCOVER_APPS == 'true') {
-                        def appDirs = powershell(
-                            script: 'Get-ChildItem -Directory | Where-Object { $_.Name -match "^app\\d+$" } | ForEach-Object { $_.Name }',
+                    // Discover ALL root-level folders (no naming restrictions)
+                    def allRootFolders = []
+                    def rootDirs = powershell(
+                        script: 'Get-ChildItem -Directory | ForEach-Object { $_.Name }',
+                        returnStdout: true
+                    ).trim()
+
+                    if (rootDirs) {
+                        allRootFolders = rootDirs.split('\n').findAll { it.trim() }
+                        echo "[ROOT_FOLDERS] Found ${allRootFolders.size()} root-level folders: ${allRootFolders.join(', ')}"
+                    } else {
+                        echo "[INFO] No root-level folders found in repository"
+                    }
+
+                    // Filter folders that contain Python files (at any depth)
+                    def foldersWithPython = []
+                    allRootFolders.each { folderName ->
+                        echo "[SCANNING] Checking ${folderName}/ for Python files..."
+
+                        def pythonFiles = powershell(
+                            script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path + '\\', '').Replace('\\', '/') }",
                             returnStdout: true
                         ).trim()
 
-                        if (appDirs) {
-                            discoveredApps = appDirs.split('\n').findAll { it.trim() }
-                            echo "[AUTO_DISCOVERED] Found app folders: ${discoveredApps.join(', ')}"
+                        if (pythonFiles) {
+                            def fileCount = pythonFiles.split('\n').findAll { it.trim() }.size()
+                            echo "[PYTHON_FOUND] ${folderName}: ${fileCount} Python files found"
+                            foldersWithPython.add(folderName)
+
+                            // Log some example files (first 3)
+                            def fileList = pythonFiles.split('\n').findAll { it.trim() }
+                            def displayFiles = fileList.take(3)
+                            displayFiles.each { file ->
+                                echo "[FILE] ${file}"
+                            }
+                            if (fileList.size() > 3) {
+                                echo "[FILES] ... and ${fileList.size() - 3} more Python files"
+                            }
+                        } else {
+                            echo "[NO_PYTHON] ${folderName}: No Python files found - skipping"
                         }
                     }
 
-                    // Combine predefined and discovered apps
-                    def predefinedApps = env.PREDEFINED_APP_FOLDERS.split(',')
-                    def allAppFolders = (predefinedApps + discoveredApps).unique()
+                    echo "[PYTHON_FOLDERS] Folders with Python files: ${foldersWithPython.join(', ')}"
+                    env.ALL_PYTHON_FOLDERS = foldersWithPython.join(',')
 
-                    echo "[MONITORING] All application folders: ${allAppFolders.join(', ')}"
-                    env.ALL_APP_FOLDERS = allAppFolders.join(',')
-
-                    echo "[DETECTION] Scanning for changes in application folders..."
+                    echo "[DETECTION] Scanning for changes in Python-containing folders..."
 
                     // Get list of changed files in the current commit
                     def output = bat(
@@ -93,92 +118,96 @@ pipeline {
                     ).trim()
                     def changedFiles = output.split('\n')
 
-                    // Define app folders to monitor
-                    def appFolders = allAppFolders
-                    def appsWithChanges = []
-                    def appChangeDetails = [:]
+                    // Check each Python folder for changes
+                    def pythonFolders = foldersWithPython
+                    def foldersWithChanges = []
+                    def folderChangeDetails = [:]
 
-                    // Check each app folder for changes
-                    appFolders.each { appFolder ->
-                        echo "[CHECKING] Scanning ${appFolder}/ for changes..."
+                    pythonFolders.each { folderName ->
+                        echo "[CHECKING] Scanning ${folderName}/ for changes..."
 
-                        // Find files changed in this app folder
-                        def appChangedFiles = changedFiles.findAll { file ->
-                            file.startsWith("${appFolder}/")
+                        // Find files changed in this folder (including all subfolders)
+                        def folderChangedFiles = changedFiles.findAll { file ->
+                            file.startsWith("${folderName}/")
                         }
 
-                        if (appChangedFiles.size() > 0) {
-                            echo "[CHANGES] Found ${appChangedFiles.size()} changed file(s) in ${appFolder}/"
-                            appsWithChanges.add(appFolder)
+                        if (folderChangedFiles.size() > 0) {
+                            echo "[CHANGES] Found ${folderChangedFiles.size()} changed file(s) in ${folderName}/"
+                            foldersWithChanges.add(folderName)
 
-                            // Categorize changes
-                            def pythonFiles = appChangedFiles.findAll { it.endsWith('.py') }
-                            def dockerfileChanged = appChangedFiles.any { it.endsWith('/Dockerfile') }
-                            def requirementsChanged = appChangedFiles.any { it.endsWith('/requirements.txt') }
+                            // Categorize changes (look for files at any depth)
+                            def pythonFiles = folderChangedFiles.findAll { it.endsWith('.py') }
+                            def dockerfileChanged = folderChangedFiles.any { it.endsWith('/Dockerfile') || it == "${folderName}/Dockerfile" }
+                            def requirementsChanged = folderChangedFiles.any { it.endsWith('/requirements.txt') || it == "${folderName}/requirements.txt" }
 
-                            appChangeDetails[appFolder] = [
+                            folderChangeDetails[folderName] = [
                                 python_files: pythonFiles,
                                 dockerfile_changed: dockerfileChanged,
                                 requirements_changed: requirementsChanged,
-                                all_files: appChangedFiles
+                                all_files: folderChangedFiles
                             ]
 
-                            echo "[PYTHON_FILES] ${appFolder}: ${pythonFiles.size()} Python files"
-                            echo "[DOCKER_CONFIG] ${appFolder}: Dockerfile changed: ${dockerfileChanged}"
-                            echo "[REQUIREMENTS] ${appFolder}: requirements.txt changed: ${requirementsChanged}"
+                            echo "[PYTHON_CHANGES] ${folderName}: ${pythonFiles.size()} Python files changed"
+                            echo "[DOCKER_CONFIG] ${folderName}: Dockerfile changed: ${dockerfileChanged}"
+                            echo "[REQUIREMENTS] ${folderName}: requirements.txt changed: ${requirementsChanged}"
 
-                            pythonFiles.each { file ->
-                                echo "[FILE] ${file}"
+                            // Show changed Python files (first 5)
+                            def displayFiles = pythonFiles.take(5)
+                            displayFiles.each { file ->
+                                echo "[CHANGED_FILE] ${file}"
+                            }
+                            if (pythonFiles.size() > 5) {
+                                echo "[MORE_FILES] ... and ${pythonFiles.size() - 5} more Python files changed"
                             }
                         } else {
-                            echo "[NO_CHANGES] No changes detected in ${appFolder}/"
+                            echo "[NO_CHANGES] No changes detected in ${folderName}/"
                         }
                     }
 
                     // Store results for next stages
-                    if (appsWithChanges.size() > 0) {
-                        env.APPS_WITH_CHANGES = appsWithChanges.join(',')
-                        env.NEEDS_MULTI_BUILD = 'true'
+                    if (foldersWithChanges.size() > 0) {
+                        env.FOLDERS_WITH_CHANGES = foldersWithChanges.join(',')
+                        env.NEEDS_PROCESSING = 'true'
 
-                        echo "[SUMMARY] Applications requiring rebuild:"
-                        appsWithChanges.each { app ->
-                            echo "[BUILD_REQUIRED] ${app}"
+                        echo "[SUMMARY] Folders requiring processing:"
+                        foldersWithChanges.each { folder ->
+                            echo "[PROCESSING_REQUIRED] ${folder}"
                         }
                     } else {
-                        echo "[INFO] No application folders have changes requiring rebuild"
-                        env.APPS_WITH_CHANGES = ''
-                        env.NEEDS_MULTI_BUILD = 'false'
+                        echo "[INFO] No Python folders have changes requiring processing"
+                        env.FOLDERS_WITH_CHANGES = ''
+                        env.NEEDS_PROCESSING = 'false'
                     }
 
                     // Store detailed change information as JSON for later stages
-                    def changeDetailsJson = groovy.json.JsonBuilder(appChangeDetails).toString()
-                    writeFile file: 'app_changes.json', text: changeDetailsJson
+                    def changeDetailsJson = groovy.json.JsonBuilder(folderChangeDetails).toString()
+                    writeFile file: 'folder_changes.json', text: changeDetailsJson
 
-                    echo "[STORED] Change details saved for build stages"
+                    echo "[STORED] Change details saved for processing stages"
                 }
             }
         }
         
-        stage('Validate and Filter Applications') {
+        stage('Validate and Filter Folders') {
             when {
-                environment name: 'NEEDS_MULTI_BUILD', value: 'true'
+                environment name: 'NEEDS_PROCESSING', value: 'true'
             }
             steps {
                 script {
-                    echo "[VALIDATION] Validating applications with changes..."
+                    echo "[VALIDATION] Validating folders with changes..."
 
-                    def appsToValidate = env.APPS_WITH_CHANGES.split(',')
-                    def validAppsForBuild = []
-                    def incompleteApps = []
+                    def foldersToValidate = env.FOLDERS_WITH_CHANGES.split(',')
+                    def validFoldersForBuild = []
+                    def incompleteFolders = []
 
-                    appsToValidate.each { appName ->
-                        echo "[VALIDATING] Application: ${appName}"
+                    foldersToValidate.each { folderName ->
+                        echo "[VALIDATING] Folder: ${folderName}"
 
                         def isValidForBuild = true
                         def validationIssues = []
 
-                        // Check if Dockerfile exists
-                        def dockerfilePath = "${appName}/Dockerfile"
+                        // Check if Dockerfile exists (at root of folder)
+                        def dockerfilePath = "${folderName}/Dockerfile"
                         if (fileExists(dockerfilePath)) {
                             echo "[DOCKERFILE] Found: ${dockerfilePath}"
                         } else {
@@ -187,33 +216,37 @@ pipeline {
                             isValidForBuild = false
                         }
 
-                        // Check if requirements.txt exists
-                        def requirementsPath = "${appName}/requirements.txt"
+                        // Check if requirements.txt exists (at root of folder)
+                        def requirementsPath = "${folderName}/requirements.txt"
                         if (fileExists(requirementsPath)) {
                             echo "[REQUIREMENTS] Found: ${requirementsPath}"
                             def reqContent = readFile(requirementsPath)
                             def reqLines = reqContent.split('\n').findAll { it.trim() }
-                            echo "[DEPENDENCIES] ${appName} has ${reqLines.size()} dependencies"
+                            echo "[DEPENDENCIES] ${folderName} has ${reqLines.size()} dependencies"
                         } else {
                             echo "[MISSING] requirements.txt not found: ${requirementsPath}"
                             validationIssues.add("Missing requirements.txt")
                             // Note: requirements.txt is optional, don't fail build
                         }
 
-                        // Validate Python files in the app
+                        // Validate Python files in the folder (recursive scan)
                         def pythonFiles = powershell(
-                            script: "Get-ChildItem -Path './${appName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path + '\\', '') }",
+                            script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path + '\\', '').Replace('\\', '/') }",
                             returnStdout: true
                         ).trim()
 
                         if (pythonFiles) {
                             def fileCount = 0
                             def syntaxErrors = []
+                            def fileList = pythonFiles.split('\n').findAll { it.trim() }
 
-                            pythonFiles.split('\n').each { file ->
+                            echo "[PYTHON_VALIDATION] ${folderName}: Validating ${fileList.size()} Python files..."
+
+                            // Validate syntax for first 10 files (to avoid overwhelming output)
+                            def filesToValidate = fileList.take(10)
+                            filesToValidate.each { file ->
                                 if (file.trim()) {
                                     fileCount++
-                                    echo "[PYTHON_FILE] ${file.trim()}"
 
                                     // Validate Python syntax (non-blocking)
                                     try {
@@ -226,44 +259,48 @@ pipeline {
                                 }
                             }
 
-                            echo "[VALIDATED] ${appName}: ${fileCount} Python files found"
+                            if (fileList.size() > 10) {
+                                echo "[INFO] Validated ${filesToValidate.size()} of ${fileList.size()} Python files (showing first 10)"
+                            }
+
+                            echo "[VALIDATED] ${folderName}: ${fileList.size()} Python files found across all subfolders"
 
                             if (syntaxErrors.size() > 0) {
-                                echo "[WARNING] ${appName} has ${syntaxErrors.size()} files with syntax errors"
+                                echo "[WARNING] ${folderName} has ${syntaxErrors.size()} files with syntax errors"
                                 validationIssues.add("Python syntax errors in ${syntaxErrors.size()} files")
                                 // Note: Syntax errors are warnings, not build blockers
                             }
                         } else {
-                            echo "[WARNING] No Python files found in ${appName}"
+                            echo "[WARNING] No Python files found in ${folderName}"
                             validationIssues.add("No Python files found")
                         }
 
-                        // Categorize app based on validation results
+                        // Categorize folder based on validation results
                         if (isValidForBuild) {
-                            validAppsForBuild.add(appName)
-                            echo "[READY_FOR_BUILD] ${appName} - Docker build will proceed"
+                            validFoldersForBuild.add(folderName)
+                            echo "[READY_FOR_BUILD] ${folderName} - Docker build will proceed"
                         } else {
-                            incompleteApps.add(appName)
-                            echo "[INCOMPLETE] ${appName} - Docker build will be skipped"
-                            echo "[ISSUES] ${appName}: ${validationIssues.join(', ')}"
+                            incompleteFolders.add(folderName)
+                            echo "[INCOMPLETE] ${folderName} - Docker build will be skipped"
+                            echo "[ISSUES] ${folderName}: ${validationIssues.join(', ')}"
                         }
                     }
 
                     // Store results for next stages
-                    env.VALID_APPS_FOR_BUILD = validAppsForBuild.join(',')
-                    env.INCOMPLETE_APPS = incompleteApps.join(',')
+                    env.VALID_FOLDERS_FOR_BUILD = validFoldersForBuild.join(',')
+                    env.INCOMPLETE_FOLDERS = incompleteFolders.join(',')
 
                     echo "[SUMMARY] Validation Results:"
-                    echo "[BUILD_READY] ${validAppsForBuild.size()} apps ready for Docker build: ${validAppsForBuild.join(', ')}"
-                    echo "[INCOMPLETE] ${incompleteApps.size()} apps with missing configuration: ${incompleteApps.join(', ')}"
+                    echo "[BUILD_READY] ${validFoldersForBuild.size()} folders ready for Docker build: ${validFoldersForBuild.join(', ')}"
+                    echo "[INCOMPLETE] ${incompleteFolders.size()} folders with missing configuration: ${incompleteFolders.join(', ')}"
 
-                    // Update build flag based on valid apps
-                    if (validAppsForBuild.size() > 0) {
-                        env.HAS_VALID_APPS_FOR_BUILD = 'true'
-                        echo "[PROCEED] Docker build will proceed for valid applications"
+                    // Update build flag based on valid folders
+                    if (validFoldersForBuild.size() > 0) {
+                        env.HAS_VALID_FOLDERS_FOR_BUILD = 'true'
+                        echo "[PROCEED] Docker build will proceed for valid folders"
                     } else {
-                        env.HAS_VALID_APPS_FOR_BUILD = 'false'
-                        echo "[SKIP] No applications are ready for Docker build"
+                        env.HAS_VALID_FOLDERS_FOR_BUILD = 'false'
+                        echo "[SKIP] No folders are ready for Docker build"
                     }
                 }
             }
@@ -272,45 +309,45 @@ pipeline {
         stage('Build Docker Images') {
             when {
                 allOf {
-                    environment name: 'NEEDS_MULTI_BUILD', value: 'true'
-                    environment name: 'HAS_VALID_APPS_FOR_BUILD', value: 'true'
+                    environment name: 'NEEDS_PROCESSING', value: 'true'
+                    environment name: 'HAS_VALID_FOLDERS_FOR_BUILD', value: 'true'
                 }
             }
             steps {
                 script {
-                    echo "[DOCKER] Building Docker images for validated applications..."
+                    echo "[DOCKER] Building Docker images for validated folders..."
 
-                    def appsToProcess = env.VALID_APPS_FOR_BUILD.split(',')
+                    def foldersToProcess = env.VALID_FOLDERS_FOR_BUILD.split(',')
                     def buildJobs = [:]
 
-                    if (env.INCOMPLETE_APPS && env.INCOMPLETE_APPS != '') {
-                        echo "[SKIPPING] Apps with incomplete configuration: ${env.INCOMPLETE_APPS}"
+                    if (env.INCOMPLETE_FOLDERS && env.INCOMPLETE_FOLDERS != '') {
+                        echo "[SKIPPING] Folders with incomplete configuration: ${env.INCOMPLETE_FOLDERS}"
                     }
 
-                    // Create parallel build jobs for each app
-                    appsToProcess.each { appName ->
-                        buildJobs[appName] = {
-                            echo "[BUILD_START] Building ${appName} Docker image..."
+                    // Create parallel build jobs for each folder
+                    foldersToProcess.each { folderName ->
+                        buildJobs[folderName] = {
+                            echo "[BUILD_START] Building ${folderName} Docker image..."
 
-                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${appName}"
+                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${folderName}"
                             def imageTag = "${env.BUILD_VERSION}-${env.COMMIT_HASH}"
 
                             try {
-                                // Build Docker image from app-specific Dockerfile
-                                bat "docker build -t ${imageName}:${imageTag} -f ${appName}/Dockerfile ${appName}/"
+                                // Build Docker image from folder-specific Dockerfile
+                                bat "docker build -t ${imageName}:${imageTag} -f ${folderName}/Dockerfile ${folderName}/"
                                 bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
 
-                                echo "[SUCCESS] ${appName} Docker image built successfully"
+                                echo "[SUCCESS] ${folderName} Docker image built successfully"
                                 echo "[IMAGE] ${imageName}:${imageTag}"
                                 echo "[IMAGE] ${imageName}:latest"
 
                                 // Store success status
-                                writeFile file: "${appName}_build_success.txt", text: "true"
+                                writeFile file: "${folderName}_build_success.txt", text: "true"
 
                             } catch (Exception e) {
-                                echo "[ERROR] ${appName} Docker build failed: ${e.message}"
-                                writeFile file: "${appName}_build_success.txt", text: "false"
-                                error("Docker build failed for ${appName}")
+                                echo "[ERROR] ${folderName} Docker build failed: ${e.message}"
+                                writeFile file: "${folderName}_build_success.txt", text: "false"
+                                error("Docker build failed for ${folderName}")
                             }
                         }
                     }
@@ -321,70 +358,11 @@ pipeline {
 
                     // Verify all builds succeeded
                     def allBuildsSuccessful = true
-                    appsToProcess.each { appName ->
-                        def buildStatus = readFile("${appName}_build_success.txt").trim()
+                    foldersToProcess.each { folderName ->
+                        def buildStatus = readFile("${folderName}_build_success.txt").trim()
                         if (buildStatus != 'true') {
                             allBuildsSuccessful = false
-                            echo "[FAILED] ${appName} build was not successful"
-                        }
-                    }
-
-                    env.ALL_BUILDS_SUCCESS = allBuildsSuccessful.toString()
-                    echo "[BUILD_RESULT] All builds successful: ${allBuildsSuccessful}"
-                }
-            }
-        }
-
-        stage('Build Docker Images') {
-            when {
-                environment name: 'NEEDS_MULTI_BUILD', value: 'true'
-            }
-            steps {
-                script {
-                    echo "[DOCKER] Building Docker images for changed applications..."
-
-                    def appsToProcess = env.APPS_WITH_CHANGES.split(',')
-                    def buildJobs = [:]
-
-                    // Create parallel build jobs for each app
-                    appsToProcess.each { appName ->
-                        buildJobs[appName] = {
-                            echo "[BUILD_START] Building ${appName} Docker image..."
-
-                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${appName}"
-                            def imageTag = "${env.BUILD_VERSION}-${env.COMMIT_HASH}"
-
-                            try {
-                                // Build Docker image from app-specific Dockerfile
-                                bat "docker build -t ${imageName}:${imageTag} -f ${appName}/Dockerfile ${appName}/"
-                                bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
-
-                                echo "[SUCCESS] ${appName} Docker image built successfully"
-                                echo "[IMAGE] ${imageName}:${imageTag}"
-                                echo "[IMAGE] ${imageName}:latest"
-
-                                // Store success status
-                                writeFile file: "${appName}_build_success.txt", text: "true"
-
-                            } catch (Exception e) {
-                                echo "[ERROR] ${appName} Docker build failed: ${e.message}"
-                                writeFile file: "${appName}_build_success.txt", text: "false"
-                                error("Docker build failed for ${appName}")
-                            }
-                        }
-                    }
-
-                    // Execute builds in parallel
-                    echo "[PARALLEL] Starting parallel Docker builds..."
-                    parallel buildJobs
-
-                    // Verify all builds succeeded
-                    def allBuildsSuccessful = true
-                    appsToProcess.each { appName ->
-                        def buildStatus = readFile("${appName}_build_success.txt").trim()
-                        if (buildStatus != 'true') {
-                            allBuildsSuccessful = false
-                            echo "[FAILED] ${appName} build was not successful"
+                            echo "[FAILED] ${folderName} build was not successful"
                         }
                     }
 
@@ -397,8 +375,8 @@ pipeline {
         stage('Push to Artifactory') {
             when {
                 allOf {
-                    environment name: 'NEEDS_MULTI_BUILD', value: 'true'
-                    environment name: 'HAS_VALID_APPS_FOR_BUILD', value: 'true'
+                    environment name: 'NEEDS_PROCESSING', value: 'true'
+                    environment name: 'HAS_VALID_FOLDERS_FOR_BUILD', value: 'true'
                     environment name: 'ALL_BUILDS_SUCCESS', value: 'true'
                 }
             }
@@ -406,7 +384,7 @@ pipeline {
                 script {
                     echo "[ARTIFACTORY] Pushing Docker images to Artifactory..."
 
-                    def appsToProcess = env.VALID_APPS_FOR_BUILD.split(',')
+                    def foldersToProcess = env.VALID_FOLDERS_FOR_BUILD.split(',')
                     def pushJobs = [:]
 
                     // Login to Artifactory once
@@ -416,12 +394,12 @@ pipeline {
                         """
                         echo "[LOGIN] Successfully logged into Artifactory"
 
-                        // Create parallel push jobs for each app
-                        appsToProcess.each { appName ->
-                            pushJobs[appName] = {
-                                echo "[PUSH_START] Pushing ${appName} to Artifactory..."
+                        // Create parallel push jobs for each folder
+                        foldersToProcess.each { folderName ->
+                            pushJobs[folderName] = {
+                                echo "[PUSH_START] Pushing ${folderName} to Artifactory..."
 
-                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${appName}"
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${folderName}"
                                 def imageTag = "${env.BUILD_VERSION}-${env.COMMIT_HASH}"
 
                                 try {
@@ -429,17 +407,17 @@ pipeline {
                                     bat "docker push ${imageName}:${imageTag}"
                                     bat "docker push ${imageName}:latest"
 
-                                    echo "[SUCCESS] ${appName} images pushed successfully"
+                                    echo "[SUCCESS] ${folderName} images pushed successfully"
                                     echo "[PUSHED] ${imageName}:${imageTag}"
                                     echo "[PUSHED] ${imageName}:latest"
 
                                     // Store push success status
-                                    writeFile file: "${appName}_push_success.txt", text: "true"
+                                    writeFile file: "${folderName}_push_success.txt", text: "true"
 
                                 } catch (Exception e) {
-                                    echo "[ERROR] ${appName} push failed: ${e.message}"
-                                    writeFile file: "${appName}_push_success.txt", text: "false"
-                                    error("Artifactory push failed for ${appName}")
+                                    echo "[ERROR] ${folderName} push failed: ${e.message}"
+                                    writeFile file: "${folderName}_push_success.txt", text: "false"
+                                    error("Artifactory push failed for ${folderName}")
                                 }
                             }
                         }
@@ -450,11 +428,11 @@ pipeline {
 
                         // Verify all pushes succeeded
                         def allPushesSuccessful = true
-                        appsToProcess.each { appName ->
-                            def pushStatus = readFile("${appName}_push_success.txt").trim()
+                        foldersToProcess.each { folderName ->
+                            def pushStatus = readFile("${folderName}_push_success.txt").trim()
                             if (pushStatus != 'true') {
                                 allPushesSuccessful = false
-                                echo "[FAILED] ${appName} push was not successful"
+                                echo "[FAILED] ${folderName} push was not successful"
                             }
                         }
 
@@ -485,25 +463,25 @@ pipeline {
                     echo "[AUTHOR] ${env.GIT_AUTHOR}"
                     echo "[MESSAGE] ${env.GIT_COMMIT_MSG}"
                     echo "[BUILD_NUMBER] ${env.BUILD_NUMBER}"
-                    echo "[MONITORED_APPS] ${env.ALL_APP_FOLDERS}"
+                    echo "[MONITORED_FOLDERS] ${env.ALL_PYTHON_FOLDERS}"
 
-                    if (env.NEEDS_MULTI_BUILD == 'true') {
-                        echo "[APPS_WITH_CHANGES] ${env.APPS_WITH_CHANGES}"
+                    if (env.NEEDS_PROCESSING == 'true') {
+                        echo "[FOLDERS_WITH_CHANGES] ${env.FOLDERS_WITH_CHANGES}"
 
-                        if (env.VALID_APPS_FOR_BUILD && env.VALID_APPS_FOR_BUILD != '') {
-                            echo "[APPS_BUILT] ${env.VALID_APPS_FOR_BUILD}"
-                            def appsProcessed = env.VALID_APPS_FOR_BUILD.split(',')
-                            appsProcessed.each { appName ->
-                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${appName}"
+                        if (env.VALID_FOLDERS_FOR_BUILD && env.VALID_FOLDERS_FOR_BUILD != '') {
+                            echo "[FOLDERS_BUILT] ${env.VALID_FOLDERS_FOR_BUILD}"
+                            def foldersProcessed = env.VALID_FOLDERS_FOR_BUILD.split(',')
+                            foldersProcessed.each { folderName ->
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${folderName}"
                                 def imageTag = "${env.BUILD_VERSION}-${env.COMMIT_HASH}"
 
-                                echo "[APP] ${appName}:"
+                                echo "[FOLDER] ${folderName}:"
                                 echo "  [IMAGE] ${imageName}:${imageTag}"
                                 echo "  [IMAGE] ${imageName}:latest"
 
                                 // Check build status
                                 try {
-                                    def buildStatus = readFile("${appName}_build_success.txt").trim()
+                                    def buildStatus = readFile("${folderName}_build_success.txt").trim()
                                     echo "  [BUILD_STATUS] ${buildStatus == 'true' ? 'SUCCESS' : 'FAILED'}"
                                 } catch (Exception e) {
                                     echo "  [BUILD_STATUS] UNKNOWN"
@@ -511,7 +489,7 @@ pipeline {
 
                                 // Check push status
                                 try {
-                                    def pushStatus = readFile("${appName}_push_success.txt").trim()
+                                    def pushStatus = readFile("${folderName}_push_success.txt").trim()
                                     echo "  [PUSH_STATUS] ${pushStatus == 'true' ? 'SUCCESS' : 'FAILED'}"
                                 } catch (Exception e) {
                                     echo "  [PUSH_STATUS] UNKNOWN"
@@ -519,9 +497,9 @@ pipeline {
                             }
 
                             if (env.ALL_BUILDS_SUCCESS == 'true') {
-                                echo "[OVERALL_BUILD] SUCCESS - All valid applications built successfully"
+                                echo "[OVERALL_BUILD] SUCCESS - All valid folders built successfully"
                             } else {
-                                echo "[OVERALL_BUILD] FAILED - Some applications failed to build"
+                                echo "[OVERALL_BUILD] FAILED - Some folders failed to build"
                             }
 
                             if (env.ALL_PUSHES_SUCCESS == 'true') {
@@ -530,21 +508,21 @@ pipeline {
                                 echo "[OVERALL_PUSH] FAILED - Some images failed to push"
                             }
                         } else {
-                            echo "[NO_VALID_APPS] No applications were ready for Docker build"
+                            echo "[NO_VALID_FOLDERS] No folders were ready for Docker build"
                         }
 
-                        // Report incomplete apps
-                        if (env.INCOMPLETE_APPS && env.INCOMPLETE_APPS != '') {
-                            echo "[INCOMPLETE_APPS] ${env.INCOMPLETE_APPS}"
-                            def incompleteApps = env.INCOMPLETE_APPS.split(',')
-                            incompleteApps.each { appName ->
-                                echo "[SKIPPED] ${appName} - Missing Docker configuration"
+                        // Report incomplete folders
+                        if (env.INCOMPLETE_FOLDERS && env.INCOMPLETE_FOLDERS != '') {
+                            echo "[INCOMPLETE_FOLDERS] ${env.INCOMPLETE_FOLDERS}"
+                            def incompleteFolders = env.INCOMPLETE_FOLDERS.split(',')
+                            incompleteFolders.each { folderName ->
+                                echo "[SKIPPED] ${folderName} - Missing Docker configuration"
                             }
-                            echo "[INFO] Add Dockerfile to incomplete apps to enable Docker builds"
+                            echo "[INFO] Add Dockerfile to incomplete folders to enable Docker builds"
                         }
                     } else {
-                        echo "[APP_CHANGES] NO - No application folders have changes"
-                        echo "[INFO] This commit doesn't affect any monitored application folders"
+                        echo "[FOLDER_CHANGES] NO - No Python folders have changes"
+                        echo "[INFO] This commit doesn't affect any folders containing Python files"
                         echo "[SKIPPED] Docker build and Artifactory push skipped"
                     }
 
