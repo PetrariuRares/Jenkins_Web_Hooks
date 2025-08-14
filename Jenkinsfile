@@ -494,27 +494,28 @@ pipeline {
                             echo "[APPS_BUILT] ${env.VALID_APPS_FOR_BUILD}"
                             def appsProcessed = env.VALID_APPS_FOR_BUILD.split(',')
                             appsProcessed.each { appName ->
-                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${appName}"
-                            def imageTag = "${env.BUILD_VERSION}-${env.COMMIT_HASH}"
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${appName}"
+                                def imageTag = "${env.BUILD_VERSION}-${env.COMMIT_HASH}"
 
-                            echo "[APP] ${appName}:"
-                            echo "  [IMAGE] ${imageName}:${imageTag}"
-                            echo "  [IMAGE] ${imageName}:latest"
+                                echo "[APP] ${appName}:"
+                                echo "  [IMAGE] ${imageName}:${imageTag}"
+                                echo "  [IMAGE] ${imageName}:latest"
 
-                            // Check build status
-                            try {
-                                def buildStatus = readFile("${appName}_build_success.txt").trim()
-                                echo "  [BUILD_STATUS] ${buildStatus == 'true' ? 'SUCCESS' : 'FAILED'}"
-                            } catch (Exception e) {
-                                echo "  [BUILD_STATUS] UNKNOWN"
-                            }
+                                // Check build status
+                                try {
+                                    def buildStatus = readFile("${appName}_build_success.txt").trim()
+                                    echo "  [BUILD_STATUS] ${buildStatus == 'true' ? 'SUCCESS' : 'FAILED'}"
+                                } catch (Exception e) {
+                                    echo "  [BUILD_STATUS] UNKNOWN"
+                                }
 
-                            // Check push status
-                            try {
-                                def pushStatus = readFile("${appName}_push_success.txt").trim()
-                                echo "  [PUSH_STATUS] ${pushStatus == 'true' ? 'SUCCESS' : 'FAILED'}"
-                            } catch (Exception e) {
-                                echo "  [PUSH_STATUS] UNKNOWN"
+                                // Check push status
+                                try {
+                                    def pushStatus = readFile("${appName}_push_success.txt").trim()
+                                    echo "  [PUSH_STATUS] ${pushStatus == 'true' ? 'SUCCESS' : 'FAILED'}"
+                                } catch (Exception e) {
+                                    echo "  [PUSH_STATUS] UNKNOWN"
+                                }
                             }
 
                             if (env.ALL_BUILDS_SUCCESS == 'true') {
