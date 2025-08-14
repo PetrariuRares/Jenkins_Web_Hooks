@@ -65,16 +65,21 @@ pipeline {
 
                     // Discover ALL root-level folders (no naming restrictions)
                     def allRootFolders = []
-                    def rootDirs = powershell(
-                        script: 'Get-ChildItem -Directory | ForEach-Object { $_.Name }',
-                        returnStdout: true
-                    ).trim()
+                    try {
+                        def rootDirs = bat(
+                            script: '@for /d %%i in (*) do @echo %%i',
+                            returnStdout: true
+                        ).trim()
 
-                    if (rootDirs) {
-                        allRootFolders = rootDirs.split('\n').findAll { it.trim() }
-                        echo "[ROOT_FOLDERS] Found ${allRootFolders.size()} root-level folders: ${allRootFolders.join(', ')}"
-                    } else {
-                        echo "[INFO] No root-level folders found in repository"
+                        if (rootDirs) {
+                            allRootFolders = rootDirs.split('\n').findAll { it.trim() }
+                            echo "[ROOT_FOLDERS] Found ${allRootFolders.size()} root-level folders: ${allRootFolders.join(', ')}"
+                        } else {
+                            echo "[INFO] No root-level folders found in repository"
+                        }
+                    } catch (Exception e) {
+                        echo "[WARNING] Could not scan for folders: ${e.message}"
+                        allRootFolders = []
                     }
 
                     // Filter folders that contain Python files (at any depth)
@@ -85,7 +90,7 @@ pipeline {
                         def pythonFiles = ""
                         try {
                             pythonFiles = bat(
-                                script: "dir /s /b ${folderName}\\*.py",
+                                script: "@echo off & for /r ${folderName} %%f in (*.py) do @echo %%f",
                                 returnStdout: true
                             ).trim()
                         } catch (Exception e) {
@@ -93,20 +98,24 @@ pipeline {
                             pythonFiles = ""
                         }
 
-                        if (pythonFiles) {
-                            def fileList = pythonFiles.split('\n').findAll { it.trim() }
-                            def fileCount = fileList.size()
-                            echo "[PYTHON_FOUND] ${folderName}: ${fileCount} Python files found"
-                            foldersWithPython.add(folderName)
+                        if (pythonFiles && pythonFiles != "") {
+                            def fileList = pythonFiles.split('\n').findAll { it.trim() && !it.contains('File Not Found') }
+                            if (fileList.size() > 0) {
+                                def fileCount = fileList.size()
+                                echo "[PYTHON_FOUND] ${folderName}: ${fileCount} Python files found"
+                                foldersWithPython.add(folderName)
 
-                            // Convert full paths to relative paths and log some example files (first 3)
-                            def displayFiles = fileList.take(3)
-                            displayFiles.each { file ->
-                                def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
-                                echo "[FILE] ${relativePath}"
-                            }
-                            if (fileList.size() > 3) {
-                                echo "[FILES] ... and ${fileList.size() - 3} more Python files"
+                                // Log some example files (first 3)
+                                def displayFiles = fileList.take(3)
+                                displayFiles.each { file ->
+                                    def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
+                                    echo "[FILE] ${relativePath}"
+                                }
+                                if (fileList.size() > 3) {
+                                    echo "[FILES] ... and ${fileList.size() - 3} more Python files"
+                                }
+                            } else {
+                                echo "[NO_PYTHON] ${folderName}: No Python files found - skipping"
                             }
                         } else {
                             echo "[NO_PYTHON] ${folderName}: No Python files found - skipping"
@@ -187,7 +196,7 @@ pipeline {
                     }
 
                     // Store detailed change information as JSON for later stages
-                    def changeDetailsJson = groovy.json.JsonBuilder(folderChangeDetails).toString()
+                    def changeDetailsJson = new groovy.json.JsonBuilder(folderChangeDetails).toString()
                     writeFile file: 'folder_changes.json', text: changeDetailsJson
 
                     echo "[STORED] Change details saved for processing stages"
@@ -240,7 +249,7 @@ pipeline {
                         def pythonFiles = ""
                         try {
                             pythonFiles = bat(
-                                script: "dir /s /b ${folderName}\\*.py",
+                                script: "@echo off & for /r ${folderName} %%f in (*.py) do @echo %%f",
                                 returnStdout: true
                             ).trim()
                         } catch (Exception e) {
@@ -248,40 +257,45 @@ pipeline {
                             pythonFiles = ""
                         }
 
-                        if (pythonFiles) {
-                            def fileCount = 0
-                            def syntaxErrors = []
-                            def fileList = pythonFiles.split('\n').findAll { it.trim() }
+                        if (pythonFiles && pythonFiles != "") {
+                            def fileList = pythonFiles.split('\n').findAll { it.trim() && !it.contains('File Not Found') }
+                            if (fileList.size() > 0) {
+                                def fileCount = 0
+                                def syntaxErrors = []
 
-                            echo "[PYTHON_VALIDATION] ${folderName}: Validating ${fileList.size()} Python files..."
+                                echo "[PYTHON_VALIDATION] ${folderName}: Validating ${fileList.size()} Python files..."
 
-                            // Validate syntax for first 10 files (to avoid overwhelming output)
-                            def filesToValidate = fileList.take(10)
-                            filesToValidate.each { file ->
-                                if (file.trim()) {
-                                    fileCount++
+                                // Validate syntax for first 5 files (to avoid overwhelming output)
+                                def filesToValidate = fileList.take(5)
+                                filesToValidate.each { file ->
+                                    if (file.trim()) {
+                                        fileCount++
 
-                                    // Validate Python syntax (non-blocking)
-                                    try {
-                                        bat(script: "@python -m py_compile \"${file.trim()}\" 2>&1", returnStdout: true)
-                                        echo "[SYNTAX_OK] ${file.trim()}"
-                                    } catch (Exception e) {
-                                        echo "[SYNTAX_ERROR] ${file.trim()}: ${e.message}"
-                                        syntaxErrors.add(file.trim())
+                                        // Validate Python syntax (non-blocking)
+                                        try {
+                                            bat(script: "@python -m py_compile \"${file.trim()}\" 2>nul", returnStdout: true)
+                                            echo "[SYNTAX_OK] ${file.trim().replace(env.WORKSPACE + '\\', '').replace('\\', '/')}"
+                                        } catch (Exception e) {
+                                            echo "[SYNTAX_ERROR] ${file.trim().replace(env.WORKSPACE + '\\', '').replace('\\', '/')}: ${e.message}"
+                                            syntaxErrors.add(file.trim())
+                                        }
                                     }
                                 }
-                            }
 
-                            if (fileList.size() > 10) {
-                                echo "[INFO] Validated ${filesToValidate.size()} of ${fileList.size()} Python files (showing first 10)"
-                            }
+                                if (fileList.size() > 5) {
+                                    echo "[INFO] Validated ${filesToValidate.size()} of ${fileList.size()} Python files (showing first 5)"
+                                }
 
-                            echo "[VALIDATED] ${folderName}: ${fileList.size()} Python files found across all subfolders"
+                                echo "[VALIDATED] ${folderName}: ${fileList.size()} Python files found across all subfolders"
 
-                            if (syntaxErrors.size() > 0) {
-                                echo "[WARNING] ${folderName} has ${syntaxErrors.size()} files with syntax errors"
-                                validationIssues.add("Python syntax errors in ${syntaxErrors.size()} files")
-                                // Note: Syntax errors are warnings, not build blockers
+                                if (syntaxErrors.size() > 0) {
+                                    echo "[WARNING] ${folderName} has ${syntaxErrors.size()} files with syntax errors"
+                                    validationIssues.add("Python syntax errors in ${syntaxErrors.size()} files")
+                                    // Note: Syntax errors are warnings, not build blockers
+                                }
+                            } else {
+                                echo "[WARNING] No Python files found in ${folderName}"
+                                validationIssues.add("No Python files found")
                             }
                         } else {
                             echo "[WARNING] No Python files found in ${folderName}"
