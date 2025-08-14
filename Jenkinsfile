@@ -99,7 +99,7 @@ pipeline {
                         def pythonFiles = ""
                         try {
                             pythonFiles = powershell(
-                                script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path, '.').Replace('\\\\', '/') }",
+                                script: "if (Test-Path '${folderName}') { Get-ChildItem -Path '${folderName}' -Filter '*.py' -Recurse | Select-Object -ExpandProperty FullName }",
                                 returnStdout: true
                             ).trim()
                         } catch (Exception e) {
@@ -156,14 +156,16 @@ pipeline {
                         foldersWithPython.each { folderName ->
                             try {
                                 def pythonFiles = powershell(
-                                    script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path, '.').Replace('\\\\', '/') }",
+                                    script: "if (Test-Path '${folderName}') { Get-ChildItem -Path '${folderName}' -Filter '*.py' -Recurse | Select-Object -ExpandProperty FullName }",
                                     returnStdout: true
                                 ).trim()
 
                                 if (pythonFiles && pythonFiles != "") {
                                     def fileList = pythonFiles.split('\n').findAll { it.trim() && !it.contains('File Not Found') }
                                     fileList.each { file ->
-                                        changedFiles.add(file.trim().replace('./', ''))
+                                        // Convert absolute path to relative path
+                                        def relativePath = file.trim().replace(env.WORKSPACE + '\\', '').replace('\\', '/')
+                                        changedFiles.add(relativePath)
                                     }
                                 }
                             } catch (Exception ex) {
@@ -265,10 +267,10 @@ pipeline {
                         def hasPythonFiles = false
                         try {
                             def pythonCheck = powershell(
-                                script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | Select-Object -First 1",
+                                script: "if (Test-Path '${folderName}') { if (Get-ChildItem -Path '${folderName}' -Filter '*.py' -Recurse) { 'FOUND' } else { 'NONE' } } else { 'NONE' }",
                                 returnStdout: true
                             ).trim()
-                            hasPythonFiles = (pythonCheck && pythonCheck != "")
+                            hasPythonFiles = (pythonCheck && pythonCheck.contains("FOUND"))
                         } catch (Exception e) {
                             hasPythonFiles = false
                         }
@@ -307,7 +309,7 @@ pipeline {
                         def pythonFiles = ""
                         try {
                             pythonFiles = powershell(
-                                script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path, '.').Replace('\\\\', '/') }",
+                                script: "if (Test-Path '${folderName}') { Get-ChildItem -Path '${folderName}' -Filter '*.py' -Recurse | Select-Object -ExpandProperty FullName }",
                                 returnStdout: true
                             ).trim()
                         } catch (Exception e) {
