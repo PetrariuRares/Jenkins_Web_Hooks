@@ -82,12 +82,8 @@ pipeline {
                     allRootFolders.each { folderName ->
                         echo "[SCANNING] Checking ${folderName}/ for Python files..."
 
-                        def pythonFiles = powershell(
-                            script: """
-                                Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object {
-                                    \$_.FullName.Replace((Get-Location).Path + '\\', '').Replace('\\', '/')
-                                }
-                            """,
+                        def pythonFiles = bat(
+                            script: "@powershell -Command \"Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path + '\\\\', '').Replace('\\\\', '/') }\"",
                             returnStdout: true
                         ).trim()
 
@@ -234,12 +230,8 @@ pipeline {
                         }
 
                         // Validate Python files in the folder (recursive scan)
-                        def pythonFiles = powershell(
-                            script: """
-                                Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object {
-                                    \$_.FullName.Replace((Get-Location).Path + '\\', '').Replace('\\', '/')
-                                }
-                            """,
+                        def pythonFiles = bat(
+                            script: "@powershell -Command \"Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path + '\\\\', '').Replace('\\\\', '/') }\"",
                             returnStdout: true
                         ).trim()
 
