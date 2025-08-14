@@ -89,8 +89,8 @@ pipeline {
 
                         def pythonFiles = ""
                         try {
-                            pythonFiles = bat(
-                                script: "dir \"${folderName}\" /s /b | findstr \\.py\$",
+                            pythonFiles = powershell(
+                                script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path, '.').Replace('\\\\', '/') }",
                                 returnStdout: true
                             ).trim()
                         } catch (Exception e) {
@@ -108,8 +108,7 @@ pipeline {
                                 // Log some example files (first 3)
                                 def displayFiles = fileList.take(3)
                                 displayFiles.each { file ->
-                                    def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
-                                    echo "[FILE] ${relativePath}"
+                                    echo "[FILE] ${file.trim()}"
                                 }
                                 if (fileList.size() > 3) {
                                     echo "[FILES] ... and ${fileList.size() - 3} more Python files"
@@ -225,8 +224,8 @@ pipeline {
                         // First, check if this folder actually contains Python files
                         def hasPythonFiles = false
                         try {
-                            def pythonCheck = bat(
-                                script: "dir \"${folderName}\" /s /b | findstr \\.py\$",
+                            def pythonCheck = powershell(
+                                script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | Select-Object -First 1",
                                 returnStdout: true
                             ).trim()
                             hasPythonFiles = (pythonCheck && pythonCheck != "")
@@ -267,8 +266,8 @@ pipeline {
                         // Validate Python files in the folder (recursive scan)
                         def pythonFiles = ""
                         try {
-                            pythonFiles = bat(
-                                script: "dir \"${folderName}\" /s /b | findstr \\.py\$",
+                            pythonFiles = powershell(
+                                script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path, '.').Replace('\\\\', '/') }",
                                 returnStdout: true
                             ).trim()
                         } catch (Exception e) {
