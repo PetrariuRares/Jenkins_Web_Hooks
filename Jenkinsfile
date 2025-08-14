@@ -90,7 +90,7 @@ pipeline {
                         def pythonFiles = ""
                         try {
                             pythonFiles = bat(
-                                script: "@echo off & for /r ${folderName} %%f in (*.py) do @echo %%f",
+                                script: "dir \"${folderName}\" /s /b | findstr \\.py\$",
                                 returnStdout: true
                             ).trim()
                         } catch (Exception e) {
@@ -134,12 +134,12 @@ pipeline {
                     ).trim()
                     def changedFiles = output.split('\n')
 
-                    // Check each Python folder for changes
-                    def pythonFolders = foldersWithPython
+                    // Check ALL folders for changes (not just ones with existing Python files)
+                    def allFolders = allRootFolders
                     def foldersWithChanges = []
                     def folderChangeDetails = [:]
 
-                    pythonFolders.each { folderName ->
+                    allFolders.each { folderName ->
                         echo "[CHECKING] Scanning ${folderName}/ for changes..."
 
                         // Find files changed in this folder (including all subfolders)
@@ -222,6 +222,25 @@ pipeline {
                         def isValidForBuild = true
                         def validationIssues = []
 
+                        // First, check if this folder actually contains Python files
+                        def hasPythonFiles = false
+                        try {
+                            def pythonCheck = bat(
+                                script: "dir \"${folderName}\" /s /b | findstr \\.py\$",
+                                returnStdout: true
+                            ).trim()
+                            hasPythonFiles = (pythonCheck && pythonCheck != "")
+                        } catch (Exception e) {
+                            hasPythonFiles = false
+                        }
+
+                        if (!hasPythonFiles) {
+                            echo "[SKIP] ${folderName}: No Python files found - skipping validation"
+                            return // Skip this folder
+                        }
+
+                        echo "[PYTHON_CONFIRMED] ${folderName}: Contains Python files - proceeding with validation"
+
                         // Check if Dockerfile exists (at root of folder)
                         def dockerfilePath = "${folderName}/Dockerfile"
                         if (fileExists(dockerfilePath)) {
@@ -249,7 +268,7 @@ pipeline {
                         def pythonFiles = ""
                         try {
                             pythonFiles = bat(
-                                script: "@echo off & for /r ${folderName} %%f in (*.py) do @echo %%f",
+                                script: "dir \"${folderName}\" /s /b | findstr \\.py\$",
                                 returnStdout: true
                             ).trim()
                         } catch (Exception e) {
