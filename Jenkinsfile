@@ -36,20 +36,29 @@ pipeline {
 
                 // Get commit information
                 script {
-                    env.GIT_COMMIT_MSG = bat(
-                        script: '@git log -1 --pretty=%%B',
-                        returnStdout: true
-                    ).trim()
+                    try {
+                        env.GIT_COMMIT_MSG = bat(
+                            script: '@git log -1 --pretty=%%B',
+                            returnStdout: true
+                        ).trim()
 
-                    env.GIT_AUTHOR = bat(
-                        script: '@git log -1 --pretty=%%an',
-                        returnStdout: true
-                    ).trim()
+                        env.GIT_AUTHOR = bat(
+                            script: '@git log -1 --pretty=%%an',
+                            returnStdout: true
+                        ).trim()
 
-                    env.GIT_COMMIT_HASH = bat(
-                        script: '@git rev-parse HEAD',
-                        returnStdout: true
-                    ).trim()
+                        env.GIT_COMMIT_HASH = bat(
+                            script: '@git rev-parse HEAD',
+                            returnStdout: true
+                        ).trim()
+
+                        echo "[GIT_INFO] Successfully retrieved git commit information"
+                    } catch (Exception e) {
+                        echo "[GIT_WARNING] Could not retrieve git information: ${e.message}"
+                        env.GIT_COMMIT_MSG = "Git information unavailable"
+                        env.GIT_AUTHOR = "Unknown"
+                        env.GIT_COMMIT_HASH = "unknown-${BUILD_NUMBER}"
+                    }
                 }
 
                 echo "[COMMIT] ${env.GIT_COMMIT_HASH}"
@@ -127,11 +136,42 @@ pipeline {
                     echo "[DETECTION] Scanning for changes in Python-containing folders..."
 
                     // Get list of changed files in the current commit
-                    def output = bat(
-                        script: '@git diff-tree --no-commit-id --name-only -r HEAD',
-                        returnStdout: true
-                    ).trim()
-                    def changedFiles = output.split('\n')
+                    def changedFiles = []
+                    try {
+                        def output = bat(
+                            script: '@git diff-tree --no-commit-id --name-only -r HEAD',
+                            returnStdout: true
+                        ).trim()
+
+                        if (output && output != "") {
+                            changedFiles = output.split('\n').findAll { it.trim() }
+                        }
+
+                        echo "[GIT_CHANGES] Found ${changedFiles.size()} changed files in commit"
+                    } catch (Exception e) {
+                        echo "[GIT_WARNING] Could not get git diff (possibly first commit): ${e.message}"
+                        echo "[FALLBACK] Will process all folders with Python files"
+
+                        // Fallback: treat all Python files as changed for first commit or git issues
+                        foldersWithPython.each { folderName ->
+                            try {
+                                def pythonFiles = powershell(
+                                    script: "Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path, '.').Replace('\\\\', '/') }",
+                                    returnStdout: true
+                                ).trim()
+
+                                if (pythonFiles && pythonFiles != "") {
+                                    def fileList = pythonFiles.split('\n').findAll { it.trim() && !it.contains('File Not Found') }
+                                    fileList.each { file ->
+                                        changedFiles.add(file.trim().replace('./', ''))
+                                    }
+                                }
+                            } catch (Exception ex) {
+                                echo "[WARNING] Could not scan ${folderName}: ${ex.message}"
+                            }
+                        }
+                        echo "[FALLBACK_RESULT] Treating ${changedFiles.size()} Python files as changed"
+                    }
 
                     // Check ALL folders for changes (not just ones with existing Python files)
                     def allFolders = allRootFolders

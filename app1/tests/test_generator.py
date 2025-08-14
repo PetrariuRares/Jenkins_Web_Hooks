@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test suite for App1 Excel Generator Test Test
+Test suite for App1 Excel Generator Test
 """
 
 import unittest
