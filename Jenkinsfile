@@ -83,20 +83,21 @@ pipeline {
                         echo "[SCANNING] Checking ${folderName}/ for Python files..."
 
                         def pythonFiles = bat(
-                            script: "@powershell -Command \"Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path + '\\\\', '').Replace('\\\\', '/') }\"",
+                            script: "@dir /s /b \"${folderName}\\*.py\" 2>nul",
                             returnStdout: true
                         ).trim()
 
                         if (pythonFiles) {
-                            def fileCount = pythonFiles.split('\n').findAll { it.trim() }.size()
+                            def fileList = pythonFiles.split('\n').findAll { it.trim() }
+                            def fileCount = fileList.size()
                             echo "[PYTHON_FOUND] ${folderName}: ${fileCount} Python files found"
                             foldersWithPython.add(folderName)
 
-                            // Log some example files (first 3)
-                            def fileList = pythonFiles.split('\n').findAll { it.trim() }
+                            // Convert full paths to relative paths and log some example files (first 3)
                             def displayFiles = fileList.take(3)
                             displayFiles.each { file ->
-                                echo "[FILE] ${file}"
+                                def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
+                                echo "[FILE] ${relativePath}"
                             }
                             if (fileList.size() > 3) {
                                 echo "[FILES] ... and ${fileList.size() - 3} more Python files"
@@ -231,7 +232,7 @@ pipeline {
 
                         // Validate Python files in the folder (recursive scan)
                         def pythonFiles = bat(
-                            script: "@powershell -Command \"Get-ChildItem -Path './${folderName}' -Filter '*.py' -Recurse | ForEach-Object { \$_.FullName.Replace((Get-Location).Path + '\\\\', '').Replace('\\\\', '/') }\"",
+                            script: "@dir /s /b \"${folderName}\\*.py\" 2>nul",
                             returnStdout: true
                         ).trim()
 
