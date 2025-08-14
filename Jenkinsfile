@@ -82,10 +82,16 @@ pipeline {
                     allRootFolders.each { folderName ->
                         echo "[SCANNING] Checking ${folderName}/ for Python files..."
 
-                        def pythonFiles = bat(
-                            script: "@dir /s /b \"${folderName}\\*.py\" 2>nul",
-                            returnStdout: true
-                        ).trim()
+                        def pythonFiles = ""
+                        try {
+                            pythonFiles = bat(
+                                script: "dir /s /b ${folderName}\\*.py",
+                                returnStdout: true
+                            ).trim()
+                        } catch (Exception e) {
+                            // No Python files found or folder doesn't exist
+                            pythonFiles = ""
+                        }
 
                         if (pythonFiles) {
                             def fileList = pythonFiles.split('\n').findAll { it.trim() }
@@ -231,10 +237,16 @@ pipeline {
                         }
 
                         // Validate Python files in the folder (recursive scan)
-                        def pythonFiles = bat(
-                            script: "@dir /s /b \"${folderName}\\*.py\" 2>nul",
-                            returnStdout: true
-                        ).trim()
+                        def pythonFiles = ""
+                        try {
+                            pythonFiles = bat(
+                                script: "dir /s /b ${folderName}\\*.py",
+                                returnStdout: true
+                            ).trim()
+                        } catch (Exception e) {
+                            // No Python files found or folder doesn't exist
+                            pythonFiles = ""
+                        }
 
                         if (pythonFiles) {
                             def fileCount = 0
