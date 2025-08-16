@@ -74,12 +74,14 @@ pipeline {
                     } else {
                         echo "[CHECKOUT] Checking out from webhook trigger..."
                         checkout scm
-                        // Get branch name using a git command for reliability
+                        // *** FIX: More reliable branch name detection for detached HEAD scenarios ***
                         try {
-                             env.GIT_BRANCH_NAME = bat(
-                                script: '@git rev-parse --abbrev-ref HEAD',
+                             def branchOutput = bat(
+                                script: '@git branch -r --contains HEAD',
                                 returnStdout: true
                             ).trim()
+                            // The output might be like "  origin/main" or "* origin/feature/branch", so we clean it up
+                            env.GIT_BRANCH_NAME = branchOutput.split('\n')[0].replaceAll('^\\s*origin/', '').replaceAll('^\\*\\s*', '').trim()
                         } catch (e) {
                             echo "[ERROR] Could not determine branch name. Defaulting to 'unknown'."
                             env.GIT_BRANCH_NAME = 'unknown'
@@ -92,12 +94,10 @@ pipeline {
                             script: '@git rev-parse --short=8 HEAD',
                             returnStdout: true
                         ).trim()
-                        // *** FIX: Escaped '%' for Windows bat step ***
                         env.GIT_COMMIT_MSG = bat(
                             script: '@git log -1 --pretty=%%B',
                             returnStdout: true
                         ).trim()
-                        // *** FIX: Escaped '%' for Windows bat step ***
                         env.GIT_AUTHOR = bat(
                             script: '@git log -1 --pretty=%%an',
                             returnStdout: true
@@ -163,17 +163,18 @@ pipeline {
                         echo "[FORCE_BUILD] Building all applications"
                         changedApps = pythonApps
                     } else {
-                        // Use Jenkins' built-in changeSets for reliable change detection.
+                        // *** FIX: Correctly iterate through change sets to get affected paths ***
                         def changedFiles = []
                         if (currentBuild.changeSets.isEmpty()) {
                             echo "[INFO] No changesets found. This might be the first build. Building all apps."
                             changedApps = pythonApps
                         } else {
-                            for (int i = 0; i < currentBuild.changeSets.size(); i++) {
-                                def entries = currentBuild.changeSets[i].items
-                                for (int j = 0; j < entries.length; j++) {
-                                    def entry = entries[j]
-                                    changedFiles.add(entry.path)
+                            for (changeSet in currentBuild.changeSets) {
+                                for (entry in changeSet.items) {
+                                    // 'affectedPaths' is a collection of strings (the file paths)
+                                    for (path in entry.affectedPaths) {
+                                        changedFiles.add(path)
+                                    }
                                 }
                             }
                         }
