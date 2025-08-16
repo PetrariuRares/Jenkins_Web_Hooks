@@ -60,7 +60,7 @@ pipeline {
         stage('Checkout') {
             steps {
                 script {
-                    // Checkout the correct branch
+                    // If manual branch specified, checkout that branch
                     if (params.BRANCH_NAME) {
                         echo "[CHECKOUT] Checking out specified branch: ${params.BRANCH_NAME}"
                         checkout([
@@ -69,22 +69,37 @@ pipeline {
                             extensions: [],
                             userRemoteConfigs: scm.userRemoteConfigs
                         ])
-                        // Set the branch name from the parameter for consistency
                         env.GIT_BRANCH_NAME = params.BRANCH_NAME
                     } else {
                         echo "[CHECKOUT] Checking out from webhook trigger..."
                         checkout scm
-                        // *** FIX: More reliable branch name detection for detached HEAD scenarios ***
+                        
+                        // Get current branch name
                         try {
-                             def branchOutput = bat(
-                                script: '@git branch -r --contains HEAD',
+                            env.GIT_BRANCH_NAME = bat(
+                                script: '@git rev-parse --abbrev-ref HEAD',
                                 returnStdout: true
                             ).trim()
-                            // The output might be like "  origin/main" or "* origin/feature/branch", so we clean it up
-                            env.GIT_BRANCH_NAME = branchOutput.split('\n')[0].replaceAll('^\\s*origin/', '').replaceAll('^\\*\\s*', '').trim()
-                        } catch (e) {
-                            echo "[ERROR] Could not determine branch name. Defaulting to 'unknown'."
+                            
+                            // If HEAD is returned, try to get the actual branch name
+                            if (env.GIT_BRANCH_NAME == 'HEAD') {
+                                env.GIT_BRANCH_NAME = bat(
+                                    script: '@git branch -r --contains HEAD',
+                                    returnStdout: true
+                                ).trim()
+                                // Clean up the branch name (remove origin/ and any whitespace)
+                                env.GIT_BRANCH_NAME = env.GIT_BRANCH_NAME.replaceAll('.*origin/', '').trim()
+                            }
+                        } catch (Exception e) {
                             env.GIT_BRANCH_NAME = 'unknown'
+                        }
+                    }
+
+                    // Clean branch name (remove origin/ prefix if present)
+                    if (env.GIT_BRANCH_NAME.contains('/')) {
+                        def parts = env.GIT_BRANCH_NAME.split('/')
+                        if (parts[0] == 'origin') {
+                            env.GIT_BRANCH_NAME = parts[1..-1].join('/')
                         }
                     }
 
@@ -140,21 +155,42 @@ pipeline {
                     def pythonApps = []
                     def changedApps = []
 
-                    // Find all directories with a Dockerfile in the root
-                    def appDirs = bat(script: '@dir /b /ad', returnStdout: true).trim().split('\r?\n')
-                    appDirs.each { dir ->
-                        if (fileExists("${dir}/Dockerfile") && !dir.startsWith('.')) {
-                            pythonApps.add(dir)
+                    // Find all directories with Dockerfile
+                    def dockerfiles = ''
+                    try {
+                        dockerfiles = bat(
+                            script: '@dir /s /b Dockerfile 2>nul || exit 0',
+                            returnStdout: true
+                        ).trim()
+                    } catch (Exception e) {
+                        echo "[INFO] No Dockerfiles found in repository"
+                        dockerfiles = ''
+                    }
+
+                    if (dockerfiles) {
+                        dockerfiles.split('\r?\n').each { file ->
+                            if (file && file.trim()) {  // Check if line is not empty
+                                def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
+                                def parts = relativePath.split('/')
+                                // Only consider Dockerfiles in immediate subdirectories
+                                if (parts.length == 2 && parts[1] == 'Dockerfile') {
+                                    def appName = parts[0]
+                                    if (!appName.startsWith('.')) {
+                                        pythonApps.add(appName)
+                                    }
+                                }
+                            }
                         }
                     }
-                    
+
                     echo "[APPS] Found ${pythonApps.size()} applications: ${pythonApps.join(', ')}"
 
                     // Exit early if no applications found
-                    if (pythonApps.isEmpty()) {
+                    if (pythonApps.size() == 0) {
                         env.HAS_CHANGES = 'false'
                         env.NO_APPS = 'true'
                         echo "[INFO] No applications with Dockerfiles found in repository"
+                        echo "[INFO] Pipeline will complete without building any images"
                         return
                     }
 
@@ -163,40 +199,50 @@ pipeline {
                         echo "[FORCE_BUILD] Building all applications"
                         changedApps = pythonApps
                     } else {
-                        // *** FIX: Correctly iterate through change sets to get affected paths ***
-                        def changedFiles = []
-                        if (currentBuild.changeSets.isEmpty()) {
-                            echo "[INFO] No changesets found. This might be the first build. Building all apps."
-                            changedApps = pythonApps
-                        } else {
-                            for (changeSet in currentBuild.changeSets) {
-                                for (entry in changeSet.items) {
-                                    // 'affectedPaths' is a collection of strings (the file paths)
-                                    for (path in entry.affectedPaths) {
-                                        changedFiles.add(path)
-                                    }
-                                }
-                            }
-                        }
+                        // Check for changes
+                        try {
+                            def commitCount = bat(
+                                script: '@git rev-list --count HEAD',
+                                returnStdout: true
+                            ).trim()
 
-                        if (!changedFiles.isEmpty()) {
-                            echo "[CHANGED_FILES] ${changedFiles.size()} files changed:"
-                            changedFiles.each { file -> echo "  - ${file}" }
-                            
-                            // Determine which apps have changes
-                            changedFiles.each { file ->
-                                def parts = file.split('/')
-                                if (parts.length > 0) {
-                                    def app = parts[0]
-                                    if (pythonApps.contains(app) && !changedApps.contains(app)) {
-                                        changedApps.add(app)
+                            if (commitCount == '1') {
+                                echo "[FIRST_COMMIT] Building all applications"
+                                changedApps = pythonApps
+                            } else {
+                                // Get list of changed files
+                                def gitDiff = bat(
+                                    script: '@git diff --name-only HEAD~1 HEAD',
+                                    returnStdout: true
+                                ).trim()
+
+                                if (gitDiff) {
+                                    def changedFiles = gitDiff.split('\r?\n')
+                                    
+                                    echo "[CHANGED_FILES] ${changedFiles.size()} files changed:"
+                                    changedFiles.each { file ->
+                                        echo "  - ${file}"
+                                    }
+                                    
+                                    // Determine which apps have changes
+                                    changedFiles.each { file ->
+                                        def parts = file.split('/')
+                                        if (parts.length > 0) {
+                                            def app = parts[0]
+                                            if (pythonApps.contains(app) && !changedApps.contains(app)) {
+                                                changedApps.add(app)
+                                            }
+                                        }
                                     }
                                 }
                             }
+                        } catch (Exception e) {
+                            echo "[WARNING] Could not determine changes, building all applications"
+                            changedApps = pythonApps
                         }
                     }
 
-                    if (!changedApps.isEmpty()) {
+                    if (changedApps.size() > 0) {
                         env.APPS_TO_BUILD = changedApps.join(',')
                         env.HAS_CHANGES = 'true'
                         echo "[BUILD_LIST] Applications to build: ${env.APPS_TO_BUILD}"
@@ -210,7 +256,7 @@ pipeline {
 
         stage('Build Docker Images') {
             when {
-                expression { env.HAS_CHANGES == 'true' }
+                environment name: 'HAS_CHANGES', value: 'true'
             }
             steps {
                 script {
@@ -225,13 +271,15 @@ pipeline {
 
                             // Determine the tag based on environment and branch
                             def imageTag = ''
+                            
                             if (env.DEPLOY_ENV == 'latest') {
+                                // For latest, always use 'latest' tag
                                 imageTag = 'latest'
                             } else {
+                                // For dev, use the branch name as tag
                                 // Clean branch name for use as Docker tag
                                 def cleanBranchName = env.GIT_BRANCH_NAME
-                                    .replaceAll('/', '-') // Replace slashes first
-                                    .replaceAll('[^a-zA-Z0-9._-]', '') // Remove other invalid characters
+                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
                                     .toLowerCase()
                                 imageTag = cleanBranchName
                             }
@@ -239,6 +287,11 @@ pipeline {
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
 
                             try {
+                                // Create requirements.txt if it doesn't exist
+                                if (!fileExists("${app}/requirements.txt")) {
+                                    writeFile file: "${app}/requirements.txt", text: "# No dependencies\n"
+                                }
+
                                 // Build the Docker image
                                 bat "docker build -t ${imageName}:${imageTag} -f ${app}/Dockerfile ${app}/"
                                 
@@ -249,10 +302,11 @@ pipeline {
 
                             } catch (Exception e) {
                                 echo "[ERROR] Failed to build ${app}: ${e.message}"
-                                error "Build failed for ${app}"
+                                throw e
                             }
                         }
                     }
+
                     parallel buildJobs
                     env.BUILD_COMPLETE = 'true'
                 }
@@ -261,7 +315,7 @@ pipeline {
 
         stage('Push to Artifactory') {
             when {
-                expression { env.BUILD_COMPLETE == 'true' }
+                environment name: 'BUILD_COMPLETE', value: 'true'
             }
             steps {
                 script {
@@ -280,6 +334,7 @@ pipeline {
                         echo "[LOGIN] Successfully logged into Artifactory"
 
                         def pushJobs = [:]
+
                         apps.each { app ->
                             pushJobs[app] = {
                                 def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
@@ -294,10 +349,11 @@ pipeline {
                                     
                                 } catch (Exception e) {
                                     echo "[ERROR] Failed to push ${imageName}:${imageTag}: ${e.message}"
-                                    error "Push failed for ${app}"
+                                    throw e
                                 }
                             }
                         }
+
                         parallel pushJobs
                     }
 
@@ -307,23 +363,20 @@ pipeline {
             }
         }
 
-        stage('Cleanup') {
+        stage('Cleanup Temp Files') {
             when {
-                expression { env.BUILD_COMPLETE == 'true' }
+                environment name: 'BUILD_COMPLETE', value: 'true'
             }
             steps {
                 script {
-                    echo "[CLEANUP] Cleaning up local images and temporary files..."
+                    echo "[CLEANUP] Cleaning up temporary files..."
                     
                     try {
-                        // Remove dangling images
-                        bat 'docker image prune -f'
-                        
                         // Remove temporary tag files
                         bat 'del /Q *_tag.txt 2>nul || exit 0'
                         
                     } catch (Exception e) {
-                        echo "[WARNING] Cleanup failed: ${e.message}"
+                        echo "[WARNING] Temp file cleanup failed: ${e.message}"
                     }
                 }
             }
@@ -347,6 +400,7 @@ pipeline {
 
                     if (env.NO_APPS == 'true') {
                         echo "\nStatus: No applications with Dockerfiles found in repository"
+                        echo "Add applications with Dockerfiles to enable Docker builds"
                     } else if (env.HAS_CHANGES == 'true') {
                         echo "\nApplications Built and Pushed:"
                         def apps = env.APPS_TO_BUILD.split(',')
@@ -384,12 +438,92 @@ pipeline {
     post {
         always {
             echo "[PIPELINE] Completed"
+            
+            script {
+                echo "[DOCKER CLEANUP] Starting Docker cleanup..."
+                
+                try {
+                    // Stop and remove any running containers from this build
+                    def runningContainers = bat(
+                        script: '@docker ps -a -q --filter "label=jenkins.build=${BUILD_NUMBER}" 2>nul',
+                        returnStdout: true
+                    ).trim()
+                    
+                    if (runningContainers) {
+                        echo "[DOCKER CLEANUP] Stopping and removing containers..."
+                        bat "docker rm -f ${runningContainers}"
+                    }
+                    
+                    // Remove images that were built in this pipeline
+                    if (env.APPS_TO_BUILD) {
+                        echo "[DOCKER CLEANUP] Removing built images..."
+                        def apps = env.APPS_TO_BUILD.split(',')
+                        
+                        apps.each { app ->
+                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
+                            
+                            // Get the tag that was used
+                            def imageTag = ''
+                            if (fileExists("${app}_tag.txt")) {
+                                imageTag = readFile("${app}_tag.txt").trim()
+                            } else if (env.DEPLOY_ENV == 'latest') {
+                                imageTag = 'latest'
+                            } else {
+                                def cleanBranchName = env.GIT_BRANCH_NAME
+                                    .replaceAll('/', '-')
+                                    .replaceAll('[^a-zA-Z0-9._-]', '')
+                                    .toLowerCase()
+                                imageTag = cleanBranchName
+                            }
+                            
+                            try {
+                                echo "[DOCKER CLEANUP] Removing ${imageName}:${imageTag}"
+                                bat "docker rmi ${imageName}:${imageTag} 2>nul || exit 0"
+                            } catch (Exception e) {
+                                echo "[WARNING] Could not remove ${imageName}:${imageTag}"
+                            }
+                        }
+                    }
+                    
+                    // Remove all dangling images (untagged images)
+                    echo "[DOCKER CLEANUP] Removing dangling images..."
+                    bat 'docker image prune -f 2>nul || exit 0'
+                    
+                    // Optional: Remove all unused images (commented out as it might be too aggressive)
+                    // bat 'docker image prune -a -f --filter "until=24h" 2>nul || exit 0'
+                    
+                    // Clean up build cache to free space
+                    echo "[DOCKER CLEANUP] Cleaning Docker build cache..."
+                    bat 'docker builder prune -f --filter "until=24h" 2>nul || exit 0'
+                    
+                    // Remove temporary files
+                    echo "[DOCKER CLEANUP] Removing temporary files..."
+                    bat 'del /Q *_tag.txt 2>nul || exit 0'
+                    
+                    // Show remaining Docker images for debugging
+                    echo "[DOCKER CLEANUP] Remaining Docker images:"
+                    bat 'docker images --format "table {{.Repository}}:{{.Tag}}\\t{{.Size}}\\t{{.CreatedAt}}" 2>nul || echo No images found'
+                    
+                    echo "[DOCKER CLEANUP] Cleanup completed successfully"
+                    
+                } catch (Exception e) {
+                    echo "[ERROR] Docker cleanup failed: ${e.message}"
+                    echo "[INFO] Manual cleanup may be required"
+                }
+            }
         }
         success {
             echo "[SUCCESS] Pipeline executed successfully!"
+            script {
+                if (env.DEPLOY_ENV == 'latest') {
+                    echo "[NOTICE] Production deployment completed!"
+                    // Add notification here if needed (Slack, Email, etc.)
+                }
+            }
         }
         failure {
             echo "[FAILURE] Pipeline failed!"
+            // Add notification here if needed
         }
     }
 }
