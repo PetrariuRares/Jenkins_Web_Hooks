@@ -1,0 +1,374 @@
+pipeline {
+    agent any
+
+    parameters {
+        // Container execution parameters
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: 'latest',
+            description: 'Docker image tag to pull from JFrog Artifactory (latest, dev, etc.)'
+        )
+        string(
+            name: 'APP1_OUTPUT_FILE',
+            defaultValue: 'business_report.xlsx',
+            description: 'Output filename for App1 Excel generator'
+        )
+        string(
+            name: 'APP1_RECORDS',
+            defaultValue: '1000',
+            description: 'Number of records for App1 to generate'
+        )
+        choice(
+            name: 'APP1_FORMAT',
+            choices: ['business', 'financial', 'customer'],
+            description: 'Data format type for App1'
+        )
+        string(
+            name: 'APP1_SHEETS',
+            defaultValue: '3',
+            description: 'Number of Excel sheets for App1 to create'
+        )
+        string(
+            name: 'APP2_INPUT_FILE',
+            defaultValue: 'business_report.xlsx',
+            description: 'Input filename for App2 processor (should match App1 output)'
+        )
+        string(
+            name: 'APP2_ANALYSIS_TYPE',
+            defaultValue: 'full',
+            description: 'Analysis type for App2 (full, summary, charts)'
+        )
+        booleanParam(
+            name: 'CLEANUP_IMAGES',
+            defaultValue: true,
+            description: 'Remove Docker images after execution to save disk space'
+        )
+    }
+
+    environment {
+        // Docker configuration (same as existing Jenkinsfile)
+        DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
+        DOCKER_REPO = 'dockertest-docker'
+
+        // Artifactory credentials (same as existing Jenkinsfile)
+        ARTIFACTORY_CREDS = credentials('artifactory-credentials')
+
+        // Build configuration
+        BUILD_NUMBER = "${BUILD_NUMBER}"
+        TIMESTAMP = "${new Date().format('yyyyMMdd-HHmmss')}"
+        
+        // Container execution configuration
+        CONTAINER_TIMEOUT = '300' // 5 minutes timeout
+        MEMORY_LIMIT = '512m'
+        CPU_LIMIT = '1.0'
+        
+        // Workspace directories
+        OUTPUT_DIR = "${WORKSPACE}\\output"
+        INPUT_DIR = "${WORKSPACE}\\input"
+        REPORTS_DIR = "${WORKSPACE}\\reports"
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "CONTAINER EXECUTION PIPELINE"
+                    echo "========================================="
+                    echo "Build Number: ${BUILD_NUMBER}"
+                    echo "Image Tag: ${params.IMAGE_TAG}"
+                    echo "App1 Parameters:"
+                    echo "  - Output File: ${params.APP1_OUTPUT_FILE}"
+                    echo "  - Records: ${params.APP1_RECORDS}"
+                    echo "  - Format: ${params.APP1_FORMAT}"
+                    echo "  - Sheets: ${params.APP1_SHEETS}"
+                    echo "App2 Parameters:"
+                    echo "  - Input File: ${params.APP2_INPUT_FILE}"
+                    echo "  - Analysis Type: ${params.APP2_ANALYSIS_TYPE}"
+                    echo "Cleanup Images: ${params.CLEANUP_IMAGES}"
+                    echo "========================================="
+                    
+                    // Create workspace directories
+                    bat """
+                        if not exist "${OUTPUT_DIR}" mkdir "${OUTPUT_DIR}"
+                        if not exist "${INPUT_DIR}" mkdir "${INPUT_DIR}"
+                        if not exist "${REPORTS_DIR}" mkdir "${REPORTS_DIR}"
+                    """
+                    
+                    echo "[WORKSPACE] Created directories: output, input, reports"
+                }
+            }
+        }
+
+        stage('Docker Login') {
+            steps {
+                script {
+                    echo "[DOCKER] Logging into JFrog Artifactory..."
+                    
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
+                        echo "[LOGIN] Successfully logged into Artifactory"
+                    }
+                }
+            }
+        }
+
+        stage('Pull App1 Container') {
+            steps {
+                script {
+                    def app1Image = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/app1:${params.IMAGE_TAG}"
+                    
+                    echo "[PULL] Pulling App1 container: ${app1Image}"
+                    
+                    try {
+                        bat "docker pull ${app1Image}"
+                        echo "[SUCCESS] App1 container pulled successfully"
+                        env.APP1_IMAGE_PULLED = 'true'
+                    } catch (Exception e) {
+                        echo "[ERROR] Failed to pull App1 container: ${e.message}"
+                        throw e
+                    }
+                }
+            }
+        }
+
+        stage('Execute App1') {
+            when {
+                environment name: 'APP1_IMAGE_PULLED', value: 'true'
+            }
+            steps {
+                script {
+                    def app1Image = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/app1:${params.IMAGE_TAG}"
+                    def containerName = "app1-${BUILD_NUMBER}"
+                    
+                    echo "[EXECUTE] Running App1 container with parameters..."
+                    echo "[CONTAINER] Name: ${containerName}"
+                    echo "[PARAMETERS] --output ${params.APP1_OUTPUT_FILE} --records ${params.APP1_RECORDS} --format ${params.APP1_FORMAT} --sheets ${params.APP1_SHEETS}"
+                    
+                    try {
+                        timeout(time: Integer.parseInt(env.CONTAINER_TIMEOUT), unit: 'SECONDS') {
+                            bat """
+                                docker run --rm ^
+                                  -v "${OUTPUT_DIR}:/app/output" ^
+                                  -v "${INPUT_DIR}:/app/input" ^
+                                  --memory="${MEMORY_LIMIT}" ^
+                                  --cpus="${CPU_LIMIT}" ^
+                                  --name "${containerName}" ^
+                                  ${app1Image} ^
+                                  python src/excel_generator.py --output "${params.APP1_OUTPUT_FILE}" --records ${params.APP1_RECORDS} --format ${params.APP1_FORMAT} --sheets ${params.APP1_SHEETS}
+                            """
+                        }
+                        
+                        echo "[SUCCESS] App1 execution completed successfully"
+                        env.APP1_EXECUTION_SUCCESS = 'true'
+                        
+                        // Verify output file was created
+                        if (fileExists("${OUTPUT_DIR}\\${params.APP1_OUTPUT_FILE}")) {
+                            echo "[VERIFICATION] App1 output file created: ${params.APP1_OUTPUT_FILE}"
+                        } else {
+                            echo "[WARNING] App1 output file not found: ${params.APP1_OUTPUT_FILE}"
+                        }
+                        
+                    } catch (Exception e) {
+                        echo "[ERROR] App1 execution failed: ${e.message}"
+                        
+                        // Try to get container logs for debugging
+                        try {
+                            bat "docker logs ${containerName} 2>nul || echo No container logs available"
+                        } catch (Exception logError) {
+                            echo "[WARNING] Could not retrieve container logs"
+                        }
+                        
+                        throw e
+                    }
+                }
+            }
+        }
+
+        stage('Pull App2 Container') {
+            steps {
+                script {
+                    def app2Image = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/app2:${params.IMAGE_TAG}"
+                    
+                    echo "[PULL] Pulling App2 container: ${app2Image}"
+                    
+                    try {
+                        bat "docker pull ${app2Image}"
+                        echo "[SUCCESS] App2 container pulled successfully"
+                        env.APP2_IMAGE_PULLED = 'true'
+                    } catch (Exception e) {
+                        echo "[ERROR] Failed to pull App2 container: ${e.message}"
+                        throw e
+                    }
+                }
+            }
+        }
+
+        stage('Execute App2') {
+            when {
+                allOf {
+                    environment name: 'APP2_IMAGE_PULLED', value: 'true'
+                    environment name: 'APP1_EXECUTION_SUCCESS', value: 'true'
+                }
+            }
+            steps {
+                script {
+                    def app2Image = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/app2:${params.IMAGE_TAG}"
+                    def containerName = "app2-${BUILD_NUMBER}"
+                    
+                    echo "[EXECUTE] Running App2 container with parameters..."
+                    echo "[CONTAINER] Name: ${containerName}"
+                    echo "[PARAMETERS] --input ${params.APP2_INPUT_FILE} --analysis ${params.APP2_ANALYSIS_TYPE}"
+                    
+                    // Copy App1 output to App2 input directory
+                    if (fileExists("${OUTPUT_DIR}\\${params.APP1_OUTPUT_FILE}")) {
+                        bat "copy \"${OUTPUT_DIR}\\${params.APP1_OUTPUT_FILE}\" \"${INPUT_DIR}\\${params.APP2_INPUT_FILE}\""
+                        echo "[TRANSFER] Copied App1 output to App2 input directory"
+                    }
+                    
+                    try {
+                        timeout(time: Integer.parseInt(env.CONTAINER_TIMEOUT), unit: 'SECONDS') {
+                            bat """
+                                docker run --rm ^
+                                  -v "${OUTPUT_DIR}:/app/output" ^
+                                  -v "${INPUT_DIR}:/app/input" ^
+                                  -v "${REPORTS_DIR}:/app/reports" ^
+                                  --memory="${MEMORY_LIMIT}" ^
+                                  --cpus="${CPU_LIMIT}" ^
+                                  --name "${containerName}" ^
+                                  ${app2Image} ^
+                                  python processor_main.py --input "${params.APP2_INPUT_FILE}" --analysis ${params.APP2_ANALYSIS_TYPE}
+                            """
+                        }
+                        
+                        echo "[SUCCESS] App2 execution completed successfully"
+                        env.APP2_EXECUTION_SUCCESS = 'true'
+                        
+                    } catch (Exception e) {
+                        echo "[ERROR] App2 execution failed: ${e.message}"
+                        
+                        // Try to get container logs for debugging
+                        try {
+                            bat "docker logs ${containerName} 2>nul || echo No container logs available"
+                        } catch (Exception logError) {
+                            echo "[WARNING] Could not retrieve container logs"
+                        }
+                        
+                        throw e
+                    }
+                }
+            }
+        }
+
+        stage('Summary') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "EXECUTION SUMMARY"
+                    echo "========================================="
+                    echo "Timestamp: ${env.TIMESTAMP}"
+                    echo "Build Number: ${BUILD_NUMBER}"
+                    echo ""
+                    
+                    if (env.APP1_EXECUTION_SUCCESS == 'true') {
+                        echo "✓ App1 (Excel Generator): SUCCESS"
+                        echo "  - Container: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/app1:${params.IMAGE_TAG}"
+                        echo "  - Output: ${params.APP1_OUTPUT_FILE}"
+                        echo "  - Records Generated: ${params.APP1_RECORDS}"
+                    } else {
+                        echo "✗ App1 (Excel Generator): FAILED"
+                    }
+                    
+                    if (env.APP2_EXECUTION_SUCCESS == 'true') {
+                        echo "✓ App2 (Excel Processor): SUCCESS"
+                        echo "  - Container: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/app2:${params.IMAGE_TAG}"
+                        echo "  - Input: ${params.APP2_INPUT_FILE}"
+                        echo "  - Analysis: ${params.APP2_ANALYSIS_TYPE}"
+                    } else {
+                        echo "✗ App2 (Excel Processor): FAILED OR SKIPPED"
+                    }
+                    
+                    echo ""
+                    echo "Output Files Location: ${OUTPUT_DIR}"
+                    echo "Reports Location: ${REPORTS_DIR}"
+                    echo "========================================="
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo "[CLEANUP] Starting Docker resource cleanup..."
+                
+                // Stop and remove any running containers
+                try {
+                    bat """
+                        for /f "tokens=*" %%i in ('docker ps -q --filter "name=app1-${BUILD_NUMBER}"') do docker stop %%i 2>nul
+                        for /f "tokens=*" %%i in ('docker ps -q --filter "name=app2-${BUILD_NUMBER}"') do docker stop %%i 2>nul
+                        for /f "tokens=*" %%i in ('docker ps -aq --filter "name=app1-${BUILD_NUMBER}"') do docker rm %%i 2>nul
+                        for /f "tokens=*" %%i in ('docker ps -aq --filter "name=app2-${BUILD_NUMBER}"') do docker rm %%i 2>nul
+                    """
+                    echo "[CLEANUP] Containers cleaned up"
+                } catch (Exception e) {
+                    echo "[WARNING] Container cleanup had issues: ${e.message}"
+                }
+                
+                // Remove Docker images if requested
+                if (params.CLEANUP_IMAGES) {
+                    try {
+                        def app1Image = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/app1:${params.IMAGE_TAG}"
+                        def app2Image = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/app2:${params.IMAGE_TAG}"
+                        
+                        bat """
+                            docker rmi ${app1Image} 2>nul || echo App1 image already removed
+                            docker rmi ${app2Image} 2>nul || echo App2 image already removed
+                        """
+                        echo "[CLEANUP] Docker images removed"
+                    } catch (Exception e) {
+                        echo "[WARNING] Image cleanup had issues: ${e.message}"
+                    }
+                }
+                
+                // Clean up dangling volumes and networks
+                try {
+                    bat """
+                        docker volume prune -f 2>nul || echo No volumes to prune
+                        docker network prune -f 2>nul || echo No networks to prune
+                    """
+                    echo "[CLEANUP] Dangling resources cleaned up"
+                } catch (Exception e) {
+                    echo "[WARNING] Resource cleanup had issues: ${e.message}"
+                }
+                
+                echo "[CLEANUP] Docker cleanup completed"
+            }
+        }
+        
+        success {
+            echo "[RESULT] Pipeline completed successfully! 🎉"
+        }
+        
+        failure {
+            echo "[RESULT] Pipeline failed! Check logs for details. ❌"
+        }
+        
+        cleanup {
+            // Archive output files as artifacts
+            script {
+                try {
+                    archiveArtifacts artifacts: 'output/**/*', allowEmptyArchive: true
+                    archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true
+                    echo "[ARCHIVE] Output files archived as build artifacts"
+                } catch (Exception e) {
+                    echo "[WARNING] Could not archive artifacts: ${e.message}"
+                }
+            }
+        }
+    }
+}
