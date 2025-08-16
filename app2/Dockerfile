@@ -1,7 +1,7 @@
 # Excel Data Processor Application
 # Specialized container for processing and analyzing Excel files
 
-FROM python:3.11-slim
+FROM trialqlk1tc.jfrog.io/dockertest-docker/python-base:3.11
 
 # Set working directory
 WORKDIR /app

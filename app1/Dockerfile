@@ -1,16 +1,11 @@
 # Excel Data Generator Application
 # Specialized container for generating Excel files with business data
 
-FROM python:3.11-slim
+FROM trialqlk1tc.jfrog.io/dockertest-docker/python-base:3.11
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies for Excel processing
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
 COPY requirements.txt .
