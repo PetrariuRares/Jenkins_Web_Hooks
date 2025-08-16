@@ -1,17 +1,31 @@
 pipeline {
     agent any
 
+    parameters {
+        // Manual trigger parameters
+        string(
+            name: 'BRANCH_NAME',
+            defaultValue: '',
+            description: 'Branch to build (leave empty for automatic detection from webhook)'
+        )
+        choice(
+            name: 'DEPLOY_TARGET',
+            choices: ['auto', 'latest', 'dev'],
+            description: 'Where to deploy (auto = based on branch, latest = production, dev = development)'
+        )
+        booleanParam(
+            name: 'FORCE_BUILD',
+            defaultValue: false,
+            description: 'Force build all applications even if no changes detected'
+        )
+    }
+
     triggers {
-        // GitHub webhook trigger for main branch
+        // GitHub webhook trigger
         githubPush()
-        // Backup: Poll SCM every 5 minutes (optional, remove if webhook works)
-        pollSCM('H/5 * * * *')
     }
 
     environment {
-        // Application configuration
-        PYTHON_VERSION = '3.11'
-
         // Docker configuration
         DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
         DOCKER_REPO = 'dockertest-docker'
@@ -20,254 +34,191 @@ pipeline {
         ARTIFACTORY_CREDS = credentials('artifactory-credentials')
 
         // Build configuration
-        BUILD_VERSION = "${BUILD_NUMBER}"
-        COMMIT_HASH = "${GIT_COMMIT ? GIT_COMMIT.take(8) : 'unknown'}"
+        BUILD_NUMBER = "${BUILD_NUMBER}"
+        TIMESTAMP = "${new Date().format('yyyyMMdd-HHmmss')}"
     }
 
     stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo "BUILD INITIALIZATION"
+                    echo "========================================="
+                    echo "Build Number: ${BUILD_NUMBER}"
+                    echo "Manual Branch Override: ${params.BRANCH_NAME ?: 'none'}"
+                    echo "Deploy Target: ${params.DEPLOY_TARGET}"
+                    echo "Force Build: ${params.FORCE_BUILD}"
+                    echo "========================================="
+                }
+            }
+        }
+
         stage('Checkout') {
             steps {
-                echo "[CHECKOUT] Checking out repository..."
-                checkout scm
-
                 script {
-                    // Get branch name
-                    env.GIT_BRANCH_NAME = env.GIT_BRANCH ? env.GIT_BRANCH.replaceAll('.*/', '') : 'unknown'
-                    echo "[BRANCH] Building from branch: ${env.GIT_BRANCH_NAME}"
-
-                    // Only proceed if on main branch
-                    if (env.GIT_BRANCH_NAME != 'main' && env.GIT_BRANCH_NAME != 'master') {
-                        echo "[SKIP] Not on main/master branch. Current branch: ${env.GIT_BRANCH_NAME}"
-                        env.SKIP_BUILD = 'true'
+                    // If manual branch specified, checkout that branch
+                    if (params.BRANCH_NAME) {
+                        echo "[CHECKOUT] Checking out specified branch: ${params.BRANCH_NAME}"
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: "*/${params.BRANCH_NAME}"]],
+                            extensions: [],
+                            userRemoteConfigs: scm.userRemoteConfigs
+                        ])
+                        env.GIT_BRANCH_NAME = params.BRANCH_NAME
                     } else {
-                        env.SKIP_BUILD = 'false'
-                    }
-
-                    try {
-                        // Try Unix-style commands first (for Linux agents)
-                        env.GIT_COMMIT_MSG = sh(
-                            script: 'git log -1 --pretty=%B',
-                            returnStdout: true
-                        ).trim()
-                        env.GIT_AUTHOR = sh(
-                            script: 'git log -1 --pretty=%an',
-                            returnStdout: true
-                        ).trim()
-                        env.GIT_COMMIT_HASH = sh(
-                            script: 'git rev-parse HEAD',
-                            returnStdout: true
-                        ).trim()
-                    } catch (Exception e) {
-                        // Fallback to Windows commands
+                        echo "[CHECKOUT] Checking out from webhook trigger..."
+                        checkout scm
+                        
+                        // Get current branch name
                         try {
-                            env.GIT_COMMIT_MSG = bat(
-                                script: '@git log -1 --pretty=%%B',
+                            env.GIT_BRANCH_NAME = bat(
+                                script: '@git rev-parse --abbrev-ref HEAD',
                                 returnStdout: true
                             ).trim()
-                            env.GIT_AUTHOR = bat(
-                                script: '@git log -1 --pretty=%%an',
-                                returnStdout: true
-                            ).trim()
-                            env.GIT_COMMIT_HASH = bat(
-                                script: '@git rev-parse HEAD',
-                                returnStdout: true
-                            ).trim()
-                        } catch (Exception e2) {
-                            echo "[WARNING] Could not retrieve git information"
-                            env.GIT_COMMIT_MSG = "Unknown"
-                            env.GIT_AUTHOR = "Unknown"
-                            env.GIT_COMMIT_HASH = "unknown-${BUILD_NUMBER}"
+                        } catch (Exception e) {
+                            env.GIT_BRANCH_NAME = 'unknown'
                         }
                     }
 
+                    // Clean branch name (remove origin/ prefix if present)
+                    if (env.GIT_BRANCH_NAME.contains('/')) {
+                        def parts = env.GIT_BRANCH_NAME.split('/')
+                        if (parts[0] == 'origin') {
+                            env.GIT_BRANCH_NAME = parts[1..-1].join('/')
+                        }
+                    }
+
+                    // Get commit information
+                    try {
+                        env.GIT_COMMIT_HASH = bat(
+                            script: '@git rev-parse --short=8 HEAD',
+                            returnStdout: true
+                        ).trim()
+                        env.GIT_COMMIT_MSG = bat(
+                            script: '@git log -1 --pretty=%%B',
+                            returnStdout: true
+                        ).trim()
+                        env.GIT_AUTHOR = bat(
+                            script: '@git log -1 --pretty=%%an',
+                            returnStdout: true
+                        ).trim()
+                    } catch (Exception e) {
+                        env.GIT_COMMIT_HASH = "unknown-${BUILD_NUMBER}"
+                        env.GIT_COMMIT_MSG = "Unknown"
+                        env.GIT_AUTHOR = "Unknown"
+                    }
+
+                    echo "[BRANCH] ${env.GIT_BRANCH_NAME}"
                     echo "[COMMIT] ${env.GIT_COMMIT_HASH}"
                     echo "[AUTHOR] ${env.GIT_AUTHOR}"
                     echo "[MESSAGE] ${env.GIT_COMMIT_MSG}"
-                }
-            }
-        }
 
-        stage('Detect Python Changes') {
-            when {
-                environment name: 'SKIP_BUILD', value: 'false'
-            }
-            steps {
-                script {
-                    echo "[DISCOVERY] Scanning repository for Python files and changes..."
-
-                    def isWindows = isUnix() ? false : true
-                    def pythonFolders = []
-                    def changedFolders = []
-
-                    // Find all folders containing Python files
-                    if (isWindows) {
-                        // Windows commands
-                        def allFiles = bat(
-                            script: '@dir /s /b *.py 2>nul',
-                            returnStdout: true
-                        ).trim()
-
-                        if (allFiles) {
-                            def files = allFiles.split('\r?\n')
-                            files.each { file ->
-                                // Extract folder name from path
-                                def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
-                                def parts = relativePath.split('/')
-                                if (parts.length > 1) {
-                                    def folder = parts[0]
-                                    if (!pythonFolders.contains(folder) && !folder.startsWith('.')) {
-                                        pythonFolders.add(folder)
-                                    }
-                                }
-                            }
-                        }
+                    // Determine deployment target
+                    if (params.DEPLOY_TARGET != 'auto') {
+                        // Manual override
+                        env.DEPLOY_ENV = params.DEPLOY_TARGET
+                        echo "[DEPLOY] Manual override: deploying to '${env.DEPLOY_ENV}'"
                     } else {
-                        // Unix/Linux commands
-                        def findResult = sh(
-                            script: 'find . -name "*.py" -type f 2>/dev/null | head -1000',
-                            returnStdout: true
-                        ).trim()
-
-                        if (findResult) {
-                            def files = findResult.split('\n')
-                            files.each { file ->
-                                // Remove ./ prefix and extract folder
-                                def path = file.replaceFirst('^\\./', '')
-                                def parts = path.split('/')
-                                if (parts.length > 1) {
-                                    def folder = parts[0]
-                                    if (!pythonFolders.contains(folder) && !folder.startsWith('.')) {
-                                        pythonFolders.add(folder)
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    echo "[PYTHON_FOLDERS] Found ${pythonFolders.size()} folders with Python files: ${pythonFolders.join(', ')}"
-
-                    // Detect changed files
-                    def changedFiles = []
-                    try {
-                        // Check if this is the first commit
-                        def commitCount = isWindows ? 
-                            bat(script: '@git rev-list --count HEAD', returnStdout: true).trim() :
-                            sh(script: 'git rev-list --count HEAD', returnStdout: true).trim()
-
-                        if (commitCount == '1') {
-                            echo "[FIRST_COMMIT] This is the first commit - treating all Python files as changed"
-                            // For first commit, treat all Python folders as changed
-                            changedFolders = pythonFolders
+                        // Auto-determine based on branch
+                        if (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master') {
+                            env.DEPLOY_ENV = 'latest'
+                            echo "[DEPLOY] Main branch detected: deploying to 'latest'"
                         } else {
-                            // Get list of changed files
-                            def gitDiff = isWindows ?
-                                bat(script: '@git diff --name-only HEAD~1 HEAD', returnStdout: true).trim() :
-                                sh(script: 'git diff --name-only HEAD~1 HEAD', returnStdout: true).trim()
-
-                            if (gitDiff) {
-                                changedFiles = gitDiff.split('\r?\n')
-                                echo "[CHANGED_FILES] Found ${changedFiles.size()} changed files:"
-                                
-                                // List all changed files
-                                changedFiles.each { file ->
-                                    echo "  - ${file}"
-                                }
-
-                                // Group changes by folder
-                                def changesByFolder = [:]
-                                changedFiles.each { file ->
-                                    def parts = file.split('/')
-                                    if (parts.length > 0) {
-                                        def folder = parts[0]
-                                        if (!changesByFolder[folder]) {
-                                            changesByFolder[folder] = []
-                                        }
-                                        changesByFolder[folder].add(file)
-                                        
-                                        if (pythonFolders.contains(folder) && !changedFolders.contains(folder)) {
-                                            changedFolders.add(folder)
-                                        }
-                                    }
-                                }
-                                
-                                // Display changes grouped by folder
-                                echo "\n[CHANGES_BY_FOLDER]:"
-                                changesByFolder.each { folder, files ->
-                                    echo "  ${folder}/ (${files.size()} files):"
-                                    files.each { file ->
-                                        def fileType = file.endsWith('.py') ? '[Python]' : 
-                                                      file.endsWith('Dockerfile') ? '[Docker]' :
-                                                      file.endsWith('requirements.txt') ? '[Requirements]' : '[Other]'
-                                        echo "    ${fileType} ${file}"
-                                    }
-                                }
-                            }
+                            env.DEPLOY_ENV = 'dev'
+                            echo "[DEPLOY] Feature branch detected: deploying to 'dev' with branch tag"
                         }
-                    } catch (Exception e) {
-                        echo "[WARNING] Could not determine changes, will process all Python folders"
-                        changedFolders = pythonFolders
-                    }
-
-                    echo "[CHANGED_FOLDERS] Folders with changes: ${changedFolders.join(', ')}"
-
-                    // Set environment variables for next stages
-                    if (changedFolders.size() > 0) {
-                        env.FOLDERS_WITH_CHANGES = changedFolders.join(',')
-                        env.NEEDS_PROCESSING = 'true'
-                    } else {
-                        echo "[INFO] No Python folders have changes"
-                        env.FOLDERS_WITH_CHANGES = ''
-                        env.NEEDS_PROCESSING = 'false'
                     }
                 }
             }
         }
 
-        stage('Validate Folders') {
-            when {
-                allOf {
-                    environment name: 'SKIP_BUILD', value: 'false'
-                    environment name: 'NEEDS_PROCESSING', value: 'true'
-                }
-            }
+        stage('Detect Changes') {
             steps {
                 script {
-                    echo "[VALIDATION] Validating folders with changes..."
+                    echo "[DISCOVERY] Scanning for Python applications..."
 
-                    def foldersToValidate = env.FOLDERS_WITH_CHANGES.split(',')
-                    def validFolders = []
-                    def invalidFolders = []
+                    def pythonApps = []
+                    def changedApps = []
 
-                    foldersToValidate.each { folder ->
-                        echo "[CHECKING] ${folder}/"
+                    // Find all directories with Dockerfile
+                    def dockerfiles = bat(
+                        script: '@dir /s /b Dockerfile 2>nul',
+                        returnStdout: true
+                    ).trim()
 
-                        def hasDockerfile = fileExists("${folder}/Dockerfile")
-                        def hasRequirements = fileExists("${folder}/requirements.txt")
-
-                        if (hasDockerfile) {
-                            echo "[✓] ${folder}/Dockerfile exists"
-                            validFolders.add(folder)
-
-                            if (!hasRequirements) {
-                                echo "[WARNING] ${folder}/requirements.txt not found (will use empty requirements)"
-                                // Create empty requirements.txt if it doesn't exist
-                                writeFile file: "${folder}/requirements.txt", text: "# No dependencies\n"
+                    if (dockerfiles) {
+                        dockerfiles.split('\r?\n').each { file ->
+                            def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
+                            def parts = relativePath.split('/')
+                            // Only consider Dockerfiles in immediate subdirectories
+                            if (parts.length == 2 && parts[1] == 'Dockerfile') {
+                                def appName = parts[0]
+                                if (!appName.startsWith('.')) {
+                                    pythonApps.add(appName)
+                                }
                             }
-                        } else {
-                            echo "[✗] ${folder}/Dockerfile missing - skipping Docker build"
-                            invalidFolders.add(folder)
                         }
                     }
 
-                    env.VALID_FOLDERS = validFolders.join(',')
-                    env.INVALID_FOLDERS = invalidFolders.join(',')
+                    echo "[APPS] Found ${pythonApps.size()} applications: ${pythonApps.join(', ')}"
 
-                    if (validFolders.size() > 0) {
-                        env.HAS_VALID_FOLDERS = 'true'
-                        echo "[SUMMARY] ${validFolders.size()} folders ready for Docker build"
+                    // Detect changes or force build
+                    if (params.FORCE_BUILD) {
+                        echo "[FORCE_BUILD] Building all applications"
+                        changedApps = pythonApps
                     } else {
-                        env.HAS_VALID_FOLDERS = 'false'
-                        echo "[SUMMARY] No folders are ready for Docker build"
+                        // Check for changes
+                        try {
+                            def commitCount = bat(
+                                script: '@git rev-list --count HEAD',
+                                returnStdout: true
+                            ).trim()
+
+                            if (commitCount == '1') {
+                                echo "[FIRST_COMMIT] Building all applications"
+                                changedApps = pythonApps
+                            } else {
+                                // Get list of changed files
+                                def gitDiff = bat(
+                                    script: '@git diff --name-only HEAD~1 HEAD',
+                                    returnStdout: true
+                                ).trim()
+
+                                if (gitDiff) {
+                                    def changedFiles = gitDiff.split('\r?\n')
+                                    
+                                    echo "[CHANGED_FILES] ${changedFiles.size()} files changed:"
+                                    changedFiles.each { file ->
+                                        echo "  - ${file}"
+                                    }
+                                    
+                                    // Determine which apps have changes
+                                    changedFiles.each { file ->
+                                        def parts = file.split('/')
+                                        if (parts.length > 0) {
+                                            def app = parts[0]
+                                            if (pythonApps.contains(app) && !changedApps.contains(app)) {
+                                                changedApps.add(app)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (Exception e) {
+                            echo "[WARNING] Could not determine changes, building all applications"
+                            changedApps = pythonApps
+                        }
+                    }
+
+                    if (changedApps.size() > 0) {
+                        env.APPS_TO_BUILD = changedApps.join(',')
+                        env.HAS_CHANGES = 'true'
+                        echo "[BUILD_LIST] Applications to build: ${env.APPS_TO_BUILD}"
+                    } else {
+                        env.HAS_CHANGES = 'false'
+                        echo "[INFO] No changes detected in any application"
                     }
                 }
             }
@@ -275,50 +226,58 @@ pipeline {
 
         stage('Build Docker Images') {
             when {
-                allOf {
-                    environment name: 'SKIP_BUILD', value: 'false'
-                    environment name: 'HAS_VALID_FOLDERS', value: 'true'
-                }
+                environment name: 'HAS_CHANGES', value: 'true'
             }
             steps {
                 script {
                     echo "[DOCKER] Building Docker images..."
 
-                    def folders = env.VALID_FOLDERS.split(',')
+                    def apps = env.APPS_TO_BUILD.split(',')
                     def buildJobs = [:]
 
-                    folders.each { folder ->
-                        buildJobs[folder] = {
-                            echo "[BUILD] Building ${folder}..."
+                    apps.each { app ->
+                        buildJobs[app] = {
+                            echo "[BUILD] Building ${app}..."
 
-                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${folder}"
-                            def imageTag = "${env.BUILD_VERSION}-${env.COMMIT_HASH}"
+                            // Determine the tag based on environment and branch
+                            def imageTag = ''
+                            
+                            if (env.DEPLOY_ENV == 'latest') {
+                                // For latest, always use 'latest' tag
+                                imageTag = 'latest'
+                            } else {
+                                // For dev, use the branch name as tag
+                                // Clean branch name for use as Docker tag
+                                def cleanBranchName = env.GIT_BRANCH_NAME
+                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
+                                    .toLowerCase()
+                                imageTag = cleanBranchName
+                            }
+
+                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
 
                             try {
-                                // Build Docker image
-                                def isWindows = isUnix() ? false : true
-                                if (isWindows) {
-                                    bat "docker build -t ${imageName}:${imageTag} -f ${folder}/Dockerfile ${folder}/"
-                                    bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
-                                } else {
-                                    sh "docker build -t ${imageName}:${imageTag} -f ${folder}/Dockerfile ${folder}/"
-                                    sh "docker tag ${imageName}:${imageTag} ${imageName}:latest"
+                                // Create requirements.txt if it doesn't exist
+                                if (!fileExists("${app}/requirements.txt")) {
+                                    writeFile file: "${app}/requirements.txt", text: "# No dependencies\n"
                                 }
 
-                                echo "[SUCCESS] ${folder} image built: ${imageName}:${imageTag}"
-                                writeFile file: "${folder}_build_success.txt", text: "true"
+                                // Build the Docker image
+                                bat "docker build -t ${imageName}:${imageTag} -f ${app}/Dockerfile ${app}/"
+                                
+                                echo "[SUCCESS] Built ${imageName}:${imageTag}"
+                                
+                                // Store tag for push stage
+                                writeFile file: "${app}_tag.txt", text: imageTag
 
                             } catch (Exception e) {
-                                echo "[ERROR] Failed to build ${folder}: ${e.message}"
-                                writeFile file: "${folder}_build_success.txt", text: "false"
+                                echo "[ERROR] Failed to build ${app}: ${e.message}"
                                 throw e
                             }
                         }
                     }
 
-                    // Execute builds in parallel
                     parallel buildJobs
-
                     env.BUILD_COMPLETE = 'true'
                 }
             }
@@ -326,71 +285,71 @@ pipeline {
 
         stage('Push to Artifactory') {
             when {
-                allOf {
-                    environment name: 'SKIP_BUILD', value: 'false'
-                    environment name: 'BUILD_COMPLETE', value: 'true'
-                }
+                environment name: 'BUILD_COMPLETE', value: 'true'
             }
             steps {
                 script {
                     echo "[PUSH] Pushing images to Artifactory..."
 
-                    def folders = env.VALID_FOLDERS.split(',')
-                    def isWindows = isUnix() ? false : true
+                    def apps = env.APPS_TO_BUILD.split(',')
 
-                    // Login to Artifactory using secure credential handling
+                    // Login to Artifactory
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
                         usernameVariable: 'ARTIFACTORY_USER',
                         passwordVariable: 'ARTIFACTORY_PASS'
                     )]) {
-                        // Use password-stdin for security
-                        if (isWindows) {
-                            bat '''
-                                echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin
-                            '''
-                        } else {
-                            sh '''
-                                echo $ARTIFACTORY_PASS | docker login $DOCKER_REGISTRY -u $ARTIFACTORY_USER --password-stdin
-                            '''
-                        }
+                        bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
                         
                         echo "[LOGIN] Successfully logged into Artifactory"
 
                         def pushJobs = [:]
 
-                        folders.each { folder ->
-                            pushJobs[folder] = {
-                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${folder}"
-                                def imageTag = "${env.BUILD_VERSION}-${env.COMMIT_HASH}"
-
+                        apps.each { app ->
+                            pushJobs[app] = {
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
+                                def imageTag = readFile("${app}_tag.txt").trim()
+                                
                                 try {
-                                    if (isWindows) {
-                                        bat "docker push ${imageName}:${imageTag}"
-                                        bat "docker push ${imageName}:latest"
-                                    } else {
-                                        sh "docker push ${imageName}:${imageTag}"
-                                        sh "docker push ${imageName}:latest"
-                                    }
-
-                                    echo "[SUCCESS] Pushed ${imageName}:${imageTag} and ${imageName}:latest"
-
+                                    bat "docker push ${imageName}:${imageTag}"
+                                    echo "[PUSHED] ${imageName}:${imageTag}"
+                                    
+                                    // Log for summary
+                                    env."${app}_PUSHED_TAG" = imageTag
+                                    
                                 } catch (Exception e) {
-                                    echo "[ERROR] Failed to push ${folder}: ${e.message}"
+                                    echo "[ERROR] Failed to push ${imageName}:${imageTag}: ${e.message}"
                                     throw e
                                 }
                             }
                         }
 
-                        // Execute pushes in parallel
                         parallel pushJobs
                     }
 
                     // Logout
-                    if (isWindows) {
-                        bat "docker logout ${env.DOCKER_REGISTRY}"
-                    } else {
-                        sh "docker logout ${env.DOCKER_REGISTRY}"
+                    bat "docker logout ${env.DOCKER_REGISTRY}"
+                }
+            }
+        }
+
+        stage('Cleanup') {
+            when {
+                environment name: 'BUILD_COMPLETE', value: 'true'
+            }
+            steps {
+                script {
+                    echo "[CLEANUP] Cleaning up local images and temporary files..."
+                    
+                    try {
+                        // Remove dangling images
+                        bat 'docker image prune -f'
+                        
+                        // Remove temporary tag files
+                        bat 'del /Q *_tag.txt 2>nul || exit 0'
+                        
+                    } catch (Exception e) {
+                        echo "[WARNING] Cleanup failed: ${e.message}"
                     }
                 }
             }
@@ -402,29 +361,43 @@ pipeline {
                     echo "\n========================================="
                     echo "BUILD SUMMARY"
                     echo "========================================="
-                    echo "Branch: ${env.GIT_BRANCH_NAME ?: 'unknown'}"
+                    echo "Branch: ${env.GIT_BRANCH_NAME}"
                     echo "Commit: ${env.GIT_COMMIT_HASH}"
                     echo "Author: ${env.GIT_AUTHOR}"
                     echo "Build #: ${env.BUILD_NUMBER}"
+                    echo "Target: ${env.DEPLOY_ENV}"
+                    
+                    if (params.BRANCH_NAME) {
+                        echo "Manual Branch Override: ${params.BRANCH_NAME}"
+                    }
 
-                    if (env.SKIP_BUILD == 'true') {
-                        echo "Status: SKIPPED (not on main branch)"
-                    } else if (env.NEEDS_PROCESSING == 'true') {
-                        echo "Folders with changes: ${env.FOLDERS_WITH_CHANGES}"
-                        if (env.HAS_VALID_FOLDERS == 'true') {
-                            echo "Docker images built: ${env.VALID_FOLDERS}"
-                            def folders = env.VALID_FOLDERS.split(',')
-                            folders.each { folder ->
-                                echo "  - ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${folder}:${env.BUILD_VERSION}-${env.COMMIT_HASH}"
-                            }
+                    if (env.HAS_CHANGES == 'true') {
+                        echo "\nApplications Built and Pushed:"
+                        def apps = env.APPS_TO_BUILD.split(',')
+                        apps.each { app ->
+                            def pushedTag = env."${app}_PUSHED_TAG"
+                            echo "  ${app}:"
+                            echo "    Image: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
+                            echo "    Registry URL: https://${env.DOCKER_REGISTRY}/artifactory/webapp/#/artifacts/browse/tree/General/${env.DOCKER_REPO}/${app}"
                         }
-                        if (env.INVALID_FOLDERS && env.INVALID_FOLDERS != '') {
-                            echo "Skipped (missing Dockerfile): ${env.INVALID_FOLDERS}"
+                        
+                        echo "\nTo pull images:"
+                        apps.each { app ->
+                            def pushedTag = env."${app}_PUSHED_TAG"
+                            echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
                         }
                     } else {
-                        echo "Status: No Python changes detected"
+                        echo "\nStatus: No changes detected"
                     }
+                    
                     echo "========================================="
+
+                    // Update build description
+                    if (env.HAS_CHANGES == 'true') {
+                        currentBuild.description = "${env.DEPLOY_ENV} | ${env.GIT_BRANCH_NAME} | ${env.APPS_TO_BUILD}"
+                    } else {
+                        currentBuild.description = "No changes | ${env.GIT_BRANCH_NAME}"
+                    }
                 }
             }
         }
@@ -432,14 +405,20 @@ pipeline {
 
     post {
         always {
-            echo "[CLEANUP] Pipeline completed"
+            echo "[PIPELINE] Completed"
         }
         success {
             echo "[SUCCESS] Pipeline executed successfully!"
+            script {
+                if (env.DEPLOY_ENV == 'latest') {
+                    echo "[NOTICE] Production deployment completed!"
+                    // Add notification here if needed (Slack, Email, etc.)
+                }
+            }
         }
         failure {
             echo "[FAILURE] Pipeline failed!"
-            // Optionally send notifications
+            // Add notification here if needed
         }
     }
 }
