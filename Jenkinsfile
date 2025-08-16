@@ -74,9 +74,16 @@ pipeline {
                     } else {
                         echo "[CHECKOUT] Checking out from webhook trigger..."
                         checkout scm
-                        // *** FIX: Use the Jenkins-provided BRANCH_NAME env var, which is more reliable. ***
-                        // It's set for multibranch pipelines and webhook triggers.
-                        env.GIT_BRANCH_NAME = env.BRANCH_NAME
+                        // Get branch name using a git command for reliability
+                        try {
+                             env.GIT_BRANCH_NAME = bat(
+                                script: '@git rev-parse --abbrev-ref HEAD',
+                                returnStdout: true
+                            ).trim()
+                        } catch (e) {
+                            echo "[ERROR] Could not determine branch name. Defaulting to 'unknown'."
+                            env.GIT_BRANCH_NAME = 'unknown'
+                        }
                     }
 
                     // Get commit information
@@ -85,12 +92,14 @@ pipeline {
                             script: '@git rev-parse --short=8 HEAD',
                             returnStdout: true
                         ).trim()
+                        // *** FIX: Escaped '%' for Windows bat step ***
                         env.GIT_COMMIT_MSG = bat(
-                            script: '@git log -1 --pretty=%B',
+                            script: '@git log -1 --pretty=%%B',
                             returnStdout: true
                         ).trim()
+                        // *** FIX: Escaped '%' for Windows bat step ***
                         env.GIT_AUTHOR = bat(
-                            script: '@git log -1 --pretty=%an',
+                            script: '@git log -1 --pretty=%%an',
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
@@ -210,7 +219,6 @@ pipeline {
                     def buildJobs = [:]
 
                     apps.each { app ->
-                        // *** FIX: Removed inner stage for a cleaner UI ***
                         buildJobs[app] = {
                             echo "[BUILD] Building ${app}..."
 
@@ -272,7 +280,6 @@ pipeline {
 
                         def pushJobs = [:]
                         apps.each { app ->
-                            // *** FIX: Removed inner stage for a cleaner UI ***
                             pushJobs[app] = {
                                 def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
                                 def imageTag = readFile("${app}_tag.txt").trim()
