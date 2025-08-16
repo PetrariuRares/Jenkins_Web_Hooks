@@ -23,8 +23,7 @@ COPY . .
 RUN chmod +x src/*.py
 
 # Create non-root user for security
-RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app
+RUN chown -R appuser:appuser /app
 USER appuser
 
 # Set environment variables

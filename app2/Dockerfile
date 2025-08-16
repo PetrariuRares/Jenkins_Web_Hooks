@@ -6,13 +6,6 @@ FROM trialqlk1tc.jfrog.io/dockertest-docker/python-base:3.11
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies for data processing
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
-
 # Copy requirements first for better caching
 COPY requirements.txt .
 
@@ -29,8 +22,7 @@ COPY . .
 RUN find . -name "*.py" -exec chmod +x {} \;
 
 # Create non-root user for security
-RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app
+RUN chown -R appuser:appuser /app
 USER appuser
 
 # Set environment variables
