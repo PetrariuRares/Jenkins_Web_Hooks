@@ -74,9 +74,9 @@ pipeline {
                     } else {
                         echo "[CHECKOUT] Checking out from webhook trigger..."
                         checkout scm
-                        // Jenkins automatically provides BRANCH_NAME for multibranch pipelines
-                        // or we can get it from the SCM object.
-                        env.GIT_BRANCH_NAME = scm.branches[0].name.replaceAll('^origin/', '')
+                        // *** FIX: Use the Jenkins-provided BRANCH_NAME env var, which is more reliable. ***
+                        // It's set for multibranch pipelines and webhook triggers.
+                        env.GIT_BRANCH_NAME = env.BRANCH_NAME
                     }
 
                     // Get commit information
@@ -154,7 +154,6 @@ pipeline {
                         echo "[FORCE_BUILD] Building all applications"
                         changedApps = pythonApps
                     } else {
-                        // *** REVISED CHANGE DETECTION LOGIC ***
                         // Use Jenkins' built-in changeSets for reliable change detection.
                         def changedFiles = []
                         if (currentBuild.changeSets.isEmpty()) {
@@ -211,37 +210,37 @@ pipeline {
                     def buildJobs = [:]
 
                     apps.each { app ->
+                        // *** FIX: Removed inner stage for a cleaner UI ***
                         buildJobs[app] = {
-                            stage("Build ${app}") {
-                                echo "[BUILD] Building ${app}..."
+                            echo "[BUILD] Building ${app}..."
 
-                                // Determine the tag based on environment and branch
-                                def imageTag = ''
-                                if (env.DEPLOY_ENV == 'latest') {
-                                    imageTag = 'latest'
-                                } else {
-                                    // Clean branch name for use as Docker tag
-                                    def cleanBranchName = env.GIT_BRANCH_NAME
-                                        .replaceAll('[^a-zA-Z0-9._-]', '-')
-                                        .toLowerCase()
-                                    imageTag = cleanBranchName
-                                }
+                            // Determine the tag based on environment and branch
+                            def imageTag = ''
+                            if (env.DEPLOY_ENV == 'latest') {
+                                imageTag = 'latest'
+                            } else {
+                                // Clean branch name for use as Docker tag
+                                def cleanBranchName = env.GIT_BRANCH_NAME
+                                    .replaceAll('/', '-') // Replace slashes first
+                                    .replaceAll('[^a-zA-Z0-9._-]', '') // Remove other invalid characters
+                                    .toLowerCase()
+                                imageTag = cleanBranchName
+                            }
 
-                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
+                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
 
-                                try {
-                                    // Build the Docker image
-                                    bat "docker build -t ${imageName}:${imageTag} -f ${app}/Dockerfile ${app}/"
-                                    
-                                    echo "[SUCCESS] Built ${imageName}:${imageTag}"
-                                    
-                                    // Store tag for push stage
-                                    writeFile file: "${app}_tag.txt", text: imageTag
+                            try {
+                                // Build the Docker image
+                                bat "docker build -t ${imageName}:${imageTag} -f ${app}/Dockerfile ${app}/"
+                                
+                                echo "[SUCCESS] Built ${imageName}:${imageTag}"
+                                
+                                // Store tag for push stage
+                                writeFile file: "${app}_tag.txt", text: imageTag
 
-                                } catch (Exception e) {
-                                    echo "[ERROR] Failed to build ${app}: ${e.message}"
-                                    error "Build failed for ${app}"
-                                }
+                            } catch (Exception e) {
+                                echo "[ERROR] Failed to build ${app}: ${e.message}"
+                                error "Build failed for ${app}"
                             }
                         }
                     }
@@ -273,22 +272,21 @@ pipeline {
 
                         def pushJobs = [:]
                         apps.each { app ->
+                            // *** FIX: Removed inner stage for a cleaner UI ***
                             pushJobs[app] = {
-                                stage("Push ${app}") {
-                                    def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
-                                    def imageTag = readFile("${app}_tag.txt").trim()
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
+                                def imageTag = readFile("${app}_tag.txt").trim()
+                                
+                                try {
+                                    bat "docker push ${imageName}:${imageTag}"
+                                    echo "[PUSHED] ${imageName}:${imageTag}"
                                     
-                                    try {
-                                        bat "docker push ${imageName}:${imageTag}"
-                                        echo "[PUSHED] ${imageName}:${imageTag}"
-                                        
-                                        // Log for summary
-                                        env."${app}_PUSHED_TAG" = imageTag
-                                        
-                                    } catch (Exception e) {
-                                        echo "[ERROR] Failed to push ${imageName}:${imageTag}: ${e.message}"
-                                        error "Push failed for ${app}"
-                                    }
+                                    // Log for summary
+                                    env."${app}_PUSHED_TAG" = imageTag
+                                    
+                                } catch (Exception e) {
+                                    echo "[ERROR] Failed to push ${imageName}:${imageTag}: ${e.message}"
+                                    error "Push failed for ${app}"
                                 }
                             }
                         }
