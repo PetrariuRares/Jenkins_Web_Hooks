@@ -1,0 +1,7 @@
+# App4 Requirements
+# This app has minimal dependencies for demonstration
+
+# No external dependencies required for basic functionality
+# When Dockerfile is added, these could include:
+# pandas==2.1.4
+# requests==2.31.0
