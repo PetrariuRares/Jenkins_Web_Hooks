@@ -13,5 +13,5 @@ import json
 from faker import Faker
 
 
-print ("[START] Excel Generator Application")
+print ("[START] Excel Generator Application Test")
 print ("=" * 40)
