@@ -36,6 +36,9 @@ pipeline {
         // Build configuration
         BUILD_NUMBER = "${BUILD_NUMBER}"
         TIMESTAMP = "${new Date().format('yyyyMMdd-HHmmss')}"
+        
+        // Initialize status flags
+        NO_APPS = 'false'
     }
 
     stages {
@@ -77,6 +80,16 @@ pipeline {
                                 script: '@git rev-parse --abbrev-ref HEAD',
                                 returnStdout: true
                             ).trim()
+                            
+                            // If HEAD is returned, try to get the actual branch name
+                            if (env.GIT_BRANCH_NAME == 'HEAD') {
+                                env.GIT_BRANCH_NAME = bat(
+                                    script: '@git branch -r --contains HEAD',
+                                    returnStdout: true
+                                ).trim()
+                                // Clean up the branch name (remove origin/ and any whitespace)
+                                env.GIT_BRANCH_NAME = env.GIT_BRANCH_NAME.replaceAll('.*origin/', '').trim()
+                            }
                         } catch (Exception e) {
                             env.GIT_BRANCH_NAME = 'unknown'
                         }
@@ -143,26 +156,43 @@ pipeline {
                     def changedApps = []
 
                     // Find all directories with Dockerfile
-                    def dockerfiles = bat(
-                        script: '@dir /s /b Dockerfile 2>nul',
-                        returnStdout: true
-                    ).trim()
+                    def dockerfiles = ''
+                    try {
+                        dockerfiles = bat(
+                            script: '@dir /s /b Dockerfile 2>nul || exit 0',
+                            returnStdout: true
+                        ).trim()
+                    } catch (Exception e) {
+                        echo "[INFO] No Dockerfiles found in repository"
+                        dockerfiles = ''
+                    }
 
                     if (dockerfiles) {
                         dockerfiles.split('\r?\n').each { file ->
-                            def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
-                            def parts = relativePath.split('/')
-                            // Only consider Dockerfiles in immediate subdirectories
-                            if (parts.length == 2 && parts[1] == 'Dockerfile') {
-                                def appName = parts[0]
-                                if (!appName.startsWith('.')) {
-                                    pythonApps.add(appName)
+                            if (file && file.trim()) {  // Check if line is not empty
+                                def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
+                                def parts = relativePath.split('/')
+                                // Only consider Dockerfiles in immediate subdirectories
+                                if (parts.length == 2 && parts[1] == 'Dockerfile') {
+                                    def appName = parts[0]
+                                    if (!appName.startsWith('.')) {
+                                        pythonApps.add(appName)
+                                    }
                                 }
                             }
                         }
                     }
 
                     echo "[APPS] Found ${pythonApps.size()} applications: ${pythonApps.join(', ')}"
+
+                    // Exit early if no applications found
+                    if (pythonApps.size() == 0) {
+                        env.HAS_CHANGES = 'false'
+                        env.NO_APPS = 'true'
+                        echo "[INFO] No applications with Dockerfiles found in repository"
+                        echo "[INFO] Pipeline will complete without building any images"
+                        return
+                    }
 
                     // Detect changes or force build
                     if (params.FORCE_BUILD) {
@@ -371,7 +401,10 @@ pipeline {
                         echo "Manual Branch Override: ${params.BRANCH_NAME}"
                     }
 
-                    if (env.HAS_CHANGES == 'true') {
+                    if (env.NO_APPS == 'true') {
+                        echo "\nStatus: No applications with Dockerfiles found in repository"
+                        echo "Add applications with Dockerfiles to enable Docker builds"
+                    } else if (env.HAS_CHANGES == 'true') {
                         echo "\nApplications Built and Pushed:"
                         def apps = env.APPS_TO_BUILD.split(',')
                         apps.each { app ->
@@ -387,13 +420,15 @@ pipeline {
                             echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
                         }
                     } else {
-                        echo "\nStatus: No changes detected"
+                        echo "\nStatus: No changes detected in applications"
                     }
                     
                     echo "========================================="
 
                     // Update build description
-                    if (env.HAS_CHANGES == 'true') {
+                    if (env.NO_APPS == 'true') {
+                        currentBuild.description = "No apps found | ${env.GIT_BRANCH_NAME}"
+                    } else if (env.HAS_CHANGES == 'true') {
                         currentBuild.description = "${env.DEPLOY_ENV} | ${env.GIT_BRANCH_NAME} | ${env.APPS_TO_BUILD}"
                     } else {
                         currentBuild.description = "No changes | ${env.GIT_BRANCH_NAME}"
