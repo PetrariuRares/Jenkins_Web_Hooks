@@ -60,7 +60,7 @@ pipeline {
         stage('Checkout') {
             steps {
                 script {
-                    // If manual branch specified, checkout that branch
+                    // Checkout the correct branch
                     if (params.BRANCH_NAME) {
                         echo "[CHECKOUT] Checking out specified branch: ${params.BRANCH_NAME}"
                         checkout([
@@ -69,38 +69,14 @@ pipeline {
                             extensions: [],
                             userRemoteConfigs: scm.userRemoteConfigs
                         ])
+                        // Set the branch name from the parameter for consistency
                         env.GIT_BRANCH_NAME = params.BRANCH_NAME
                     } else {
                         echo "[CHECKOUT] Checking out from webhook trigger..."
                         checkout scm
-                        
-                        // Get current branch name
-                        try {
-                            env.GIT_BRANCH_NAME = bat(
-                                script: '@git rev-parse --abbrev-ref HEAD',
-                                returnStdout: true
-                            ).trim()
-                            
-                            // If HEAD is returned, try to get the actual branch name
-                            if (env.GIT_BRANCH_NAME == 'HEAD') {
-                                env.GIT_BRANCH_NAME = bat(
-                                    script: '@git branch -r --contains HEAD',
-                                    returnStdout: true
-                                ).trim()
-                                // Clean up the branch name (remove origin/ and any whitespace)
-                                env.GIT_BRANCH_NAME = env.GIT_BRANCH_NAME.replaceAll('.*origin/', '').trim()
-                            }
-                        } catch (Exception e) {
-                            env.GIT_BRANCH_NAME = 'unknown'
-                        }
-                    }
-
-                    // Clean branch name (remove origin/ prefix if present)
-                    if (env.GIT_BRANCH_NAME.contains('/')) {
-                        def parts = env.GIT_BRANCH_NAME.split('/')
-                        if (parts[0] == 'origin') {
-                            env.GIT_BRANCH_NAME = parts[1..-1].join('/')
-                        }
+                        // Jenkins automatically provides BRANCH_NAME for multibranch pipelines
+                        // or we can get it from the SCM object.
+                        env.GIT_BRANCH_NAME = scm.branches[0].name.replaceAll('^origin/', '')
                     }
 
                     // Get commit information
@@ -110,11 +86,11 @@ pipeline {
                             returnStdout: true
                         ).trim()
                         env.GIT_COMMIT_MSG = bat(
-                            script: '@git log -1 --pretty=%%B',
+                            script: '@git log -1 --pretty=%B',
                             returnStdout: true
                         ).trim()
                         env.GIT_AUTHOR = bat(
-                            script: '@git log -1 --pretty=%%an',
+                            script: '@git log -1 --pretty=%an',
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
@@ -155,42 +131,21 @@ pipeline {
                     def pythonApps = []
                     def changedApps = []
 
-                    // Find all directories with Dockerfile
-                    def dockerfiles = ''
-                    try {
-                        dockerfiles = bat(
-                            script: '@dir /s /b Dockerfile 2>nul || exit 0',
-                            returnStdout: true
-                        ).trim()
-                    } catch (Exception e) {
-                        echo "[INFO] No Dockerfiles found in repository"
-                        dockerfiles = ''
-                    }
-
-                    if (dockerfiles) {
-                        dockerfiles.split('\r?\n').each { file ->
-                            if (file && file.trim()) {  // Check if line is not empty
-                                def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
-                                def parts = relativePath.split('/')
-                                // Only consider Dockerfiles in immediate subdirectories
-                                if (parts.length == 2 && parts[1] == 'Dockerfile') {
-                                    def appName = parts[0]
-                                    if (!appName.startsWith('.')) {
-                                        pythonApps.add(appName)
-                                    }
-                                }
-                            }
+                    // Find all directories with a Dockerfile in the root
+                    def appDirs = bat(script: '@dir /b /ad', returnStdout: true).trim().split('\r?\n')
+                    appDirs.each { dir ->
+                        if (fileExists("${dir}/Dockerfile") && !dir.startsWith('.')) {
+                            pythonApps.add(dir)
                         }
                     }
-
+                    
                     echo "[APPS] Found ${pythonApps.size()} applications: ${pythonApps.join(', ')}"
 
                     // Exit early if no applications found
-                    if (pythonApps.size() == 0) {
+                    if (pythonApps.isEmpty()) {
                         env.HAS_CHANGES = 'false'
                         env.NO_APPS = 'true'
                         echo "[INFO] No applications with Dockerfiles found in repository"
-                        echo "[INFO] Pipeline will complete without building any images"
                         return
                     }
 
@@ -199,50 +154,40 @@ pipeline {
                         echo "[FORCE_BUILD] Building all applications"
                         changedApps = pythonApps
                     } else {
-                        // Check for changes
-                        try {
-                            def commitCount = bat(
-                                script: '@git rev-list --count HEAD',
-                                returnStdout: true
-                            ).trim()
+                        // *** REVISED CHANGE DETECTION LOGIC ***
+                        // Use Jenkins' built-in changeSets for reliable change detection.
+                        def changedFiles = []
+                        if (currentBuild.changeSets.isEmpty()) {
+                            echo "[INFO] No changesets found. This might be the first build. Building all apps."
+                            changedApps = pythonApps
+                        } else {
+                            for (int i = 0; i < currentBuild.changeSets.size(); i++) {
+                                def entries = currentBuild.changeSets[i].items
+                                for (int j = 0; j < entries.length; j++) {
+                                    def entry = entries[j]
+                                    changedFiles.add(entry.path)
+                                }
+                            }
+                        }
 
-                            if (commitCount == '1') {
-                                echo "[FIRST_COMMIT] Building all applications"
-                                changedApps = pythonApps
-                            } else {
-                                // Get list of changed files
-                                def gitDiff = bat(
-                                    script: '@git diff --name-only HEAD~1 HEAD',
-                                    returnStdout: true
-                                ).trim()
-
-                                if (gitDiff) {
-                                    def changedFiles = gitDiff.split('\r?\n')
-                                    
-                                    echo "[CHANGED_FILES] ${changedFiles.size()} files changed:"
-                                    changedFiles.each { file ->
-                                        echo "  - ${file}"
-                                    }
-                                    
-                                    // Determine which apps have changes
-                                    changedFiles.each { file ->
-                                        def parts = file.split('/')
-                                        if (parts.length > 0) {
-                                            def app = parts[0]
-                                            if (pythonApps.contains(app) && !changedApps.contains(app)) {
-                                                changedApps.add(app)
-                                            }
-                                        }
+                        if (!changedFiles.isEmpty()) {
+                            echo "[CHANGED_FILES] ${changedFiles.size()} files changed:"
+                            changedFiles.each { file -> echo "  - ${file}" }
+                            
+                            // Determine which apps have changes
+                            changedFiles.each { file ->
+                                def parts = file.split('/')
+                                if (parts.length > 0) {
+                                    def app = parts[0]
+                                    if (pythonApps.contains(app) && !changedApps.contains(app)) {
+                                        changedApps.add(app)
                                     }
                                 }
                             }
-                        } catch (Exception e) {
-                            echo "[WARNING] Could not determine changes, building all applications"
-                            changedApps = pythonApps
                         }
                     }
 
-                    if (changedApps.size() > 0) {
+                    if (!changedApps.isEmpty()) {
                         env.APPS_TO_BUILD = changedApps.join(',')
                         env.HAS_CHANGES = 'true'
                         echo "[BUILD_LIST] Applications to build: ${env.APPS_TO_BUILD}"
@@ -256,7 +201,7 @@ pipeline {
 
         stage('Build Docker Images') {
             when {
-                environment name: 'HAS_CHANGES', value: 'true'
+                expression { env.HAS_CHANGES == 'true' }
             }
             steps {
                 script {
@@ -267,46 +212,39 @@ pipeline {
 
                     apps.each { app ->
                         buildJobs[app] = {
-                            echo "[BUILD] Building ${app}..."
+                            stage("Build ${app}") {
+                                echo "[BUILD] Building ${app}..."
 
-                            // Determine the tag based on environment and branch
-                            def imageTag = ''
-                            
-                            if (env.DEPLOY_ENV == 'latest') {
-                                // For latest, always use 'latest' tag
-                                imageTag = 'latest'
-                            } else {
-                                // For dev, use the branch name as tag
-                                // Clean branch name for use as Docker tag
-                                def cleanBranchName = env.GIT_BRANCH_NAME
-                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
-                                    .toLowerCase()
-                                imageTag = cleanBranchName
-                            }
-
-                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
-
-                            try {
-                                // Create requirements.txt if it doesn't exist
-                                if (!fileExists("${app}/requirements.txt")) {
-                                    writeFile file: "${app}/requirements.txt", text: "# No dependencies\n"
+                                // Determine the tag based on environment and branch
+                                def imageTag = ''
+                                if (env.DEPLOY_ENV == 'latest') {
+                                    imageTag = 'latest'
+                                } else {
+                                    // Clean branch name for use as Docker tag
+                                    def cleanBranchName = env.GIT_BRANCH_NAME
+                                        .replaceAll('[^a-zA-Z0-9._-]', '-')
+                                        .toLowerCase()
+                                    imageTag = cleanBranchName
                                 }
 
-                                // Build the Docker image
-                                bat "docker build -t ${imageName}:${imageTag} -f ${app}/Dockerfile ${app}/"
-                                
-                                echo "[SUCCESS] Built ${imageName}:${imageTag}"
-                                
-                                // Store tag for push stage
-                                writeFile file: "${app}_tag.txt", text: imageTag
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
 
-                            } catch (Exception e) {
-                                echo "[ERROR] Failed to build ${app}: ${e.message}"
-                                throw e
+                                try {
+                                    // Build the Docker image
+                                    bat "docker build -t ${imageName}:${imageTag} -f ${app}/Dockerfile ${app}/"
+                                    
+                                    echo "[SUCCESS] Built ${imageName}:${imageTag}"
+                                    
+                                    // Store tag for push stage
+                                    writeFile file: "${app}_tag.txt", text: imageTag
+
+                                } catch (Exception e) {
+                                    echo "[ERROR] Failed to build ${app}: ${e.message}"
+                                    error "Build failed for ${app}"
+                                }
                             }
                         }
                     }
-
                     parallel buildJobs
                     env.BUILD_COMPLETE = 'true'
                 }
@@ -315,7 +253,7 @@ pipeline {
 
         stage('Push to Artifactory') {
             when {
-                environment name: 'BUILD_COMPLETE', value: 'true'
+                expression { env.BUILD_COMPLETE == 'true' }
             }
             steps {
                 script {
@@ -334,26 +272,26 @@ pipeline {
                         echo "[LOGIN] Successfully logged into Artifactory"
 
                         def pushJobs = [:]
-
                         apps.each { app ->
                             pushJobs[app] = {
-                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
-                                def imageTag = readFile("${app}_tag.txt").trim()
-                                
-                                try {
-                                    bat "docker push ${imageName}:${imageTag}"
-                                    echo "[PUSHED] ${imageName}:${imageTag}"
+                                stage("Push ${app}") {
+                                    def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
+                                    def imageTag = readFile("${app}_tag.txt").trim()
                                     
-                                    // Log for summary
-                                    env."${app}_PUSHED_TAG" = imageTag
-                                    
-                                } catch (Exception e) {
-                                    echo "[ERROR] Failed to push ${imageName}:${imageTag}: ${e.message}"
-                                    throw e
+                                    try {
+                                        bat "docker push ${imageName}:${imageTag}"
+                                        echo "[PUSHED] ${imageName}:${imageTag}"
+                                        
+                                        // Log for summary
+                                        env."${app}_PUSHED_TAG" = imageTag
+                                        
+                                    } catch (Exception e) {
+                                        echo "[ERROR] Failed to push ${imageName}:${imageTag}: ${e.message}"
+                                        error "Push failed for ${app}"
+                                    }
                                 }
                             }
                         }
-
                         parallel pushJobs
                     }
 
@@ -365,7 +303,7 @@ pipeline {
 
         stage('Cleanup') {
             when {
-                environment name: 'BUILD_COMPLETE', value: 'true'
+                expression { env.BUILD_COMPLETE == 'true' }
             }
             steps {
                 script {
@@ -403,7 +341,6 @@ pipeline {
 
                     if (env.NO_APPS == 'true') {
                         echo "\nStatus: No applications with Dockerfiles found in repository"
-                        echo "Add applications with Dockerfiles to enable Docker builds"
                     } else if (env.HAS_CHANGES == 'true') {
                         echo "\nApplications Built and Pushed:"
                         def apps = env.APPS_TO_BUILD.split(',')
@@ -444,16 +381,9 @@ pipeline {
         }
         success {
             echo "[SUCCESS] Pipeline executed successfully!"
-            script {
-                if (env.DEPLOY_ENV == 'latest') {
-                    echo "[NOTICE] Production deployment completed!"
-                    // Add notification here if needed (Slack, Email, etc.)
-                }
-            }
         }
         failure {
             echo "[FAILURE] Pipeline failed!"
-            // Add notification here if needed
         }
     }
 }
