@@ -81,14 +81,14 @@ pipeline {
                         // Determine current branch name from git
                         try {
                             env.GIT_BRANCH_NAME = bat(
-                                script: '@git rev-parse --abbrev-ref HEAD',
+                                script: 'git rev-parse --abbrev-ref HEAD',
                                 returnStdout: true
                             ).trim()
                             
                             // Handle detached HEAD state
                             if (env.GIT_BRANCH_NAME == 'HEAD') {
                                 env.GIT_BRANCH_NAME = bat(
-                                    script: '@git branch -r --contains HEAD',
+                                    script: 'git branch -r --contains HEAD',
                                     returnStdout: true
                                 ).trim()
                                 // Clean up the branch name
@@ -109,20 +109,22 @@ pipeline {
 
                     // Extract commit information for traceability
                     try {
+                        // Using full git command for better reliability
                         env.GIT_COMMIT_HASH = bat(
-                            script: '@git rev-parse --short=8 HEAD',
+                            script: 'git rev-parse --short=8 HEAD',
                             returnStdout: true
                         ).trim()
                         env.GIT_COMMIT_MSG = bat(
-                            script: '@git log -1 --pretty=%B',
+                            script: 'git log -1 --pretty=%B',
                             returnStdout: true
                         ).trim()
                         env.GIT_AUTHOR = bat(
-                            script: '@git log -1 --pretty=%an',
+                            script: 'git log -1 --pretty=%an',
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
-                        env.GIT_COMMIT_HASH = "unknown-${BUILD_NUMBER}"
+                        error("Failed to get Git commit information. Error: ${e.message}")
+                        env.GIT_COMMIT_HASH = "unknown"
                         env.GIT_COMMIT_MSG = "Unknown"
                         env.GIT_AUTHOR = "Unknown"
                     }
@@ -134,11 +136,9 @@ pipeline {
 
                     // Determine deployment environment based on branch or manual override
                     if (params.DEPLOY_TARGET != 'auto') {
-                        // Manual deployment target override
                         env.DEPLOY_ENV = params.DEPLOY_TARGET
                         echo "[DEPLOY] Manual override: deploying to '${env.DEPLOY_ENV}'"
                     } else {
-                        // Auto-determine based on branch naming convention
                         if (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master') {
                             env.DEPLOY_ENV = 'latest'
                             echo "[DEPLOY] Main branch detected: deploying to 'latest'"
@@ -152,17 +152,17 @@ pipeline {
         }
 
         // ================================================================================
-        // STAGE 3: Detect Changes (MODIFIED LOGIC)
-        // Scans for applications with Dockerfiles
-        // Compares local git commit with the git.commit label on the image in Artifactory
+        // STAGE 3: Detect Changes (IMPROVED LOGIC)
+        // Scans for apps and uses 'git diff' to detect changes in each app's directory
+        // since the last successful build for that specific app.
         // ================================================================================
         stage('Detect Changes') {
             steps {
                 script {
                     echo "========================================="
-                    echo ">>> CHANGE DETECTION (COMMIT HASH BASED)"
+                    echo ">>> PER-APP CHANGE DETECTION (GIT DIFF BASED)"
                     echo "========================================="
-                    echo "[DISCOVERY] Scanning for Python applications..."
+                    echo "[DISCOVERY] Scanning for applications..."
 
                     def pythonApps = []
                     def changedApps = []
@@ -197,7 +197,6 @@ pipeline {
 
                     echo "[APPS] Found ${pythonApps.size()} applications: ${pythonApps.join(', ')}"
 
-                    // Exit early if no applications found
                     if (pythonApps.size() == 0) {
                         env.HAS_CHANGES = 'false'
                         env.NO_APPS = 'true'
@@ -205,7 +204,6 @@ pipeline {
                         return
                     }
 
-                    // Connect to Artifactory to check existing images
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
                         usernameVariable: 'ARTIFACTORY_USER',
@@ -213,58 +211,49 @@ pipeline {
                     )]) {
                         bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
 
-                        // Check each application to determine if rebuild is needed
                         pythonApps.each { app ->
                             def needsBuild = false
                             def currentCommit = env.GIT_COMMIT_HASH
 
-                            // Determine the Docker tag based on environment
-                            def imageTag = ''
-                            if (env.DEPLOY_ENV == 'latest') {
-                                imageTag = 'latest'
-                            } else {
-                                // For dev environment, use sanitized branch name as tag
-                                def cleanBranchName = env.GIT_BRANCH_NAME
-                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
-                                    .toLowerCase()
-                                imageTag = cleanBranchName
-                            }
-
+                            def imageTag = (env.DEPLOY_ENV == 'latest') ? 'latest' : env.GIT_BRANCH_NAME.replaceAll('[^a-zA-Z0-9._-]', '-').toLowerCase()
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${imageTag}"
 
-                            // Check if image exists in registry and compare commit hash
                             try {
-                                // Attempt to pull the image from registry
-                                def pullResult = bat(
-                                    script: "docker pull ${imageName} 2>&1",
-                                    returnStatus: true
-                                )
+                                def pullResult = bat(script: "docker pull ${imageName} 2>&1", returnStatus: true)
 
                                 if (pullResult == 0) {
-                                    // Image exists, extract and compare commit hash from labels
-                                    def existingCommit = bat(
-                                        script: "@docker inspect ${imageName} --format=\"{{index .Config.Labels \\\"git.commit\\\"}}\" 2>nul || echo \"\"",
+                                    def lastBuiltCommit = bat(
+                                        script: "docker inspect ${imageName} --format=\"{{index .Config.Labels \\\"git.commit\\\"}}\" 2>nul || echo \"\"",
                                         returnStdout: true
                                     ).trim()
 
-                                    if (existingCommit && existingCommit != currentCommit) {
-                                        echo "[CHANGE DETECTED] ${app}: Commit changed (${existingCommit} -> ${currentCommit})"
-                                        needsBuild = true
-                                    } else if (!existingCommit) {
-                                        echo "[CHANGE DETECTED] ${app}: No git.commit label in existing image, rebuilding"
-                                        needsBuild = true
+                                    if (lastBuiltCommit && lastBuiltCommit != "unknown") {
+                                        echo "[INFO] ${app}: Last build was from commit ${lastBuiltCommit}. Comparing with current commit ${currentCommit}."
+                                        // Use git diff to check for changes in the specific app directory.
+                                        // returnStatus: true makes it return the exit code. 0 = no changes, 1 = changes.
+                                        def diffResult = bat(
+                                            script: "git diff --quiet ${lastBuiltCommit} ${currentCommit} -- ./${app}",
+                                            returnStatus: true
+                                        )
+
+                                        if (diffResult != 0) {
+                                            echo "[CHANGE DETECTED] ${app}: Code changes found in ./${app} since commit ${lastBuiltCommit}."
+                                            needsBuild = true
+                                        } else {
+                                            echo "[NO CHANGE] ${app}: No code changes in ./${app} since last build."
+                                        }
                                     } else {
-                                        echo "[NO CHANGE] ${app}: Commit unchanged (commit: ${currentCommit})"
+                                        echo "[CHANGE DETECTED] ${app}: No valid git.commit label on existing image. Rebuilding."
+                                        needsBuild = true
                                     }
                                     
-                                    // Clean up pulled image to save space
-                                    bat "docker rmi ${imageName} 2>nul || exit 0"
+                                    bat "docker rmi ${imageName} 2>nul || exit 0" // Clean up pulled image
                                 } else {
-                                    echo "[NEW IMAGE] ${app}: Image doesn't exist in registry"
+                                    echo "[NEW IMAGE] ${app}: Image does not exist in registry. Building."
                                     needsBuild = true
                                 }
-                            } catch (Exception e) {
-                                echo "[NEW IMAGE] ${app}: Unable to check existing image, will build"
+                            } catch (e) {
+                                echo "[ERROR] ${app}: Error during change detection. Assuming build is needed. Details: ${e.message}"
                                 needsBuild = true
                             }
 
@@ -276,7 +265,6 @@ pipeline {
                         bat "docker logout ${env.DOCKER_REGISTRY}"
                     }
 
-                    // Set environment variables based on detection results
                     if (changedApps.size() > 0) {
                         env.APPS_TO_BUILD = changedApps.join(',')
                         env.HAS_CHANGES = 'true'
@@ -309,31 +297,17 @@ pipeline {
                     def apps = env.APPS_TO_BUILD.split(',')
                     def buildJobs = [:]
 
-                    // Create parallel build jobs for each application
                     apps.each { app ->
                         buildJobs[app] = {
                             echo "[BUILD START] ${app}"
-
-                            // Determine the tag based on deployment environment
-                            def imageTag = ''
-                            if (env.DEPLOY_ENV == 'latest') {
-                                imageTag = 'latest'
-                            } else {
-                                def cleanBranchName = env.GIT_BRANCH_NAME
-                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
-                                    .toLowerCase()
-                                imageTag = cleanBranchName
-                            }
-
+                            def imageTag = (env.DEPLOY_ENV == 'latest') ? 'latest' : env.GIT_BRANCH_NAME.replaceAll('[^a-zA-Z0-9._-]', '-').toLowerCase()
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
 
                             try {
-                                // Ensure requirements.txt exists
                                 if (!fileExists("${app}/requirements.txt")) {
                                     writeFile file: "${app}/requirements.txt", text: "# No dependencies\n"
                                 }
 
-                                // Build Docker image with metadata labels
                                 bat """
                                     docker build \
                                         -t ${imageName}:${imageTag} \
@@ -345,8 +319,6 @@ pipeline {
                                 """
                                 
                                 echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag} (commit: ${env.GIT_COMMIT_HASH})"
-                                
-                                // Store tag for push stage
                                 writeFile file: "${app}_tag.txt", text: imageTag
 
                             } catch (Exception e) {
@@ -356,7 +328,6 @@ pipeline {
                         }
                     }
 
-                    // Execute all build jobs in parallel
                     parallel buildJobs
                     env.BUILD_COMPLETE = 'true'
                 }
@@ -375,7 +346,6 @@ pipeline {
                     echo "========================================="
                     echo ">>> ARTIFACTORY PUSH"
                     echo "========================================="
-
                     def apps = env.APPS_TO_BUILD.split(',')
 
                     withCredentials([usernamePassword(
@@ -384,11 +354,7 @@ pipeline {
                         passwordVariable: 'ARTIFACTORY_PASS'
                     )]) {
                         bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
-                        
-                        echo "[LOGIN] Successfully logged into Artifactory"
-
                         def pushJobs = [:]
-
                         apps.each { app ->
                             pushJobs[app] = {
                                 def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
@@ -397,19 +363,15 @@ pipeline {
                                 try {
                                     bat "docker push ${imageName}:${imageTag}"
                                     echo "[PUSH SUCCESS] ${app}: ${imageName}:${imageTag}"
-                                    
                                     env."${app}_PUSHED_TAG" = imageTag
-                                    
                                 } catch (Exception e) {
                                     echo "[PUSH ERROR] ${app}: ${e.message}"
                                     throw e
                                 }
                             }
                         }
-
                         parallel pushJobs
                     }
-
                     bat "docker logout ${env.DOCKER_REGISTRY}"
                 }
             }
@@ -425,7 +387,6 @@ pipeline {
             steps {
                 script {
                     echo "[CLEANUP] Cleaning up temporary files..."
-                    
                     try {
                         bat 'del /Q *_tag.txt 2>nul || exit 0'
                         echo "[CLEANUP] Temporary files removed"
@@ -501,27 +462,13 @@ pipeline {
                 echo "[DOCKER CLEANUP] Starting Docker cleanup..."
                 
                 try {
-                    // Remove temporary files
                     bat 'del /Q *_tag.txt 2>nul || exit 0'
-                    
-                    // Remove local Docker images
                     if (env.APPS_TO_BUILD) {
                         echo "[DOCKER CLEANUP] Removing local Docker images..."
                         def apps = env.APPS_TO_BUILD.split(',')
-                        
                         apps.each { app ->
+                            def imageTag = (env.DEPLOY_ENV == 'latest') ? 'latest' : env.GIT_BRANCH_NAME.replaceAll('[^a-zA-Z0-9._-]', '-').toLowerCase()
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
-                            def imageTag = ''
-                            
-                            if (env.DEPLOY_ENV == 'latest') {
-                                imageTag = 'latest'
-                            } else {
-                                def cleanBranchName = env.GIT_BRANCH_NAME
-                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
-                                    .toLowerCase()
-                                imageTag = cleanBranchName
-                            }
-                            
                             try {
                                 bat "docker rmi ${imageName}:${imageTag} 2>nul || exit 0"
                             } catch (Exception e) {
@@ -530,13 +477,10 @@ pipeline {
                         }
                     }
                     
-                    // Prune dangling images and build cache
                     echo "[DOCKER CLEANUP] Pruning Docker cache..."
                     bat 'docker image prune -f 2>nul || exit 0'
                     bat 'docker builder prune -f --filter "until=168h" 2>nul || exit 0'
-                    
                     echo "[DOCKER CLEANUP] Cleanup completed"
-                    
                 } catch (Exception e) {
                     echo "[DOCKER CLEANUP ERROR] ${e.message}"
                 }
