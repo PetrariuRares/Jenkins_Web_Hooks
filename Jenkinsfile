@@ -114,12 +114,13 @@ pipeline {
                             script: 'git rev-parse --short=8 HEAD',
                             returnStdout: true
                         ).trim()
+                        // CORRECTED: Escaped %B to %%B for Windows compatibility
                         env.GIT_COMMIT_MSG = bat(
-                            script: 'git log -1 --pretty=%B',
+                            script: 'git log -1 --pretty=%%B',
                             returnStdout: true
                         ).trim()
                         env.GIT_AUTHOR = bat(
-                            script: 'git log -1 --pretty=%an',
+                            script: 'git log -1 --pretty=%%an',
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
