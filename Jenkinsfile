@@ -60,7 +60,7 @@ pipeline {
         }
 
         // ================================================================================
-        // STAGE 2: Checkout Code
+        // STAGE 2: Checkout Code Test
         // Handles both manual branch selection and webhook triggers
         // Determines deployment target based on branch name
         // ================================================================================
