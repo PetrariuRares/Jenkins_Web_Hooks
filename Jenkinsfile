@@ -39,6 +39,7 @@ pipeline {
     stages {
         // ================================================================================
         // STAGE 1: Initialize Pipeline
+        // Sets up the build environment and displays configuration
         // ================================================================================
         stage('Initialize') {
             steps {
@@ -56,11 +57,8 @@ pipeline {
 
         // ================================================================================
         // STAGE 2: Checkout Code
-<<<<<<< Updated upstream
-=======
         // Handles both manual branch selection and webhook triggers
         // Determines deployment target based on branch name
->>>>>>> Stashed changes
         // ================================================================================
         stage('Checkout') {
             steps {
@@ -86,14 +84,14 @@ pipeline {
                         // Determine current branch name from git
                         try {
                             env.GIT_BRANCH_NAME = bat(
-                                script: 'git rev-parse --abbrev-ref HEAD',
+                                script: '@git rev-parse --abbrev-ref HEAD',
                                 returnStdout: true
                             ).trim()
                             
                             // Handle detached HEAD state
                             if (env.GIT_BRANCH_NAME == 'HEAD') {
                                 env.GIT_BRANCH_NAME = bat(
-                                    script: 'git branch -r --contains HEAD',
+                                    script: '@git branch -r --contains HEAD',
                                     returnStdout: true
                                 ).trim()
                                 // Clean up the branch name
@@ -114,36 +112,25 @@ pipeline {
 
                     // Extract commit information for traceability
                     try {
-                        // Using full git command for better reliability
                         env.GIT_COMMIT_HASH = bat(
-<<<<<<< Updated upstream
-                            script: 'git rev-parse --short=8 HEAD',
-=======
                             script: '@git rev-parse HEAD',
                             returnStdout: true
                         ).trim()
                         env.GIT_COMMIT_SHORT = bat(
                             script: '@git rev-parse --short=8 HEAD',
->>>>>>> Stashed changes
                             returnStdout: true
                         ).trim()
-                        // CORRECTED: Escaped %B to %%B for Windows compatibility
                         env.GIT_COMMIT_MSG = bat(
-                            script: 'git log -l --pretty=%%B',
+                            script: '@git log -1 --pretty=%%B',
                             returnStdout: true
                         ).trim()
                         env.GIT_AUTHOR = bat(
-                            script: 'git log -l --pretty=%%an',
+                            script: '@git log -1 --pretty=%%an',
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
-<<<<<<< Updated upstream
-                        error("Failed to get Git commit information. Error: ${e.message}")
-                        env.GIT_COMMIT_HASH = "unknown"
-=======
                         env.GIT_COMMIT_HASH = "unknown"
                         env.GIT_COMMIT_SHORT = "unknown-${BUILD_NUMBER}"
->>>>>>> Stashed changes
                         env.GIT_COMMIT_MSG = "Unknown"
                         env.GIT_AUTHOR = "Unknown"
                     }
@@ -155,9 +142,11 @@ pipeline {
 
                     // Determine deployment environment based on branch or manual override
                     if (params.DEPLOY_TARGET != 'auto') {
+                        // Manual deployment target override
                         env.DEPLOY_ENV = params.DEPLOY_TARGET
                         echo "[DEPLOY] Manual override: deploying to '${env.DEPLOY_ENV}'"
                     } else {
+                        // Auto-determine based on branch naming convention
                         if (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master') {
                             env.DEPLOY_ENV = 'latest'
                             echo "[DEPLOY] Main branch detected: deploying to 'latest'"
@@ -171,20 +160,16 @@ pipeline {
         }
 
         // ================================================================================
-<<<<<<< Updated upstream
-        // STAGE 3: Detect Changes (IMPROVED LOGIC)
-=======
         // STAGE 3: Detect Changes
         // Scans for applications with Dockerfiles
         // Compares git commits between current code and Artifactory images
         // Uses git diff to determine which specific apps have changes
->>>>>>> Stashed changes
         // ================================================================================
         stage('Detect Changes') {
             steps {
                 script {
                     echo "========================================="
-                    echo ">>> PER-APP CHANGE DETECTION (GIT DIFF BASED)"
+                    echo ">>> CHANGE DETECTION"
                     echo "========================================="
                     echo "[DISCOVERY] Scanning for applications..."
 
@@ -209,8 +194,10 @@ pipeline {
                             if (file && file.trim()) {
                                 def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
                                 def parts = relativePath.split('/')
+                                // Only consider Dockerfiles in immediate subdirectories (app pattern)
                                 if (parts.length == 2 && parts[1] == 'Dockerfile') {
                                     def appName = parts[0]
+                                    // Skip hidden directories
                                     if (!appName.startsWith('.')) {
                                         pythonApps.add(appName)
                                     }
@@ -221,17 +208,16 @@ pipeline {
 
                     echo "[APPS] Found ${pythonApps.size()} applications: ${pythonApps.join(', ')}"
 
+                    // Exit early if no applications found
                     if (pythonApps.size() == 0) {
                         env.HAS_CHANGES = 'false'
                         env.NO_APPS = 'true'
                         echo "[INFO] No applications with Dockerfiles found in repository"
+                        echo "[INFO] Pipeline will complete without building any images"
                         return
                     }
 
-<<<<<<< Updated upstream
-=======
                     // Connect to Artifactory to check existing images
->>>>>>> Stashed changes
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
                         usernameVariable: 'ARTIFACTORY_USER',
@@ -239,48 +225,34 @@ pipeline {
                     )]) {
                         bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
 
+                        // Check each application to determine if rebuild is needed
                         pythonApps.each { app ->
                             def needsBuild = false
-<<<<<<< Updated upstream
-                            def currentCommit = env.GIT_COMMIT_HASH
-=======
                             def reason = ""
->>>>>>> Stashed changes
 
-                            def imageTag = (env.DEPLOY_ENV == 'latest') ? 'latest' : env.GIT_BRANCH_NAME.replaceAll('[^a-zA-Z0-9._-]', '-').toLowerCase()
+                            // Determine the Docker tag based on environment
+                            def imageTag = ''
+                            if (env.DEPLOY_ENV == 'latest') {
+                                imageTag = 'latest'
+                            } else {
+                                // For dev environment, use sanitized branch name as tag
+                                def cleanBranchName = env.GIT_BRANCH_NAME
+                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
+                                    .toLowerCase()
+                                imageTag = cleanBranchName
+                            }
+
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${imageTag}"
 
-<<<<<<< Updated upstream
-=======
                             // Check if image exists in registry and compare git commits
->>>>>>> Stashed changes
                             try {
-                                def pullResult = bat(script: "docker pull ${imageName} 2>&1", returnStatus: true)
+                                // Attempt to pull the image from registry
+                                def pullResult = bat(
+                                    script: "docker pull ${imageName} 2>&1",
+                                    returnStatus: true
+                                )
 
                                 if (pullResult == 0) {
-<<<<<<< Updated upstream
-                                    def lastBuiltCommit = bat(
-                                        script: "docker inspect ${imageName} --format=\"{{index .Config.Labels \\\"git.commit\\\"}}\" 2>nul || echo \"\"",
-                                        returnStdout: true
-                                    ).trim()
-
-                                    if (lastBuiltCommit && lastBuiltCommit != "unknown") {
-                                        echo "[INFO] ${app}: Last build was from commit ${lastBuiltCommit}. Comparing with current commit ${currentCommit}."
-                                        def diffResult = bat(
-                                            script: "git diff --quiet ${lastBuiltCommit} ${currentCommit} -- ./${app}",
-                                            returnStatus: true
-                                        )
-
-                                        if (diffResult != 0) {
-                                            echo "[CHANGE DETECTED] ${app}: Code changes found in ./${app} since commit ${lastBuiltCommit}."
-                                            needsBuild = true
-                                        } else {
-                                            echo "[NO CHANGE] ${app}: No code changes in ./${app} since last build."
-                                        }
-                                    } else {
-                                        echo "[CHANGE DETECTED] ${app}: No valid git.commit label on existing image. Rebuilding."
-                                        needsBuild = true
-=======
                                     // Image exists, extract git commit from labels
                                     def existingCommit = bat(
                                         script: "@docker inspect ${imageName} --format=\"{{index .Config.Labels \\\"git.commit\\\"}}\" 2>nul || echo \"\"",
@@ -308,48 +280,34 @@ pipeline {
                                             needsBuild = false
                                             reason = "No changes in app directory (commits differ but app unchanged)"
                                         }
->>>>>>> Stashed changes
                                     }
                                     
-                                    bat "docker rmi ${imageName} 2>nul || exit 0" // Clean up pulled image
+                                    // Clean up pulled image to save space
+                                    bat "docker rmi ${imageName} 2>nul || exit 0"
                                 } else {
-<<<<<<< Updated upstream
-                                    echo "[NEW IMAGE] ${app}: Image does not exist in registry. Building."
-=======
                                     // Image doesn't exist
->>>>>>> Stashed changes
                                     needsBuild = true
                                     reason = "Image doesn't exist in registry"
                                 }
-<<<<<<< Updated upstream
-                            } catch (e) {
-                                echo "[ERROR] ${app}: Error during change detection. Assuming build is needed. Details: ${e.message}"
-=======
                             } catch (Exception e) {
                                 // Error checking image
->>>>>>> Stashed changes
                                 needsBuild = true
                                 reason = "Unable to check existing image: ${e.message}"
                             }
 
-<<<<<<< Updated upstream
-=======
                             // Log decision and add to build list if needed
->>>>>>> Stashed changes
                             if (needsBuild) {
                                 echo "[BUILD NEEDED] ${app}: ${reason}"
                                 changedApps.add(app)
-<<<<<<< Updated upstream
-=======
                             } else {
                                 echo "[SKIP] ${app}: ${reason}"
->>>>>>> Stashed changes
                             }
                         }
 
                         bat "docker logout ${env.DOCKER_REGISTRY}"
                     }
 
+                    // Set environment variables based on detection results
                     if (changedApps.size() > 0) {
                         env.APPS_TO_BUILD = changedApps.join(',')
                         env.HAS_CHANGES = 'true'
@@ -368,12 +326,9 @@ pipeline {
 
         // ================================================================================
         // STAGE 4: Build Docker Images
-<<<<<<< Updated upstream
-=======
         // Builds only the applications that have changes
         // Uses parallel execution for efficiency
         // Adds git commit as Docker label for future comparison
->>>>>>> Stashed changes
         // ================================================================================
         stage('Build Docker Images') {
             when {
@@ -388,12 +343,10 @@ pipeline {
                     def apps = env.APPS_TO_BUILD.split(',')
                     def buildJobs = [:]
 
+                    // Create parallel build jobs for each application
                     apps.each { app ->
                         buildJobs[app] = {
                             echo "[BUILD START] ${app}"
-<<<<<<< Updated upstream
-                            def imageTag = (env.DEPLOY_ENV == 'latest') ? 'latest' : env.GIT_BRANCH_NAME.replaceAll('[^a-zA-Z0-9._-]', '-').toLowerCase()
-=======
 
                             // Determine the tag based on deployment environment
                             def imageTag = ''
@@ -406,21 +359,14 @@ pipeline {
                                 imageTag = cleanBranchName
                             }
 
->>>>>>> Stashed changes
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
 
                             try {
+                                // Ensure requirements.txt exists (some apps might not have dependencies)
                                 if (!fileExists("${app}/requirements.txt")) {
                                     writeFile file: "${app}/requirements.txt", text: "# No dependencies\n"
                                 }
 
-<<<<<<< Updated upstream
-                                // FINAL FIX: Construct the command as a single-line Groovy string to prevent
-                                // Windows shell from misinterpreting line breaks.
-                                def dockerCommand = "docker build -t \"${imageName}:${imageTag}\" --label \"git.commit=${env.GIT_COMMIT_HASH}\" --label \"git.branch=${env.GIT_BRANCH_NAME}\" --label \"build.number=${BUILD_NUMBER}\" --label \"build.timestamp=${env.TIMESTAMP}\" -f \"${app}/Dockerfile\" \"${app}/\""
-                                
-                                bat(script: dockerCommand)
-=======
                                 // Build Docker image with metadata labels
                                 // Labels are used to track git commit and build information
                                 bat """
@@ -436,9 +382,8 @@ pipeline {
                                 """
                                 
                                 echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag}"
->>>>>>> Stashed changes
                                 
-                                echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag} (commit: ${env.GIT_COMMIT_HASH})"
+                                // Store tag for push stage
                                 writeFile file: "${app}_tag.txt", text: imageTag
 
                             } catch (Exception e) {
@@ -448,6 +393,7 @@ pipeline {
                         }
                     }
 
+                    // Execute all build jobs in parallel
                     parallel buildJobs
                     env.BUILD_COMPLETE = 'true'
                 }
@@ -456,6 +402,8 @@ pipeline {
 
         // ================================================================================
         // STAGE 5: Push to Artifactory
+        // Pushes built images to JFrog Artifactory
+        // Uses parallel uploads for efficiency
         // ================================================================================
         stage('Push to Artifactory') {
             when {
@@ -466,32 +414,47 @@ pipeline {
                     echo "========================================="
                     echo ">>> ARTIFACTORY PUSH"
                     echo "========================================="
+
                     def apps = env.APPS_TO_BUILD.split(',')
 
+                    // Authenticate with Artifactory
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
                         usernameVariable: 'ARTIFACTORY_USER',
                         passwordVariable: 'ARTIFACTORY_PASS'
                     )]) {
                         bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
+                        
+                        echo "[LOGIN] Successfully logged into Artifactory"
+
                         def pushJobs = [:]
+
+                        // Create parallel push jobs for each application
                         apps.each { app ->
                             pushJobs[app] = {
                                 def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
                                 def imageTag = readFile("${app}_tag.txt").trim()
                                 
                                 try {
-                                    bat "docker push \"${imageName}:${imageTag}\""
+                                    // Push image to registry
+                                    bat "docker push ${imageName}:${imageTag}"
                                     echo "[PUSH SUCCESS] ${app}: ${imageName}:${imageTag}"
+                                    
+                                    // Store pushed tag for summary report
                                     env."${app}_PUSHED_TAG" = imageTag
+                                    
                                 } catch (Exception e) {
                                     echo "[PUSH ERROR] ${app}: ${e.message}"
                                     throw e
                                 }
                             }
                         }
+
+                        // Execute all push jobs in parallel
                         parallel pushJobs
                     }
+
+                    // Logout from registry
                     bat "docker logout ${env.DOCKER_REGISTRY}"
                 }
             }
@@ -499,6 +462,7 @@ pipeline {
 
         // ================================================================================
         // STAGE 6: Cleanup Temporary Files
+        // Removes temporary files created during the build process
         // ================================================================================
         stage('Cleanup Temp Files') {
             when {
@@ -507,14 +471,11 @@ pipeline {
             steps {
                 script {
                     echo "[CLEANUP] Cleaning up temporary files..."
+                    
                     try {
-<<<<<<< Updated upstream
-                        bat 'del /Q *_tag.txt 2>nul || exit 0'
-=======
                         // Remove temporary tag files
                         bat 'del /Q *_tag.txt 2>nul || exit 0'
                         
->>>>>>> Stashed changes
                         echo "[CLEANUP] Temporary files removed"
                     } catch (Exception e) {
                         echo "[CLEANUP WARNING] Temp file cleanup failed: ${e.message}"
@@ -525,6 +486,7 @@ pipeline {
 
         // ================================================================================
         // STAGE 7: Build Summary
+        // Displays comprehensive build results and instructions
         // ================================================================================
         stage('Summary') {
             steps {
@@ -542,29 +504,34 @@ pipeline {
                         echo "Manual Branch Override: ${params.BRANCH_NAME}"
                     }
 
+                    // Display appropriate summary based on build results
                     if (env.NO_APPS == 'true') {
                         echo "\n[STATUS] No applications with Dockerfiles found in repository"
+                        echo "Add applications with Dockerfiles to enable Docker builds"
                     } else if (env.HAS_CHANGES == 'true') {
                         echo "\n>>> APPLICATIONS BUILT AND PUSHED:"
                         def apps = env.APPS_TO_BUILD.split(',')
                         apps.each { app ->
                             def pushedTag = env."${app}_PUSHED_TAG"
-                            echo "\n   ${app}:"
-                            echo "     Image: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
-                            echo "     Registry: https://${env.DOCKER_REGISTRY}/artifactory/webapp/#/artifacts/browse/tree/General/${env.DOCKER_REPO}/${app}"
+                            echo "\n  ${app}:"
+                            echo "    Image: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
+                            echo "    Registry: https://${env.DOCKER_REGISTRY}/artifactory/webapp/#/artifacts/browse/tree/General/${env.DOCKER_REPO}/${app}"
                         }
                         
+                        // Provide docker pull commands for easy access
                         echo "\n>>> TO PULL IMAGES:"
                         apps.each { app ->
                             def pushedTag = env."${app}_PUSHED_TAG"
-                            echo "   docker pull \"${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}\""
+                            echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
                         }
                     } else {
                         echo "\n[STATUS] No changes detected - all applications are up to date"
+                        echo "No builds performed, no new images pushed to Artifactory"
                     }
                     
                     echo "========================================="
 
+                    // Update Jenkins build description for dashboard visibility
                     if (env.NO_APPS == 'true') {
                         currentBuild.description = "No apps found | ${env.GIT_BRANCH_NAME}"
                     } else if (env.HAS_CHANGES == 'true') {
@@ -579,6 +546,7 @@ pipeline {
 
     // ================================================================================
     // POST-BUILD ACTIONS
+    // Cleanup and notifications that run regardless of build result
     // ================================================================================
     post {
         always {
@@ -588,34 +556,52 @@ pipeline {
                 echo "[DOCKER CLEANUP] Starting Docker cleanup..."
                 
                 try {
+                    // Remove temporary files
+                    echo "[DOCKER CLEANUP] Removing temporary files..."
                     bat 'del /Q *_tag.txt 2>nul || exit 0'
-<<<<<<< Updated upstream
-=======
                     
                     // Remove local Docker images to save disk space
->>>>>>> Stashed changes
                     if (env.APPS_TO_BUILD) {
                         echo "[DOCKER CLEANUP] Removing local Docker images..."
                         def apps = env.APPS_TO_BUILD.split(',')
+                        
                         apps.each { app ->
-                            def imageTag = (env.DEPLOY_ENV == 'latest') ? 'latest' : env.GIT_BRANCH_NAME.replaceAll('[^a-zA-Z0-9._-]', '-').toLowerCase()
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
+                            def imageTag = ''
+                            
+                            if (env.DEPLOY_ENV == 'latest') {
+                                imageTag = 'latest'
+                            } else {
+                                def cleanBranchName = env.GIT_BRANCH_NAME
+                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
+                                    .toLowerCase()
+                                imageTag = cleanBranchName
+                            }
+                            
                             try {
-                                bat "docker rmi \"${imageName}:${imageTag}\" 2>nul || exit 0"
+                                bat "docker rmi ${imageName}:${imageTag} 2>nul || exit 0"
                             } catch (Exception e) {
-                                // Ignore errors
+                                // Ignore errors during cleanup
                             }
                         }
                     }
                     
-                    echo "[DOCKER CLEANUP] Pruning Docker cache..."
+                    // Clean up dangling images
+                    echo "[DOCKER CLEANUP] Removing dangling images..."
                     bat 'docker image prune -f 2>nul || exit 0'
+                    
+                    // Clean up old build cache
+                    echo "[DOCKER CLEANUP] Cleaning Docker build cache..."
                     bat 'docker builder prune -f --filter "until=168h" 2>nul || exit 0'
-                    echo "[DOCKER CLEANUP] Cleanup completed"
+                    
+                    echo "[DOCKER CLEANUP] Cleanup completed successfully"
+                    
                 } catch (Exception e) {
                     echo "[DOCKER CLEANUP ERROR] ${e.message}"
                 }
                 
+                // Clean workspace to ensure fresh checkout next time
+                // This ensures no stale files affect future builds
                 echo "[WORKSPACE] Cleaning workspace for next build..."
                 deleteDir()
                 echo "[WORKSPACE] Workspace cleaned successfully"
@@ -623,14 +609,19 @@ pipeline {
         }
         success {
             echo "[SUCCESS] Pipeline executed successfully!"
+            script {
+                if (env.DEPLOY_ENV == 'latest') {
+                    echo "[NOTICE] Production deployment completed!"
+                    // Add Slack/Email notification here if needed
+                }
+            }
         }
         failure {
             echo "[FAILURE] Pipeline failed!"
+            // Add notification here if needed
         }
     }
 }
-<<<<<<< Updated upstream
-=======
 
 // ================================================================================
 // HELPER FUNCTION: Check if App Has Changes Between Commits
@@ -662,4 +653,3 @@ def checkAppChanges(appDir, fromCommit, toCommit) {
         return true
     }
 }
->>>>>>> Stashed changes
