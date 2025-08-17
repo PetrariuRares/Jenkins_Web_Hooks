@@ -283,18 +283,22 @@ pipeline {
                                     
                                     // Store the old SHA256 digest for potential cleanup later
                                     if (params.CLEANUP_OLD_SHA256) {
-                                        def oldDigest = bat(
-                                            script: "@docker inspect ${imageName} --format=\"{{.RepoDigests}}\" 2>nul || echo \"\"",
-                                            returnStdout: true
-                                        ).trim()
-                                        
-                                        if (oldDigest && oldDigest.contains('@sha256:')) {
-                                            def sha256Match = (oldDigest =~ /sha256:([a-f0-9]{64})/)
-                                            if (sha256Match) {
-                                                def oldSha256 = sha256Match[0][1]
-                                                writeFile file: "${app}_old_sha256.txt", text: oldSha256
-                                                echo "[SHA256 TRACKING] Stored old SHA256 for ${app}: ${oldSha256.substring(0, 12)}..."
+                                        try {
+                                            def oldDigest = bat(
+                                                script: "@docker inspect ${imageName} --format=\"{{.RepoDigests}}\" 2>nul || echo \"\"",
+                                                returnStdout: true
+                                            ).trim()
+                                            
+                                            if (oldDigest && oldDigest.contains('@sha256:')) {
+                                                def sha256Match = (oldDigest =~ /sha256:([a-f0-9]{64})/)
+                                                if (sha256Match.find()) {
+                                                    def oldSha256 = sha256Match.group(1)
+                                                    writeFile file: "${app}_old_sha256.txt", text: oldSha256
+                                                    echo "[SHA256 TRACKING] Stored old SHA256 for ${app}: ${oldSha256.substring(0, 12)}..."
+                                                }
                                             }
+                                        } catch (Exception sha256Ex) {
+                                            echo "[SHA256 WARNING] Could not extract old SHA256 for ${app}: ${sha256Ex.message}"
                                         }
                                     }
 
@@ -472,27 +476,32 @@ pipeline {
                                     env."${app}_PUSHED_TAG" = imageTag
                                     
                                     // Get the new SHA256 digest after push
-                                    def newDigest = bat(
-                                        script: "@docker inspect ${imageName}:${imageTag} --format=\"{{.RepoDigests}}\" 2>nul || echo \"\"",
-                                        returnStdout: true
-                                    ).trim()
-                                    
-                                    if (newDigest && newDigest.contains('@sha256:')) {
-                                        def sha256Match = (newDigest =~ /sha256:([a-f0-9]{64})/)
-                                        if (sha256Match) {
-                                            def newSha256 = sha256Match[0][1]
-                                            writeFile file: "${app}_new_sha256.txt", text: newSha256
-                                            echo "[SHA256] New digest for ${app}: ${newSha256.substring(0, 12)}..."
-                                            
-                                            // Schedule cleanup if old SHA256 exists and is different
-                                            if (params.CLEANUP_OLD_SHA256 && fileExists("${app}_old_sha256.txt")) {
-                                                def oldSha256 = readFile("${app}_old_sha256.txt").trim()
-                                                if (oldSha256 && oldSha256 != newSha256) {
-                                                    sha256Cleanup[app] = [old: oldSha256, new: newSha256]
-                                                    echo "[SHA256 CLEANUP] Scheduled cleanup for ${app}: old ${oldSha256.substring(0, 12)}..."
+                                    try {
+                                        def newDigest = bat(
+                                            script: "@docker inspect ${imageName}:${imageTag} --format=\"{{.RepoDigests}}\" 2>nul || echo \"\"",
+                                            returnStdout: true
+                                        ).trim()
+                                        
+                                        if (newDigest && newDigest.contains('@sha256:')) {
+                                            def sha256Match = (newDigest =~ /sha256:([a-f0-9]{64})/)
+                                            if (sha256Match.find()) {
+                                                def newSha256 = sha256Match.group(1)
+                                                writeFile file: "${app}_new_sha256.txt", text: newSha256
+                                                echo "[SHA256] New digest for ${app}: ${newSha256.substring(0, 12)}..."
+                                                
+                                                // Schedule cleanup if old SHA256 exists and is different
+                                                if (params.CLEANUP_OLD_SHA256 && fileExists("${app}_old_sha256.txt")) {
+                                                    def oldSha256 = readFile("${app}_old_sha256.txt").trim()
+                                                    if (oldSha256 && oldSha256 != newSha256) {
+                                                        sha256Cleanup[app] = [old: oldSha256, new: newSha256]
+                                                        echo "[SHA256 CLEANUP] Scheduled cleanup for ${app}: old ${oldSha256.substring(0, 12)}..."
+                                                    }
                                                 }
                                             }
                                         }
+                                    } catch (Exception sha256Ex) {
+                                        echo "[SHA256 WARNING] Could not extract SHA256 for ${app}: ${sha256Ex.message}"
+                                        echo "[SHA256 WARNING] Continuing without SHA256 cleanup for ${app}"
                                     }
                                     
                                 } catch (Exception e) {
