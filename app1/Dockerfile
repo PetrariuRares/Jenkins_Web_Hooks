@@ -1,41 +1,25 @@
-# Excel Data Generator Application
-# Specialized container for generating Excel files with business data
-
 FROM trialqlk1tc.jfrog.io/dockertest-docker/python-base:3.11
 
-# Set working directory
 WORKDIR /app
 
-
-# Copy requirements first for better caching
+# Copy only requirements first (better layer caching)
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Create output directory for Excel files
+# Create directories
 RUN mkdir -p /app/output
 
-# Copy application files
-COPY . .
+# Copy only source code (not everything)
+COPY src/ ./src/
+COPY *.py ./
 
-# Set permissions for Python scripts
-RUN chmod +x src/*.py
-
-# Create non-root user for security
-RUN chown -R appuser:appuser /app
+# Set up user and permissions
+RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Set environment variables
 ENV PYTHONPATH=/app/src
 ENV PYTHONUNBUFFERED=1
-ENV APP_NAME=excel-generator
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import pandas, openpyxl, numpy; print('Dependencies OK')" || exit 1
-
-# Default command runs the Excel generator
 CMD ["python", "src/excel_generator.py"]
 
 # Labels for container metadata

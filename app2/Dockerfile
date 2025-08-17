@@ -15,24 +15,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Create directories for input/output
 RUN mkdir -p /app/input /app/output /app/reports
 
-# Copy application files
-COPY . .
+# Copy only the necessary application source code
+# This improves layer caching by not copying everything (.)
+COPY processor_main.py .
+# If you have other source files (e.g., in a 'src' directory), copy them here
+# COPY src/ ./src/
 
-# Set permissions for Python scripts
-RUN find . -name "*.py" -exec chmod +x {} \;
-
-# Create non-root user for security
-RUN chown -R appuser:appuser /app
+# Create non-root user and set permissions in a single layer
+RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
 # Set environment variables
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
-ENV APP_NAME=excel-processor
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import pandas, matplotlib, seaborn; print('Dependencies OK')" || exit 1
 
 # Default command runs the Excel processor
 CMD ["python", "processor_main.py"]

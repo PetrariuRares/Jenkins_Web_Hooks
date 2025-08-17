@@ -194,52 +194,81 @@ pipeline {
                         return
                     }
 
-                    // Detect changes or force build
-                    if (params.FORCE_BUILD) {
-                        echo "[FORCE_BUILD] Building all applications"
-                        changedApps = pythonApps
-                    } else {
-                        // Check for changes
-                        try {
-                            def commitCount = bat(
-                                script: '@git rev-list --count HEAD',
-                                returnStdout: true
-                            ).trim()
+                    // Calculate content hash for each application
+                    def appHashes = [:]
+                    pythonApps.each { app ->
+                        def hash = calculateAppContentHash(app)
+                        appHashes[app] = hash
+                        echo "[HASH] ${app}: ${hash}"
+                    }
 
-                            if (commitCount == '1') {
-                                echo "[FIRST_COMMIT] Building all applications"
-                                changedApps = pythonApps
+                    // Login to check existing images
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
+
+                        // Check which apps actually need building
+                        pythonApps.each { app ->
+                            def currentHash = appHashes[app]
+                            def needsBuild = false
+
+                            // Determine the tag
+                            def imageTag = ''
+                            if (env.DEPLOY_ENV == 'latest') {
+                                imageTag = 'latest'
                             } else {
-                                // Get list of changed files
-                                def gitDiff = bat(
-                                    script: '@git diff --name-only HEAD~1 HEAD',
-                                    returnStdout: true
-                                ).trim()
-
-                                if (gitDiff) {
-                                    def changedFiles = gitDiff.split('\r?\n')
-                                    
-                                    echo "[CHANGED_FILES] ${changedFiles.size()} files changed:"
-                                    changedFiles.each { file ->
-                                        echo "  - ${file}"
-                                    }
-                                    
-                                    // Determine which apps have changes
-                                    changedFiles.each { file ->
-                                        def parts = file.split('/')
-                                        if (parts.length > 0) {
-                                            def app = parts[0]
-                                            if (pythonApps.contains(app) && !changedApps.contains(app)) {
-                                                changedApps.add(app)
-                                            }
-                                        }
-                                    }
-                                }
+                                def cleanBranchName = env.GIT_BRANCH_NAME
+                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
+                                    .toLowerCase()
+                                imageTag = cleanBranchName
                             }
-                        } catch (Exception e) {
-                            echo "[WARNING] Could not determine changes, building all applications"
-                            changedApps = pythonApps
+
+                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${imageTag}"
+
+                            // Check if image exists and get its label
+                            try {
+                                // Try to pull the image to check if it exists
+                                def pullResult = bat(
+                                    script: "docker pull ${imageName} 2>&1",
+                                    returnStatus: true
+                                )
+
+                                if (pullResult == 0) {
+                                    // Image exists, check its content hash
+                                    def existingHash = bat(
+                                        script: "@docker inspect ${imageName} --format=\"{{index .Config.Labels \\\"content.hash\\\"}}\" 2>nul || echo \"\"",
+                                        returnStdout: true
+                                    ).trim()
+
+                                    if (existingHash && existingHash != currentHash) {
+                                        echo "[CHANGE] ${app}: Content changed (${existingHash} -> ${currentHash})"
+                                        needsBuild = true
+                                    } else if (!existingHash) {
+                                        echo "[CHANGE] ${app}: No content hash in existing image, rebuilding"
+                                        needsBuild = true
+                                    } else {
+                                        echo "[SKIP] ${app}: Content unchanged (${currentHash})"
+                                    }
+                                } else {
+                                    echo "[NEW] ${app}: Image doesn't exist in registry"
+                                    needsBuild = true
+                                }
+                            } catch (Exception e) {
+                                echo "[NEW] ${app}: Unable to check existing image, will build"
+                                needsBuild = true
+                            }
+
+                            if (needsBuild || params.FORCE_BUILD) {
+                                changedApps.add(app)
+                                // Store hash for build stage
+                                writeFile file: "${app}_hash.txt", text: currentHash
+                            }
                         }
+
+                        bat "docker logout ${env.DOCKER_REGISTRY}"
                     }
 
                     if (changedApps.size() > 0) {
@@ -248,7 +277,7 @@ pipeline {
                         echo "[BUILD_LIST] Applications to build: ${env.APPS_TO_BUILD}"
                     } else {
                         env.HAS_CHANGES = 'false'
-                        echo "[INFO] No changes detected in any application"
+                        echo "[INFO] No applications need building - all content is up to date"
                     }
                 }
             }
@@ -269,15 +298,15 @@ pipeline {
                         buildJobs[app] = {
                             echo "[BUILD] Building ${app}..."
 
+                            // Read the content hash
+                            def contentHash = readFile("${app}_hash.txt").trim()
+
                             // Determine the tag based on environment and branch
                             def imageTag = ''
                             
                             if (env.DEPLOY_ENV == 'latest') {
-                                // For latest, always use 'latest' tag
                                 imageTag = 'latest'
                             } else {
-                                // For dev, use the branch name as tag
-                                // Clean branch name for use as Docker tag
                                 def cleanBranchName = env.GIT_BRANCH_NAME
                                     .replaceAll('[^a-zA-Z0-9._-]', '-')
                                     .toLowerCase()
@@ -292,10 +321,20 @@ pipeline {
                                     writeFile file: "${app}/requirements.txt", text: "# No dependencies\n"
                                 }
 
-                                // Build the Docker image
-                                bat "docker build -t ${imageName}:${imageTag} -f ${app}/Dockerfile ${app}/"
+                                // Build the Docker image with content hash label and build args for better caching
+                                bat """
+                                    docker build \
+                                        -t ${imageName}:${imageTag} \
+                                        --label content.hash=${contentHash} \
+                                        --label build.number=${BUILD_NUMBER} \
+                                        --label git.commit=${env.GIT_COMMIT_HASH} \
+                                        --label git.branch=${env.GIT_BRANCH_NAME} \
+                                        --cache-from ${imageName}:${imageTag} \
+                                        --build-arg BUILDKIT_INLINE_CACHE=1 \
+                                        -f ${app}/Dockerfile ${app}/
+                                """
                                 
-                                echo "[SUCCESS] Built ${imageName}:${imageTag}"
+                                echo "[SUCCESS] Built ${imageName}:${imageTag} with hash ${contentHash}"
                                 
                                 // Store tag for push stage
                                 writeFile file: "${app}_tag.txt", text: imageTag
@@ -372,8 +411,9 @@ pipeline {
                     echo "[CLEANUP] Cleaning up temporary files..."
                     
                     try {
-                        // Remove temporary tag files
+                        // Remove temporary tag and hash files
                         bat 'del /Q *_tag.txt 2>nul || exit 0'
+                        bat 'del /Q *_hash.txt 2>nul || exit 0'
                         
                     } catch (Exception e) {
                         echo "[WARNING] Temp file cleanup failed: ${e.message}"
@@ -417,7 +457,7 @@ pipeline {
                             echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
                         }
                     } else {
-                        echo "\nStatus: No changes detected in applications"
+                        echo "\nStatus: No changes detected - all applications are up to date"
                     }
                     
                     echo "========================================="
@@ -443,66 +483,18 @@ pipeline {
                 echo "[DOCKER CLEANUP] Starting Docker cleanup..."
                 
                 try {
-                    // Stop and remove any running containers from this build
-                    def runningContainers = bat(
-                        script: '@docker ps -a -q --filter "label=jenkins.build=${BUILD_NUMBER}" 2>nul',
-                        returnStdout: true
-                    ).trim()
-                    
-                    if (runningContainers) {
-                        echo "[DOCKER CLEANUP] Stopping and removing containers..."
-                        bat "docker rm -f ${runningContainers}"
-                    }
-                    
-                    // Remove images that were built in this pipeline
-                    if (env.APPS_TO_BUILD) {
-                        echo "[DOCKER CLEANUP] Removing built images..."
-                        def apps = env.APPS_TO_BUILD.split(',')
-                        
-                        apps.each { app ->
-                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
-                            
-                            // Get the tag that was used
-                            def imageTag = ''
-                            if (fileExists("${app}_tag.txt")) {
-                                imageTag = readFile("${app}_tag.txt").trim()
-                            } else if (env.DEPLOY_ENV == 'latest') {
-                                imageTag = 'latest'
-                            } else {
-                                def cleanBranchName = env.GIT_BRANCH_NAME
-                                    .replaceAll('/', '-')
-                                    .replaceAll('[^a-zA-Z0-9._-]', '')
-                                    .toLowerCase()
-                                imageTag = cleanBranchName
-                            }
-                            
-                            try {
-                                echo "[DOCKER CLEANUP] Removing ${imageName}:${imageTag}"
-                                bat "docker rmi ${imageName}:${imageTag} 2>nul || exit 0"
-                            } catch (Exception e) {
-                                echo "[WARNING] Could not remove ${imageName}:${imageTag}"
-                            }
-                        }
-                    }
-                    
-                    // Remove all dangling images (untagged images)
-                    echo "[DOCKER CLEANUP] Removing dangling images..."
-                    bat 'docker image prune -f 2>nul || exit 0'
-                    
-                    // Optional: Remove all unused images (commented out as it might be too aggressive)
-                    // bat 'docker image prune -a -f --filter "until=24h" 2>nul || exit 0'
-                    
-                    // Clean up build cache to free space
-                    echo "[DOCKER CLEANUP] Cleaning Docker build cache..."
-                    bat 'docker builder prune -f --filter "until=24h" 2>nul || exit 0'
-                    
                     // Remove temporary files
                     echo "[DOCKER CLEANUP] Removing temporary files..."
                     bat 'del /Q *_tag.txt 2>nul || exit 0'
+                    bat 'del /Q *_hash.txt 2>nul || exit 0'
                     
-                    // Show remaining Docker images for debugging
-                    echo "[DOCKER CLEANUP] Remaining Docker images:"
-                    bat 'docker images --format "table {{.Repository}}:{{.Tag}}\\t{{.Size}}\\t{{.CreatedAt}}" 2>nul || echo No images found'
+                    // Clean up dangling images
+                    echo "[DOCKER CLEANUP] Removing dangling images..."
+                    bat 'docker image prune -f 2>nul || exit 0'
+                    
+                    // Clean up old build cache (older than 7 days)
+                    echo "[DOCKER CLEANUP] Cleaning Docker build cache..."
+                    bat 'docker builder prune -f --filter "until=168h" 2>nul || exit 0'
                     
                     echo "[DOCKER CLEANUP] Cleanup completed successfully"
                     
@@ -525,5 +517,63 @@ pipeline {
             echo "[FAILURE] Pipeline failed!"
             // Add notification here if needed
         }
+    }
+}
+
+// Helper function to calculate content hash for an application
+def calculateAppContentHash(appDir) {
+    try {
+        // Get list of relevant files (excluding .dockerignore patterns)
+        def relevantFiles = []
+        
+        // Read .dockerignore if it exists
+        def dockerignorePath = "${appDir}/.dockerignore"
+        def ignorePatterns = []
+        if (fileExists(dockerignorePath)) {
+            def dockerignore = readFile(dockerignorePath)
+            ignorePatterns = dockerignore.split('\n').findAll { it.trim() && !it.startsWith('#') }
+        }
+        
+        // Get all files in the app directory
+        def allFiles = bat(
+            script: "@dir /b /s \"${appDir}\" 2>nul | findstr /v \"\\.git\" | findstr /v \"__pycache__\" | findstr /v \"\\.pyc\"",
+            returnStdout: true
+        ).trim().split('\r?\n')
+        
+        // Filter files based on dockerignore patterns (simplified)
+        def filesToHash = []
+        allFiles.each { file ->
+            def relativePath = file.replace(env.WORKSPACE + '\\' + appDir + '\\', '')
+            def shouldInclude = true
+            
+            // Simple dockerignore matching (not comprehensive)
+            ignorePatterns.each { pattern ->
+                if (relativePath.contains(pattern.replace('*', ''))) {
+                    shouldInclude = false
+                }
+            }
+            
+            if (shouldInclude && file.endsWith('.py') || file.endsWith('.txt') || file.contains('Dockerfile') || file.endsWith('.json') || file.endsWith('.yml') || file.endsWith('.yaml')) {
+                filesToHash.add(file)
+            }
+        }
+        
+        // Calculate hash of all relevant file contents
+        def combinedHash = ''
+        filesToHash.sort().each { file ->
+            if (fileExists(file)) {
+                def content = readFile(file)
+                // Simple hash calculation (you might want to use a proper hash function)
+                combinedHash += content.hashCode().toString()
+            }
+        }
+        
+        // Return a hash of the combined content
+        return combinedHash.hashCode().toString()
+        
+    } catch (Exception e) {
+        echo "[WARNING] Could not calculate hash for ${appDir}: ${e.message}"
+        // Return timestamp as fallback to ensure build happens
+        return new Date().getTime().toString()
     }
 }
