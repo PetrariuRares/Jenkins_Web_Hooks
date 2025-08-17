@@ -116,11 +116,11 @@ pipeline {
                         ).trim()
                         // CORRECTED: Escaped %B to %%B for Windows compatibility
                         env.GIT_COMMIT_MSG = bat(
-                            script: 'git log -1 --pretty=%%B',
+                            script: 'git log -l --pretty=%%B',
                             returnStdout: true
                         ).trim()
                         env.GIT_AUTHOR = bat(
-                            script: 'git log -1 --pretty=%%an',
+                            script: 'git log -l --pretty=%%an',
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
@@ -305,16 +305,10 @@ pipeline {
                                     writeFile file: "${app}/requirements.txt", text: "# No dependencies\n"
                                 }
 
-                                // CORRECTED: Construct the command as a Groovy string first to ensure
-                                // proper variable interpolation before passing it to the bat step.
-                                def dockerCommand = """
-                                    docker build -t "${imageName}:${imageTag}" \
-                                    --label "git.commit=${env.GIT_COMMIT_HASH}" \
-                                    --label "git.branch=${env.GIT_BRANCH_NAME}" \
-                                    --label "build.number=${BUILD_NUMBER}" \
-                                    --label "build.timestamp=${env.TIMESTAMP}" \
-                                    -f "${app}/Dockerfile" "${app}/"
-                                """
+                                // FINAL FIX: Construct the command as a single-line Groovy string to prevent
+                                // Windows shell from misinterpreting line breaks.
+                                def dockerCommand = "docker build -t \"${imageName}:${imageTag}\" --label \"git.commit=${env.GIT_COMMIT_HASH}\" --label \"git.branch=${env.GIT_BRANCH_NAME}\" --label \"build.number=${BUILD_NUMBER}\" --label \"build.timestamp=${env.TIMESTAMP}\" -f \"${app}/Dockerfile\" \"${app}/\""
+                                
                                 bat(script: dockerCommand)
                                 
                                 echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag} (commit: ${env.GIT_COMMIT_HASH})"
@@ -360,7 +354,7 @@ pipeline {
                                 def imageTag = readFile("${app}_tag.txt").trim()
                                 
                                 try {
-                                    bat "docker push ${imageName}:${imageTag}"
+                                    bat "docker push \"${imageName}:${imageTag}\""
                                     echo "[PUSH SUCCESS] ${app}: ${imageName}:${imageTag}"
                                     env."${app}_PUSHED_TAG" = imageTag
                                 } catch (Exception e) {
@@ -430,7 +424,7 @@ pipeline {
                         echo "\n>>> TO PULL IMAGES:"
                         apps.each { app ->
                             def pushedTag = env."${app}_PUSHED_TAG"
-                            echo "   docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
+                            echo "   docker pull \"${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}\""
                         }
                     } else {
                         echo "\n[STATUS] No changes detected - all applications are up to date"
@@ -469,7 +463,7 @@ pipeline {
                             def imageTag = (env.DEPLOY_ENV == 'latest') ? 'latest' : env.GIT_BRANCH_NAME.replaceAll('[^a-zA-Z0-9._-]', '-').toLowerCase()
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
                             try {
-                                bat "docker rmi ${imageName}:${imageTag} 2>nul || exit 0"
+                                bat "docker rmi \"${imageName}:${imageTag}\" 2>nul || exit 0"
                             } catch (Exception e) {
                                 // Ignore errors
                             }
