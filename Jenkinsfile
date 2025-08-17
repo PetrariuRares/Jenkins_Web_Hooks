@@ -39,7 +39,6 @@ pipeline {
     stages {
         // ================================================================================
         // STAGE 1: Initialize Pipeline
-        // Sets up the build environment and displays configuration
         // ================================================================================
         stage('Initialize') {
             steps {
@@ -50,19 +49,13 @@ pipeline {
                     echo "Build Number: ${BUILD_NUMBER}"
                     echo "Manual Branch Override: ${params.BRANCH_NAME ?: 'none'}"
                     echo "Deploy Target: ${params.DEPLOY_TARGET}"
-                    if (params.FORCE_BUILD) {
-                        echo "[WARNING] FORCE_BUILD parameter is deprecated and ignored"
-                        echo "[INFO] Builds only occur when actual changes are detected"
-                    }
                     echo "========================================="
                 }
             }
         }
 
         // ================================================================================
-        // STAGE 2: Checkout Code Test
-        // Handles both manual branch selection and webhook triggers
-        // Determines deployment target based on branch name
+        // STAGE 2: Checkout Code
         // ================================================================================
         stage('Checkout') {
             steps {
@@ -121,11 +114,11 @@ pipeline {
                             returnStdout: true
                         ).trim()
                         env.GIT_COMMIT_MSG = bat(
-                            script: '@git log -1 --pretty=%%B',
+                            script: '@git log -1 --pretty=%B',
                             returnStdout: true
                         ).trim()
                         env.GIT_AUTHOR = bat(
-                            script: '@git log -1 --pretty=%%an',
+                            script: '@git log -1 --pretty=%an',
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
@@ -159,16 +152,15 @@ pipeline {
         }
 
         // ================================================================================
-        // STAGE 3: Detect Changes
+        // STAGE 3: Detect Changes (MODIFIED LOGIC)
         // Scans for applications with Dockerfiles
-        // Calculates content hashes to determine what needs rebuilding
-        // Compares with existing images in Artifactory
+        // Compares local git commit with the git.commit label on the image in Artifactory
         // ================================================================================
         stage('Detect Changes') {
             steps {
                 script {
                     echo "========================================="
-                    echo ">>> CHANGE DETECTION"
+                    echo ">>> CHANGE DETECTION (COMMIT HASH BASED)"
                     echo "========================================="
                     echo "[DISCOVERY] Scanning for Python applications..."
 
@@ -193,10 +185,8 @@ pipeline {
                             if (file && file.trim()) {
                                 def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
                                 def parts = relativePath.split('/')
-                                // Only consider Dockerfiles in immediate subdirectories (app pattern)
                                 if (parts.length == 2 && parts[1] == 'Dockerfile') {
                                     def appName = parts[0]
-                                    // Skip hidden directories
                                     if (!appName.startsWith('.')) {
                                         pythonApps.add(appName)
                                     }
@@ -212,17 +202,7 @@ pipeline {
                         env.HAS_CHANGES = 'false'
                         env.NO_APPS = 'true'
                         echo "[INFO] No applications with Dockerfiles found in repository"
-                        echo "[INFO] Pipeline will complete without building any images"
                         return
-                    }
-
-                    // Calculate content hash for each application
-                    // This hash represents the current state of the application's code
-                    def appHashes = [:]
-                    pythonApps.each { app ->
-                        def hash = calculateAppContentHash(app)
-                        appHashes[app] = hash
-                        echo "[HASH] ${app}: ${hash}"
                     }
 
                     // Connect to Artifactory to check existing images
@@ -235,8 +215,8 @@ pipeline {
 
                         // Check each application to determine if rebuild is needed
                         pythonApps.each { app ->
-                            def currentHash = appHashes[app]
                             def needsBuild = false
+                            def currentCommit = env.GIT_COMMIT_HASH
 
                             // Determine the Docker tag based on environment
                             def imageTag = ''
@@ -252,7 +232,7 @@ pipeline {
 
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${imageTag}"
 
-                            // Check if image exists in registry and compare content hash
+                            // Check if image exists in registry and compare commit hash
                             try {
                                 // Attempt to pull the image from registry
                                 def pullResult = bat(
@@ -261,20 +241,20 @@ pipeline {
                                 )
 
                                 if (pullResult == 0) {
-                                    // Image exists, extract and compare content hash from labels
-                                    def existingHash = bat(
-                                        script: "@docker inspect ${imageName} --format=\"{{index .Config.Labels \\\"content.hash\\\"}}\" 2>nul || echo \"\"",
+                                    // Image exists, extract and compare commit hash from labels
+                                    def existingCommit = bat(
+                                        script: "@docker inspect ${imageName} --format=\"{{index .Config.Labels \\\"git.commit\\\"}}\" 2>nul || echo \"\"",
                                         returnStdout: true
                                     ).trim()
 
-                                    if (existingHash && existingHash != currentHash) {
-                                        echo "[CHANGE DETECTED] ${app}: Content changed (${existingHash} -> ${currentHash})"
+                                    if (existingCommit && existingCommit != currentCommit) {
+                                        echo "[CHANGE DETECTED] ${app}: Commit changed (${existingCommit} -> ${currentCommit})"
                                         needsBuild = true
-                                    } else if (!existingHash) {
-                                        echo "[CHANGE DETECTED] ${app}: No content hash in existing image, rebuilding"
+                                    } else if (!existingCommit) {
+                                        echo "[CHANGE DETECTED] ${app}: No git.commit label in existing image, rebuilding"
                                         needsBuild = true
                                     } else {
-                                        echo "[NO CHANGE] ${app}: Content unchanged (hash: ${currentHash})"
+                                        echo "[NO CHANGE] ${app}: Commit unchanged (commit: ${currentCommit})"
                                     }
                                     
                                     // Clean up pulled image to save space
@@ -288,12 +268,8 @@ pipeline {
                                 needsBuild = true
                             }
 
-                            // Only add to build list if actual changes detected
-                            // FORCE_BUILD is intentionally ignored here
                             if (needsBuild) {
                                 changedApps.add(app)
-                                // Store hash for build stage
-                                writeFile file: "${app}_hash.txt", text: currentHash
                             }
                         }
 
@@ -319,9 +295,6 @@ pipeline {
 
         // ================================================================================
         // STAGE 4: Build Docker Images
-        // Builds only the applications that have changes
-        // Uses parallel execution for efficiency
-        // Adds content hash as Docker label for future comparison
         // ================================================================================
         stage('Build Docker Images') {
             when {
@@ -341,9 +314,6 @@ pipeline {
                         buildJobs[app] = {
                             echo "[BUILD START] ${app}"
 
-                            // Read the content hash calculated earlier
-                            def contentHash = readFile("${app}_hash.txt").trim()
-
                             // Determine the tag based on deployment environment
                             def imageTag = ''
                             if (env.DEPLOY_ENV == 'latest') {
@@ -358,25 +328,23 @@ pipeline {
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
 
                             try {
-                                // Ensure requirements.txt exists (some apps might not have dependencies)
+                                // Ensure requirements.txt exists
                                 if (!fileExists("${app}/requirements.txt")) {
                                     writeFile file: "${app}/requirements.txt", text: "# No dependencies\n"
                                 }
 
                                 // Build Docker image with metadata labels
-                                // Labels are used to track content hash and build information
                                 bat """
                                     docker build \
                                         -t ${imageName}:${imageTag} \
-                                        --label content.hash=${contentHash} \
-                                        --label build.number=${BUILD_NUMBER} \
                                         --label git.commit=${env.GIT_COMMIT_HASH} \
                                         --label git.branch=${env.GIT_BRANCH_NAME} \
+                                        --label build.number=${BUILD_NUMBER} \
                                         --label build.timestamp=${env.TIMESTAMP} \
                                         -f ${app}/Dockerfile ${app}/
                                 """
                                 
-                                echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag} (hash: ${contentHash})"
+                                echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag} (commit: ${env.GIT_COMMIT_HASH})"
                                 
                                 // Store tag for push stage
                                 writeFile file: "${app}_tag.txt", text: imageTag
@@ -397,8 +365,6 @@ pipeline {
 
         // ================================================================================
         // STAGE 5: Push to Artifactory
-        // Pushes built images to JFrog Artifactory
-        // Uses parallel uploads for efficiency
         // ================================================================================
         stage('Push to Artifactory') {
             when {
@@ -412,7 +378,6 @@ pipeline {
 
                     def apps = env.APPS_TO_BUILD.split(',')
 
-                    // Authenticate with Artifactory
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
                         usernameVariable: 'ARTIFACTORY_USER',
@@ -424,18 +389,15 @@ pipeline {
 
                         def pushJobs = [:]
 
-                        // Create parallel push jobs for each application
                         apps.each { app ->
                             pushJobs[app] = {
                                 def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
                                 def imageTag = readFile("${app}_tag.txt").trim()
                                 
                                 try {
-                                    // Push image to registry
                                     bat "docker push ${imageName}:${imageTag}"
                                     echo "[PUSH SUCCESS] ${app}: ${imageName}:${imageTag}"
                                     
-                                    // Store pushed tag for summary report
                                     env."${app}_PUSHED_TAG" = imageTag
                                     
                                 } catch (Exception e) {
@@ -445,11 +407,9 @@ pipeline {
                             }
                         }
 
-                        // Execute all push jobs in parallel
                         parallel pushJobs
                     }
 
-                    // Logout from registry
                     bat "docker logout ${env.DOCKER_REGISTRY}"
                 }
             }
@@ -457,7 +417,6 @@ pipeline {
 
         // ================================================================================
         // STAGE 6: Cleanup Temporary Files
-        // Removes temporary files created during the build process
         // ================================================================================
         stage('Cleanup Temp Files') {
             when {
@@ -468,10 +427,7 @@ pipeline {
                     echo "[CLEANUP] Cleaning up temporary files..."
                     
                     try {
-                        // Remove temporary tag and hash files
                         bat 'del /Q *_tag.txt 2>nul || exit 0'
-                        bat 'del /Q *_hash.txt 2>nul || exit 0'
-                        
                         echo "[CLEANUP] Temporary files removed"
                     } catch (Exception e) {
                         echo "[CLEANUP WARNING] Temp file cleanup failed: ${e.message}"
@@ -482,7 +438,6 @@ pipeline {
 
         // ================================================================================
         // STAGE 7: Build Summary
-        // Displays comprehensive build results and instructions
         // ================================================================================
         stage('Summary') {
             steps {
@@ -500,34 +455,29 @@ pipeline {
                         echo "Manual Branch Override: ${params.BRANCH_NAME}"
                     }
 
-                    // Display appropriate summary based on build results
                     if (env.NO_APPS == 'true') {
                         echo "\n[STATUS] No applications with Dockerfiles found in repository"
-                        echo "Add applications with Dockerfiles to enable Docker builds"
                     } else if (env.HAS_CHANGES == 'true') {
                         echo "\n>>> APPLICATIONS BUILT AND PUSHED:"
                         def apps = env.APPS_TO_BUILD.split(',')
                         apps.each { app ->
                             def pushedTag = env."${app}_PUSHED_TAG"
-                            echo "\n  ${app}:"
-                            echo "    Image: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
-                            echo "    Registry: https://${env.DOCKER_REGISTRY}/artifactory/webapp/#/artifacts/browse/tree/General/${env.DOCKER_REPO}/${app}"
+                            echo "\n   ${app}:"
+                            echo "     Image: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
+                            echo "     Registry: https://${env.DOCKER_REGISTRY}/artifactory/webapp/#/artifacts/browse/tree/General/${env.DOCKER_REPO}/${app}"
                         }
                         
-                        // Provide docker pull commands for easy access
                         echo "\n>>> TO PULL IMAGES:"
                         apps.each { app ->
                             def pushedTag = env."${app}_PUSHED_TAG"
-                            echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
+                            echo "   docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
                         }
                     } else {
                         echo "\n[STATUS] No changes detected - all applications are up to date"
-                        echo "No builds performed, no new images pushed to Artifactory"
                     }
                     
                     echo "========================================="
 
-                    // Update Jenkins build description for dashboard visibility
                     if (env.NO_APPS == 'true') {
                         currentBuild.description = "No apps found | ${env.GIT_BRANCH_NAME}"
                     } else if (env.HAS_CHANGES == 'true') {
@@ -542,7 +492,6 @@ pipeline {
 
     // ================================================================================
     // POST-BUILD ACTIONS
-    // Cleanup and notifications that run regardless of build result
     // ================================================================================
     post {
         always {
@@ -553,11 +502,9 @@ pipeline {
                 
                 try {
                     // Remove temporary files
-                    echo "[DOCKER CLEANUP] Removing temporary files..."
                     bat 'del /Q *_tag.txt 2>nul || exit 0'
-                    bat 'del /Q *_hash.txt 2>nul || exit 0'
                     
-                    // Remove local Docker images to save disk space
+                    // Remove local Docker images
                     if (env.APPS_TO_BUILD) {
                         echo "[DOCKER CLEANUP] Removing local Docker images..."
                         def apps = env.APPS_TO_BUILD.split(',')
@@ -578,27 +525,22 @@ pipeline {
                             try {
                                 bat "docker rmi ${imageName}:${imageTag} 2>nul || exit 0"
                             } catch (Exception e) {
-                                // Ignore errors during cleanup
+                                // Ignore errors
                             }
                         }
                     }
                     
-                    // Clean up dangling images
-                    echo "[DOCKER CLEANUP] Removing dangling images..."
+                    // Prune dangling images and build cache
+                    echo "[DOCKER CLEANUP] Pruning Docker cache..."
                     bat 'docker image prune -f 2>nul || exit 0'
-                    
-                    // Clean up old build cache
-                    echo "[DOCKER CLEANUP] Cleaning Docker build cache..."
                     bat 'docker builder prune -f --filter "until=168h" 2>nul || exit 0'
                     
-                    echo "[DOCKER CLEANUP] Cleanup completed successfully"
+                    echo "[DOCKER CLEANUP] Cleanup completed"
                     
                 } catch (Exception e) {
                     echo "[DOCKER CLEANUP ERROR] ${e.message}"
                 }
                 
-                // Clean workspace to ensure fresh checkout next time
-                // This ensures no stale files affect future builds
                 echo "[WORKSPACE] Cleaning workspace for next build..."
                 deleteDir()
                 echo "[WORKSPACE] Workspace cleaned successfully"
@@ -606,225 +548,9 @@ pipeline {
         }
         success {
             echo "[SUCCESS] Pipeline executed successfully!"
-            script {
-                if (env.DEPLOY_ENV == 'latest') {
-                    echo "[NOTICE] Production deployment completed!"
-                    // Add Slack/Email notification here if needed
-                }
-            }
         }
         failure {
             echo "[FAILURE] Pipeline failed!"
-            // Add notification here if needed
-        }
-    }
-}
-
-// ================================================================================
-// HELPER FUNCTION: Calculate Content Hash
-// Pure implementation - only uses .dockerignore rules, nothing hardcoded
-// ================================================================================
-def calculateAppContentHash(appDir) {
-    try {
-        echo "[HASH] Starting hash calculation for ${appDir}..."
-        
-        // Get all files in the directory
-        def allFiles = getAllFiles(appDir)
-        echo "[HASH] Found ${allFiles.size()} total files in ${appDir}"
-        
-        // Parse .dockerignore if it exists
-        def ignorePatterns = []
-        def dockerignorePath = "${appDir}/.dockerignore"
-        if (fileExists(dockerignorePath)) {
-            ignorePatterns = readFile(dockerignorePath)
-                .split('\n')
-                .findAll { it.trim() && !it.startsWith('#') }
-                .collect { it.trim() }
-            echo "[HASH] Loaded ${ignorePatterns.size()} ignore patterns from .dockerignore"
-        }
-        
-        // Filter files based on .dockerignore patterns
-        def filesToHash = allFiles.findAll { file ->
-            !isIgnored(file, ignorePatterns)
-        }
-        echo "[HASH] ${filesToHash.size()} files to hash after filtering"
-        
-        // Sort for consistent ordering
-        filesToHash.sort()
-        
-        // Create hash from file contents and metadata
-        def hashContent = new StringBuilder()
-        filesToHash.each { relativePath ->
-            def fullPath = "${appDir}/${relativePath}"
-            if (fileExists(fullPath)) {
-                try {
-                    // Read file content
-                    def content = readFile(fullPath)
-                    // Use content hash and relative path (not file stats which can change)
-                    hashContent.append("${relativePath}:${content.hashCode()}\n")
-                } catch (Exception e) {
-                    // If can't read file, just use the path
-                    hashContent.append("${relativePath}:unreadable\n")
-                }
-            }
-        }
-        
-        // If no content to hash, return a stable hash based on app name
-        if (hashContent.length() == 0) {
-            echo "[HASH] No files to hash for ${appDir}, using stable default"
-            return "empty-${appDir}".hashCode().toString()
-        }
-        
-        // Return hash of combined content
-        def finalHash = hashContent.toString().hashCode().toString()
-        echo "[HASH] Final hash for ${appDir}: ${finalHash}"
-        return finalHash
-        
-    } catch (Exception e) {
-        echo "[HASH ERROR] Failed to calculate hash for ${appDir}: ${e.message}"
-        echo "[HASH ERROR] Stack trace: ${e.printStackTrace()}"
-        // Return a stable fallback based on app name, not timestamp!
-        return "fallback-${appDir}".hashCode().toString()
-    }
-}
-
-// ================================================================================
-// HELPER FUNCTION: Get All Files Recursively
-// ================================================================================
-def getAllFiles(appDir) {
-    def files = []
-    
-    try {
-        // Use Windows dir command to get all files
-        def output = bat(
-            script: "@dir /b /s /a:-d \"${appDir}\" 2>nul",
-            returnStdout: true
-        ).trim()
-        
-        if (output) {
-            // Get the absolute path of the app directory for proper path calculation
-            def workspacePath = env.WORKSPACE.replace('/', '\\')
-            def appFullPath = "${workspacePath}\\${appDir}"
-            
-            output.split('\r?\n').each { absolutePath ->
-                if (absolutePath && absolutePath.trim()) {
-                    // Convert absolute path to relative path from app directory
-                    if (absolutePath.startsWith(appFullPath)) {
-                        def relativePath = absolutePath
-                            .substring(appFullPath.length())
-                            .replace('\\', '/')
-                        
-                        // Remove leading slash if present
-                        if (relativePath.startsWith('/')) {
-                            relativePath = relativePath.substring(1)
-                        }
-                        
-                        if (relativePath) {
-                            files.add(relativePath)
-                        }
-                    }
-                }
-            }
-        }
-    } catch (Exception e) {
-        echo "[HASH WARNING] Error listing files in ${appDir}: ${e.message}"
-    }
-    
-    return files
-}
-
-// ================================================================================
-// HELPER FUNCTION: Check if File Should be Ignored
-// ================================================================================
-def isIgnored(filePath, patterns) {
-    for (pattern in patterns) {
-        if (matchesDockerignorePattern(filePath, pattern)) {
-            return true
-        }
-    }
-    return false
-}
-
-// ================================================================================
-// HELPER FUNCTION: Match File Against Dockerignore Pattern
-// ================================================================================
-def matchesDockerignorePattern(filePath, pattern) {
-    // Handle negation patterns (starting with !)
-    if (pattern.startsWith('!')) {
-        return false  // Negation patterns need special handling in the main logic
-    }
-    
-    // Handle directory patterns (ending with /)
-    if (pattern.endsWith('/')) {
-        def dir = pattern[0..-2]
-        return filePath.startsWith("${dir}/") || filePath == dir
-    }
-    
-    // Handle patterns with wildcards
-    if (pattern.contains('*') || pattern.contains('?')) {
-        // Convert dockerignore pattern to regex
-        def regexPattern = pattern
-            .replace('\\', '/')  // Normalize path separators
-            .replace('.', '\\.')  // Escape dots
-            .replace('**/', '(.*/)?')  // ** matches any number of directories
-            .replace('**', '.*')  // ** at end matches everything
-            .replace('*', '[^/]*')  // * matches any character except /
-            .replace('?', '.')  // ? matches single character
-        
-        // Determine if pattern should match from root or anywhere
-        if (pattern.startsWith('/')) {
-            // Absolute pattern - must match from start
-            regexPattern = '^' + regexPattern.substring(1) + '$'
-        } else if (pattern.contains('/')) {
-            // Relative path pattern - can match as path
-            regexPattern = '(^|/)' + regexPattern + '$'
-        } else {
-            // Filename pattern - can match anywhere
-            regexPattern = '(^|.*/)'+ regexPattern + '$'
-        }
-        
-        try {
-            return filePath.matches(regexPattern)
-        } catch (Exception e) {
-            // If regex fails, fall back to simple contains
-            return filePath.contains(pattern.replace('*', ''))
-        }
-    }
-    
-    // Handle exact matches and simple patterns
-    if (pattern.contains('/')) {
-        // Path pattern
-        return filePath == pattern || filePath.startsWith("${pattern}/")
-    } else {
-        // Filename pattern - match basename
-        def fileName = filePath.contains('/') ? filePath.substring(filePath.lastIndexOf('/') + 1) : filePath
-        return fileName == pattern
-    }
-}
-
-// ================================================================================
-// ALTERNATIVE: Simpler MD5 Hash Using certutil (if you want real MD5)
-// ================================================================================
-def createMD5Hash(content) {
-    def tempFile = "${env.WORKSPACE}/.temp_hash_${BUILD_NUMBER}_${System.nanoTime()}.txt"
-    
-    try {
-        writeFile file: tempFile, text: content
-        
-        def hash = bat(
-            script: "@certutil -hashfile \"${tempFile}\" MD5 | find /v \":\" | find /v \"CertUtil\"",
-            returnStdout: true
-        ).trim().replace(' ', '').toLowerCase()
-        
-        return hash ?: content.hashCode().toString()
-        
-    } catch (Exception e) {
-        return content.hashCode().toString()
-    } finally {
-        try {
-            bat "del \"${tempFile}\" 2>nul || exit 0"
-        } catch (Exception ignored) {
-            // Ignore cleanup errors
         }
     }
 }
