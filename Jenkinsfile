@@ -622,92 +622,153 @@ pipeline {
 
 // ================================================================================
 // HELPER FUNCTION: Calculate Content Hash
-// Creates a hash representing the current state of an application
-// Used to determine if Docker image needs rebuilding
+// Pure implementation - only uses .dockerignore rules, nothing hardcoded
 // ================================================================================
 def calculateAppContentHash(appDir) {
     try {
-        // List of file patterns to include in hash calculation
-        def filePatterns = ['*.py', '*.txt', 'Dockerfile', '*.json', '*.yml', '*.yaml', '*.sh', '*.sql']
-        def combinedContent = ''
+        // Get all files in the directory
+        def allFiles = getAllFiles(appDir)
         
-        // Read .dockerignore patterns if exists
-        def dockerignorePath = "${appDir}/.dockerignore"
+        // Parse .dockerignore if it exists
         def ignorePatterns = []
+        def dockerignorePath = "${appDir}/.dockerignore"
         if (fileExists(dockerignorePath)) {
-            def dockerignore = readFile(dockerignorePath)
-            ignorePatterns = dockerignore.split('\n').findAll { it.trim() && !it.startsWith('#') }
+            ignorePatterns = readFile(dockerignorePath)
+                .split('\n')
+                .findAll { it.trim() && !it.startsWith('#') }
+                .collect { it.trim() }
         }
         
-        // Process each file pattern
-        filePatterns.each { pattern ->
-            try {
-                def files = bat(
-                    script: "@dir /b \"${appDir}\\${pattern}\" 2>nul || exit 0",
+        // Filter files based on .dockerignore patterns
+        def filesToHash = allFiles.findAll { file ->
+            !isIgnored(file, ignorePatterns)
+        }
+        
+        // Sort for consistent ordering
+        filesToHash.sort()
+        
+        // Create hash from file contents and metadata
+        def hashContent = new StringBuilder()
+        filesToHash.each { relativePath ->
+            def fullPath = "${appDir}/${relativePath}"
+            if (fileExists(fullPath)) {
+                // Get file size and modification time
+                def fileStats = bat(
+                    script: "@for %%I in (\"${fullPath.replace('/', '\\')}\") do @echo %%~zI %%~tI",
                     returnStdout: true
-                ).trim().split('\r?\n')
+                ).trim()
                 
-                files.each { file ->
-                    if (file && file.trim()) {
-                        def filePath = "${appDir}/${file}"
-                        def shouldInclude = true
-                        
-                        // Check against ignore patterns
-                        ignorePatterns.each { ignorePattern ->
-                            if (file.contains(ignorePattern.replace('*', ''))) {
-                                shouldInclude = false
-                            }
-                        }
-                        
-                        if (shouldInclude && fileExists(filePath)) {
-                            // Read file content and add to combined content
-                            def content = readFile(filePath)
-                            combinedContent += file + ':' + content.hashCode().toString() + ';'
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                // Ignore errors for missing file patterns
+                // Read file content
+                def content = readFile(fullPath)
+                
+                // Combine path, stats, and content hash
+                hashContent.append("${relativePath}:${fileStats}:${content.hashCode()}\n")
             }
         }
         
-        // Also hash subdirectories if they exist
-        def subdirs = ['src', 'lib', 'utils', 'config', 'scripts']
-        subdirs.each { subdir ->
-            def subdirPath = "${appDir}/${subdir}"
-            if (fileExists(subdirPath)) {
-                filePatterns.each { pattern ->
-                    try {
-                        def files = bat(
-                            script: "@dir /b /s \"${subdirPath}\\${pattern}\" 2>nul || exit 0",
-                            returnStdout: true
-                        ).trim().split('\r?\n')
-                        
-                        files.each { file ->
-                            if (file && file.trim() && fileExists(file)) {
-                                def content = readFile(file)
-                                def relativePath = file.replace(env.WORKSPACE + '\\', '')
-                                combinedContent += relativePath + ':' + content.hashCode().toString() + ';'
-                            }
-                        }
-                    } catch (Exception e) {
-                        // Ignore errors for missing patterns
-                    }
-                }
-            }
-        }
-        
-        // Return hash of combined content
-        // If no content found, use timestamp to force build
-        if (combinedContent) {
-            return combinedContent.hashCode().toString()
-        } else {
-            return new Date().getTime().toString()
-        }
+        // Return MD5 hash of combined content
+        return createMD5Hash(hashContent.toString())
         
     } catch (Exception e) {
-        echo "[HASH WARNING] Could not calculate hash for ${appDir}: ${e.message}"
-        // Return timestamp as fallback to ensure build happens
-        return new Date().getTime().toString()
+        echo "[HASH ERROR] ${appDir}: ${e.message}"
+        return "error-${System.currentTimeMillis()}"
+    }
+}
+
+// ================================================================================
+// HELPER FUNCTION: Get All Files Recursively
+// ================================================================================
+def getAllFiles(appDir) {
+    def files = []
+    
+    def output = bat(
+        script: "@dir /b /s /a:-d \"${appDir}\" 2>nul",
+        returnStdout: true
+    ).trim()
+    
+    if (output) {
+        def appPath = new File("${env.WORKSPACE}/${appDir}").canonicalPath
+        output.split('\r?\n').each { absolutePath ->
+            if (absolutePath) {
+                // Convert to relative path
+                def relativePath = absolutePath
+                    .replace(appPath + '\\', '')
+                    .replace('\\', '/')
+                files.add(relativePath)
+            }
+        }
+    }
+    
+    return files
+}
+
+// ================================================================================
+// HELPER FUNCTION: Check if File Should be Ignored
+// ================================================================================
+def isIgnored(filePath, patterns) {
+    for (pattern in patterns) {
+        if (matchesDockerignorePattern(filePath, pattern)) {
+            return true
+        }
+    }
+    return false
+}
+
+// ================================================================================
+// HELPER FUNCTION: Match File Against Dockerignore Pattern
+// ================================================================================
+def matchesDockerignorePattern(filePath, pattern) {
+    // Handle directory patterns (ending with /)
+    if (pattern.endsWith('/')) {
+        def dir = pattern[0..-2]
+        return filePath.startsWith("${dir}/") || filePath == dir
+    }
+    
+    // Convert dockerignore pattern to regex
+    def regexPattern = pattern
+        .replace('.', '\\.')
+        .replace('**/', '(.*/)?')  // ** matches any number of directories
+        .replace('*', '[^/]*')      // * matches any character except /
+        .replace('?', '.')           // ? matches single character
+    
+    // Add anchors
+    if (pattern.contains('/')) {
+        // Path pattern - must match from start
+        regexPattern = '^' + regexPattern + '$'
+    } else {
+        // Filename pattern - can match anywhere
+        regexPattern = '(^|/)' + regexPattern + '$'
+    }
+    
+    try {
+        return filePath.matches(regexPattern)
+    } catch (Exception e) {
+        // Fallback to simple string matching
+        return filePath == pattern || 
+               filePath.endsWith("/${pattern}") || 
+               filePath.startsWith("${pattern}/")
+    }
+}
+
+// ================================================================================
+// HELPER FUNCTION: Create MD5 Hash Using Windows Certutil
+// ================================================================================
+def createMD5Hash(content) {
+    def tempFile = "${env.WORKSPACE}/.temp_hash_${BUILD_NUMBER}_${System.nanoTime()}.txt"
+    
+    try {
+        writeFile file: tempFile, text: content
+        
+        def hash = bat(
+            script: "@certutil -hashfile \"${tempFile}\" MD5 | find /v \":\" | find /v \"CertUtil\"",
+            returnStdout: true
+        ).trim().replace(' ', '').toLowerCase()
+        
+        return hash ?: content.hashCode().toString()
+        
+    } catch (Exception e) {
+        return content.hashCode().toString()
+    } finally {
+        bat "del \"${tempFile}\" 2>nul || exit 0"
     }
 }
