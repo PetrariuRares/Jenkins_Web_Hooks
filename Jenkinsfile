@@ -154,8 +154,6 @@ pipeline {
 
         // ================================================================================
         // STAGE 3: Detect Changes (IMPROVED LOGIC)
-        // Scans for apps and uses 'git diff' to detect changes in each app's directory
-        // since the last successful build for that specific app.
         // ================================================================================
         stage('Detect Changes') {
             steps {
@@ -230,8 +228,6 @@ pipeline {
 
                                     if (lastBuiltCommit && lastBuiltCommit != "unknown") {
                                         echo "[INFO] ${app}: Last build was from commit ${lastBuiltCommit}. Comparing with current commit ${currentCommit}."
-                                        // Use git diff to check for changes in the specific app directory.
-                                        // returnStatus: true makes it return the exit code. 0 = no changes, 1 = changes.
                                         def diffResult = bat(
                                             script: "git diff --quiet ${lastBuiltCommit} ${currentCommit} -- ./${app}",
                                             returnStatus: true
@@ -309,15 +305,17 @@ pipeline {
                                     writeFile file: "${app}/requirements.txt", text: "# No dependencies\n"
                                 }
 
-                                bat """
-                                    docker build \
-                                        -t ${imageName}:${imageTag} \
-                                        --label git.commit=${env.GIT_COMMIT_HASH} \
-                                        --label git.branch=${env.GIT_BRANCH_NAME} \
-                                        --label build.number=${BUILD_NUMBER} \
-                                        --label build.timestamp=${env.TIMESTAMP} \
-                                        -f ${app}/Dockerfile ${app}/
+                                // CORRECTED: Construct the command as a Groovy string first to ensure
+                                // proper variable interpolation before passing it to the bat step.
+                                def dockerCommand = """
+                                    docker build -t "${imageName}:${imageTag}" \
+                                    --label "git.commit=${env.GIT_COMMIT_HASH}" \
+                                    --label "git.branch=${env.GIT_BRANCH_NAME}" \
+                                    --label "build.number=${BUILD_NUMBER}" \
+                                    --label "build.timestamp=${env.TIMESTAMP}" \
+                                    -f "${app}/Dockerfile" "${app}/"
                                 """
+                                bat(script: dockerCommand)
                                 
                                 echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag} (commit: ${env.GIT_COMMIT_HASH})"
                                 writeFile file: "${app}_tag.txt", text: imageTag
