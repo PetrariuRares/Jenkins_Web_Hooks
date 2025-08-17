@@ -1,953 +1,1156 @@
 #!/usr/bin/env python3
 """
-Enhanced Docker Image Manager with Essential Features
-Includes: Search, Progress Bars, Disk Monitoring, Credentials, Quick Run
+Docker Manager Application Test
+A comprehensive PyQt5 application for managing Docker containers with JFrog Artifactory integration
 """
 
 import sys
 import os
 import json
 import subprocess
-import requests
-import shutil
-from datetime import datetime, timedelta
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
-import configparser
+from typing import Dict, List, Optional, Tuple
+import requests
+from requests.auth import HTTPBasicAuth
 
-from PyQt5.QtWidgets import *
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
-from PyQt5.QtGui import QIcon, QPalette, QColor
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QTableWidget, QTableWidgetItem, QTabWidget,
+    QLabel, QLineEdit, QTextEdit, QComboBox, QSpinBox,
+    QFileDialog, QMessageBox, QHeaderView, QGroupBox,
+    QCheckBox, QProgressBar, QSplitter, QDialog,
+    QDialogButtonBox, QFormLayout, QSlider, QMenu,
+    QAction, QToolBar, QStatusBar, QSystemTrayIcon
+)
+from PyQt5.QtCore import (
+    Qt, QThread, pyqtSignal, QTimer, QSettings,
+    QSize, QProcess, QByteArray
+)
+from PyQt5.QtGui import (
+    QIcon, QFont, QPalette, QColor, QPixmap,
+    QPainter, QBrush, QPen
+)
 
-# ============================================================================
-# Configuration Management
-# ============================================================================
+# Check if docker module is available
+try:
+    import docker
+    DOCKER_AVAILABLE = True
+except ImportError:
+    DOCKER_AVAILABLE = False
+    print("Warning: Docker Python SDK not installed. Install with: pip install docker")
 
-class ConfigManager:
-    """Manages application configuration and credentials"""
-    
-    def __init__(self):
-        self.config_file = os.path.join(os.path.expanduser("~"), ".docker_manager", "config.ini")
-        self.config_dir = os.path.dirname(self.config_file)
-        
-        # Create config directory if it doesn't exist
-        if not os.path.exists(self.config_dir):
-            os.makedirs(self.config_dir)
-        
-        self.config = configparser.ConfigParser()
-        self.load_config()
-    
-    def load_config(self):
-        """Load configuration from file"""
-        if os.path.exists(self.config_file):
-            self.config.read(self.config_file)
-        else:
-            self.create_default_config()
-    
-    def create_default_config(self):
-        """Create default configuration"""
-        self.config['Artifactory'] = {
-            'registry': 'trialqlk1tc.jfrog.io',
-            'repository': 'dockertest-docker',
-            'username': '',
-            'password': ''  # In production, use keyring for secure storage
-        }
-        self.config['Local'] = {
-            'storage_path': 'D:\\DockerImages',
-            'auto_refresh_interval': '300',  # seconds
-            'max_concurrent_downloads': '3',
-            'cleanup_days': '30'
-        }
-        self.config['UI'] = {
-            'theme': 'light',
-            'window_width': '1200',
-            'window_height': '800'
-        }
-        self.save_config()
-    
-    def save_config(self):
-        """Save configuration to file"""
-        with open(self.config_file, 'w') as f:
-            self.config.write(f)
-    
-    def get(self, section, key, fallback=''):
-        """Get configuration value"""
-        return self.config.get(section, key, fallback=fallback)
-    
-    def set(self, section, key, value):
-        """Set configuration value"""
-        if section not in self.config:
-            self.config[section] = {}
-        self.config[section][key] = str(value)
-        self.save_config()
 
-# ============================================================================
-# Download Worker with Progress
-# ============================================================================
-
-class DownloadWorker(QThread):
-    """Worker thread for downloading with progress updates"""
-    progress = pyqtSignal(int, str)  # percent, message
-    finished = pyqtSignal(bool, str)
+class DockerWorker(QThread):
+    """Worker thread for Docker operations"""
+    progress = pyqtSignal(str)
+    error = pyqtSignal(str)
+    finished = pyqtSignal(bool)
+    update_progress = pyqtSignal(int)
     
-    def __init__(self, images, config):
+    def __init__(self, operation, **kwargs):
         super().__init__()
-        self.images = images
-        self.config = config
-        self.is_cancelled = False
-    
+        self.operation = operation
+        self.kwargs = kwargs
+        self.client = None
+        
     def run(self):
-        """Download images with progress tracking"""
-        total_images = len(self.images)
-        
-        # Login to Docker
-        registry = self.config.get('Artifactory', 'registry')
-        username = self.config.get('Artifactory', 'username')
-        password = self.config.get('Artifactory', 'password')
-        repository = self.config.get('Artifactory', 'repository')
-        storage = self.config.get('Local', 'storage_path')
-        
-        login_cmd = f'echo {password} | docker login {registry} -u {username} --password-stdin'
-        subprocess.run(login_cmd, shell=True, capture_output=True)
-        
-        for idx, (image, tag) in enumerate(self.images):
-            if self.is_cancelled:
-                self.finished.emit(False, "Download cancelled")
-                return
-            
-            # Calculate progress
-            base_progress = int((idx / total_images) * 100)
-            
-            # Update progress
-            self.progress.emit(base_progress, f"Downloading {image}:{tag}...")
-            
-            # Pull image
-            full_name = f"{registry}/{repository}/{image}:{tag}"
-            pull_cmd = f'docker pull {full_name}'
-            result = subprocess.run(pull_cmd, shell=True, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                # Save to tar
-                self.progress.emit(base_progress + 50, f"Saving {image}:{tag} to disk...")
+        """Execute Docker operation in background"""
+        try:
+            if DOCKER_AVAILABLE:
+                self.client = docker.from_env()
                 
-                tar_file = os.path.join(storage, f"{image}_{tag}.tar")
-                save_cmd = f'docker save -o "{tar_file}" {full_name}'
-                subprocess.run(save_cmd, shell=True)
-                
-                self.progress.emit((idx + 1) * 100 // total_images, f"Completed {image}:{tag}")
+                if self.operation == "pull":
+                    self.pull_image()
+                elif self.operation == "remove":
+                    self.remove_image()
+                elif self.operation == "run":
+                    self.run_container()
+                elif self.operation == "stop":
+                    self.stop_container()
+                elif self.operation == "list_local":
+                    self.list_local_images()
+                    
+                self.finished.emit(True)
             else:
-                self.progress.emit(base_progress, f"Failed to download {image}:{tag}")
+                self.error.emit("Docker Python SDK not installed")
+                self.finished.emit(False)
+                
+        except Exception as e:
+            self.error.emit(str(e))
+            self.finished.emit(False)
+            
+    def pull_image(self):
+        """Pull Docker image"""
+        image_name = self.kwargs.get('image_name')
+        self.progress.emit(f"Pulling {image_name}...")
         
-        self.finished.emit(True, f"Downloaded {total_images} images")
+        try:
+            # Pull with progress tracking
+            image = self.client.images.pull(image_name)
+            self.progress.emit(f"Successfully pulled {image_name}")
+        except Exception as e:
+            raise Exception(f"Failed to pull {image_name}: {str(e)}")
+            
+    def remove_image(self):
+        """Remove Docker image"""
+        image_name = self.kwargs.get('image_name')
+        self.progress.emit(f"Removing {image_name}...")
+        
+        try:
+            self.client.images.remove(image_name, force=True)
+            self.progress.emit(f"Successfully removed {image_name}")
+        except Exception as e:
+            raise Exception(f"Failed to remove {image_name}: {str(e)}")
+            
+    def run_container(self):
+        """Run Docker container"""
+        image_name = self.kwargs.get('image_name')
+        cpu_limit = self.kwargs.get('cpu_limit', None)
+        mem_limit = self.kwargs.get('mem_limit', None)
+        
+        self.progress.emit(f"Starting container from {image_name}...")
+        
+        try:
+            container = self.client.containers.run(
+                image_name,
+                detach=True,
+                cpu_count=cpu_limit,
+                mem_limit=mem_limit,
+                remove=False
+            )
+            self.progress.emit(f"Container {container.short_id} started")
+        except Exception as e:
+            raise Exception(f"Failed to run container: {str(e)}")
+            
+    def stop_container(self):
+        """Stop Docker container"""
+        container_id = self.kwargs.get('container_id')
+        self.progress.emit(f"Stopping container {container_id}...")
+        
+        try:
+            container = self.client.containers.get(container_id)
+            container.stop()
+            self.progress.emit(f"Container {container_id} stopped")
+        except Exception as e:
+            raise Exception(f"Failed to stop container: {str(e)}")
+
+
+class TerminalDialog(QDialog):
+    """Terminal dialog for executing Docker containers"""
     
-    def cancel(self):
-        """Cancel the download"""
-        self.is_cancelled = True
+    def __init__(self, image_name, parent=None):
+        super().__init__(parent)
+        self.image_name = image_name
+        self.process = QProcess()
+        self.init_ui()
+        
+    def init_ui(self):
+        """Initialize terminal UI"""
+        self.setWindowTitle(f"Terminal - {self.image_name}")
+        self.setGeometry(100, 100, 800, 600)
+        
+        layout = QVBoxLayout()
+        
+        # Terminal output
+        self.terminal_output = QTextEdit()
+        self.terminal_output.setReadOnly(True)
+        self.terminal_output.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #00ff00;
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 10pt;
+            }
+        """)
+        layout.addWidget(self.terminal_output)
+        
+        # Command input
+        input_layout = QHBoxLayout()
+        self.command_input = QLineEdit()
+        self.command_input.setPlaceholderText("Enter command...")
+        self.command_input.returnPressed.connect(self.execute_command)
+        input_layout.addWidget(self.command_input)
+        
+        self.execute_btn = QPushButton("Execute")
+        self.execute_btn.clicked.connect(self.execute_command)
+        input_layout.addWidget(self.execute_btn)
+        
+        layout.addLayout(input_layout)
+        
+        # Control buttons
+        button_layout = QHBoxLayout()
+        
+        self.run_btn = QPushButton("Run Container")
+        self.run_btn.clicked.connect(self.run_container)
+        button_layout.addWidget(self.run_btn)
+        
+        self.stop_btn = QPushButton("Stop Container")
+        self.stop_btn.clicked.connect(self.stop_container)
+        self.stop_btn.setEnabled(False)
+        button_layout.addWidget(self.stop_btn)
+        
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.clicked.connect(self.terminal_output.clear)
+        button_layout.addWidget(self.clear_btn)
+        
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+        
+        # Connect process signals
+        self.process.readyReadStandardOutput.connect(self.handle_stdout)
+        self.process.readyReadStandardError.connect(self.handle_stderr)
+        self.process.finished.connect(self.process_finished)
+        
+    def run_container(self):
+        """Run Docker container interactively"""
+        self.terminal_output.append(f"Starting container from {self.image_name}...\n")
+        
+        # Docker run command with interactive mode
+        cmd = f"docker run -it --rm {self.image_name}"
+        
+        self.process.start("cmd.exe", ["/c", cmd])
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        
+    def stop_container(self):
+        """Stop running container"""
+        if self.process.state() == QProcess.Running:
+            self.process.terminate()
+            self.terminal_output.append("\nContainer stopped.\n")
+            
+    def execute_command(self):
+        """Execute command in container"""
+        command = self.command_input.text()
+        if command and self.process.state() == QProcess.Running:
+            self.process.write(command.encode() + b'\n')
+            self.command_input.clear()
+            self.terminal_output.append(f"> {command}\n")
+            
+    def handle_stdout(self):
+        """Handle standard output"""
+        data = self.process.readAllStandardOutput()
+        output = bytes(data).decode('utf-8', errors='ignore')
+        self.terminal_output.append(output)
+        
+    def handle_stderr(self):
+        """Handle standard error"""
+        data = self.process.readAllStandardError()
+        output = bytes(data).decode('utf-8', errors='ignore')
+        self.terminal_output.append(f"Error: {output}")
+        
+    def process_finished(self):
+        """Handle process finished"""
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.terminal_output.append("\nProcess finished.\n")
 
-# ============================================================================
-# Enhanced Main Application
-# ============================================================================
 
-class EnhancedDockerManager(QMainWindow):
+class DockerManagerApp(QMainWindow):
+    """Main application window"""
+    
     def __init__(self):
         super().__init__()
-        self.config = ConfigManager()
-        self.download_worker = None
+        self.settings = QSettings("DockerManager", "Settings")
+        self.artifactory_images = []
+        self.local_images = []
+        self.containers = []
+        self.docker_client = None
+        self.init_docker_client()
         self.init_ui()
-        self.init_storage()
-        self.load_credentials()
-        self.setup_auto_refresh()
-        self.refresh_all()
-    
-    def init_storage(self):
-        """Initialize storage directory"""
-        storage_path = self.config.get('Local', 'storage_path')
-        if not os.path.exists(storage_path):
-            os.makedirs(storage_path)
-    
-    def init_ui(self):
-        """Initialize enhanced UI"""
-        self.setWindowTitle("Enhanced Docker Image Manager")
-        
-        # Load window size from config
-        width = int(self.config.get('UI', 'window_width', fallback='1200'))
-        height = int(self.config.get('UI', 'window_height', fallback='800'))
-        self.setGeometry(100, 100, width, height)
-        
-        # Central widget
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        
-        # === Header Section ===
-        header_layout = QVBoxLayout()
-        
-        # Title and connection status
-        title_layout = QHBoxLayout()
-        title = QLabel("Docker Image Manager")
-        title.setStyleSheet("font-size: 18px; font-weight: bold;")
-        
-        self.connection_status = QLabel("⚫ Disconnected")
-        self.connection_status.setStyleSheet("color: gray; font-weight: bold;")
-        
-        title_layout.addWidget(title)
-        title_layout.addStretch()
-        title_layout.addWidget(self.connection_status)
-        
-        header_layout.addLayout(title_layout)
-        
-        # === Search and Filter Bar ===
-        search_layout = QHBoxLayout()
-        
-        # Search input
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("🔍 Search images...")
-        self.search_input.textChanged.connect(self.filter_table)
-        self.search_input.setMinimumWidth(300)
-        
-        # Filter combo
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["All Images", "Downloaded", "In Docker", "Not Downloaded", "Large (>500MB)"])
-        self.filter_combo.currentTextChanged.connect(self.filter_table)
-        
-        # Disk space indicator
-        self.disk_space_label = QLabel("💾 Calculating...")
-        self.update_disk_space()
-        
-        search_layout.addWidget(QLabel("Search:"))
-        search_layout.addWidget(self.search_input)
-        search_layout.addWidget(QLabel("Filter:"))
-        search_layout.addWidget(self.filter_combo)
-        search_layout.addStretch()
-        search_layout.addWidget(self.disk_space_label)
-        
-        header_layout.addLayout(search_layout)
-        layout.addLayout(header_layout)
-        
-        # === Toolbar ===
-        toolbar_layout = QHBoxLayout()
-        
-        # Main action buttons
-        self.refresh_btn = QPushButton("🔄 Refresh")
-        self.refresh_btn.clicked.connect(self.refresh_all)
-        
-        self.download_btn = QPushButton("⬇ Download Selected")
-        self.download_btn.clicked.connect(self.download_selected)
-        
-        self.load_btn = QPushButton("📦 Load to Docker")
-        self.load_btn.clicked.connect(self.load_to_docker)
-        
-        self.quick_run_btn = QPushButton("▶ Quick Run")
-        self.quick_run_btn.clicked.connect(self.quick_run)
-        self.quick_run_btn.setStyleSheet("background-color: #28a745;")
-        
-        self.remove_btn = QPushButton("❌ Remove from Docker")
-        self.remove_btn.clicked.connect(self.remove_from_docker)
-        
-        self.delete_btn = QPushButton("🗑 Delete Local")
-        self.delete_btn.clicked.connect(self.delete_local)
-        
-        # Selection buttons
-        self.select_all_btn = QPushButton("☑ All")
-        self.select_all_btn.clicked.connect(self.select_all)
-        
-        self.select_none_btn = QPushButton("☐ None")
-        self.select_none_btn.clicked.connect(self.select_none)
-        
-        toolbar_layout.addWidget(self.refresh_btn)
-        toolbar_layout.addWidget(QLabel(" | "))
-        toolbar_layout.addWidget(self.download_btn)
-        toolbar_layout.addWidget(self.load_btn)
-        toolbar_layout.addWidget(self.quick_run_btn)
-        toolbar_layout.addWidget(QLabel(" | "))
-        toolbar_layout.addWidget(self.remove_btn)
-        toolbar_layout.addWidget(self.delete_btn)
-        toolbar_layout.addWidget(QLabel(" | "))
-        toolbar_layout.addWidget(self.select_all_btn)
-        toolbar_layout.addWidget(self.select_none_btn)
-        toolbar_layout.addStretch()
-        
-        # Settings button
-        self.settings_btn = QPushButton("⚙ Settings")
-        self.settings_btn.clicked.connect(self.show_settings)
-        toolbar_layout.addWidget(self.settings_btn)
-        
-        layout.addLayout(toolbar_layout)
-        
-        # === Main Table ===
-        self.table = QTableWidget()
-        self.table.setColumnCount(8)
-        self.table.setHorizontalHeaderLabels([
-            "Select", "Image", "Tag", "Size", "Created", "Local", "Docker", "Actions"
-        ])
-        
-        # Configure table
-        self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setSortingEnabled(True)
-        
-        layout.addWidget(self.table)
-        
-        # === Progress Bar ===
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-        
-        # === Status Bar ===
-        status_layout = QHBoxLayout()
-        
-        self.status_label = QLabel("Ready")
-        self.auto_refresh_label = QLabel("Auto-refresh: OFF")
-        
-        status_layout.addWidget(self.status_label)
-        status_layout.addStretch()
-        status_layout.addWidget(self.auto_refresh_label)
-        
-        layout.addLayout(status_layout)
-        
-        # Apply theme
-        self.apply_theme()
-    
-    def apply_theme(self):
-        """Apply UI theme"""
-        theme = self.config.get('UI', 'theme', fallback='light')
-        
-        if theme == 'dark':
-            self.setStyleSheet("""
-                QMainWindow { background-color: #2b2b2b; }
-                QWidget { background-color: #2b2b2b; color: #ffffff; }
-                QTableWidget { 
-                    background-color: #1e1e1e; 
-                    gridline-color: #3c3c3c;
-                    selection-background-color: #094771;
-                }
-                QPushButton { 
-                    background-color: #0d7377; 
-                    color: white; 
-                    border: none; 
-                    padding: 8px; 
-                    border-radius: 4px; 
-                }
-                QPushButton:hover { background-color: #14967f; }
-                QLineEdit, QComboBox { 
-                    background-color: #3c3c3c; 
-                    border: 1px solid #555; 
-                    padding: 5px; 
-                }
-            """)
-        else:
-            self.setStyleSheet("""
-                QPushButton {
-                    background-color: #007bff;
-                    color: white;
-                    border: none;
-                    padding: 8px;
-                    border-radius: 4px;
-                    font-weight: bold;
-                }
-                QPushButton:hover { background-color: #0056b3; }
-                QTableWidget { 
-                    selection-background-color: #cce5ff;
-                    alternate-background-color: #f8f9fa;
-                }
-            """)
-    
-    def load_credentials(self):
-        """Load saved credentials"""
-        username = self.config.get('Artifactory', 'username')
-        password = self.config.get('Artifactory', 'password')
-        
-        if not username or not password:
-            self.show_settings()
-    
-    def setup_auto_refresh(self):
-        """Setup auto-refresh timer"""
-        self.auto_refresh_timer = QTimer()
-        self.auto_refresh_timer.timeout.connect(self.refresh_all)
-        
-        # Get interval from config (in seconds)
-        interval = int(self.config.get('Local', 'auto_refresh_interval', fallback='300'))
-        if interval > 0:
-            self.auto_refresh_timer.start(interval * 1000)  # Convert to milliseconds
-            self.auto_refresh_label.setText(f"Auto-refresh: {interval}s")
-    
-    def update_disk_space(self):
-        """Update disk space indicator"""
-        try:
-            storage_path = self.config.get('Local', 'storage_path')
-            
-            # Get disk usage
-            total, used, free = shutil.disk_usage(storage_path)
-            
-            # Calculate Docker images size
-            tar_size = sum(
-                f.stat().st_size for f in Path(storage_path).glob("*.tar")
-            ) if os.path.exists(storage_path) else 0
-            
-            # Format sizes
-            free_gb = free / (1024**3)
-            tar_gb = tar_size / (1024**3)
-            
-            # Update label with color coding
-            if free_gb < 10:
-                color = "red"
-            elif free_gb < 50:
-                color = "orange"
-            else:
-                color = "green"
-            
-            self.disk_space_label.setText(f"💾 Free: {free_gb:.1f}GB | Images: {tar_gb:.1f}GB")
-            self.disk_space_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-            
-        except Exception as e:
-            self.disk_space_label.setText("💾 Unknown")
-    
-    def refresh_all(self):
-        """Refresh all data"""
-        self.status_label.setText("Refreshing...")
-        self.connection_status.setText("🟡 Connecting...")
-        self.connection_status.setStyleSheet("color: orange; font-weight: bold;")
-        
-        try:
-            # Get configuration
-            registry = self.config.get('Artifactory', 'registry')
-            repository = self.config.get('Artifactory', 'repository')
-            username = self.config.get('Artifactory', 'username')
-            password = self.config.get('Artifactory', 'password')
-            storage = self.config.get('Local', 'storage_path')
-            
-            # Get catalog from Artifactory
-            url = f"https://{registry}/artifactory/api/docker/{repository}/v2/_catalog"
-            response = requests.get(url, auth=(username, password), timeout=10)
-            
-            if response.status_code == 200:
-                self.connection_status.setText("🟢 Connected")
-                self.connection_status.setStyleSheet("color: green; font-weight: bold;")
-                
-                data = response.json()
-                repos = data.get('repositories', [])
-                
-                # Clear table
-                self.table.setRowCount(0)
-                
-                for repo in repos:
-                    # Get tags
-                    tags_url = f"https://{registry}/artifactory/api/docker/{repository}/v2/{repo}/tags/list"
-                    tags_response = requests.get(tags_url, auth=(username, password), timeout=10)
-                    
-                    if tags_response.status_code == 200:
-                        tags = tags_response.json().get('tags', ['latest'])
-                        
-                        for tag in tags:
-                            self.add_image_row(repo, tag, registry, repository, storage)
-                
-                self.status_label.setText(f"Found {self.table.rowCount()} images")
-                self.update_disk_space()
-            else:
-                self.connection_status.setText("🔴 Connection Failed")
-                self.connection_status.setStyleSheet("color: red; font-weight: bold;")
-                self.status_label.setText("Failed to connect to Artifactory")
-                
-        except Exception as e:
-            self.connection_status.setText("🔴 Error")
-            self.connection_status.setStyleSheet("color: red; font-weight: bold;")
-            self.status_label.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Failed to refresh:\n{str(e)}")
-    
-    def add_image_row(self, image, tag, registry, repository, storage):
-        """Add a row to the table"""
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        
-        # Checkbox
-        checkbox = QCheckBox()
-        self.table.setCellWidget(row, 0, checkbox)
-        
-        # Image name
-        self.table.setItem(row, 1, QTableWidgetItem(image))
-        
-        # Tag
-        self.table.setItem(row, 2, QTableWidgetItem(tag))
-        
-        # Size (placeholder - would need actual manifest data)
-        tar_file = os.path.join(storage, f"{image}_{tag}.tar")
-        if os.path.exists(tar_file):
-            size_mb = os.path.getsize(tar_file) / (1024*1024)
-            size_text = f"{size_mb:.1f} MB"
-        else:
-            size_text = "Unknown"
-        self.table.setItem(row, 3, QTableWidgetItem(size_text))
-        
-        # Created date (placeholder)
-        if os.path.exists(tar_file):
-            created = datetime.fromtimestamp(os.path.getctime(tar_file)).strftime("%Y-%m-%d")
-        else:
-            created = "N/A"
-        self.table.setItem(row, 4, QTableWidgetItem(created))
-        
-        # Local file status
-        local = "✓" if os.path.exists(tar_file) else "✗"
-        local_item = QTableWidgetItem(local)
-        local_item.setTextAlignment(Qt.AlignCenter)
-        if local == "✓":
-            local_item.setForeground(QColor(0, 128, 0))
-        self.table.setItem(row, 5, local_item)
-        
-        # Docker status
-        full_name = f"{registry}/{repository}/{image}:{tag}"
-        cmd = f'docker images -q {full_name}'
-        result = subprocess.run(cmd, shell=True, capture_output=True)
-        docker = "✓" if result.stdout.strip() else "✗"
-        docker_item = QTableWidgetItem(docker)
-        docker_item.setTextAlignment(Qt.AlignCenter)
-        if docker == "✓":
-            docker_item.setForeground(QColor(0, 0, 255))
-        self.table.setItem(row, 6, docker_item)
-        
-        # Action buttons
-        action_widget = QWidget()
-        action_layout = QHBoxLayout(action_widget)
-        action_layout.setContentsMargins(0, 0, 0, 0)
-        
-        inspect_btn = QPushButton("🔍")
-        inspect_btn.setToolTip("Inspect image")
-        inspect_btn.clicked.connect(lambda: self.inspect_image(image, tag))
-        inspect_btn.setMaximumWidth(30)
-        
-        action_layout.addWidget(inspect_btn)
-        self.table.setCellWidget(row, 7, action_widget)
-    
-    def filter_table(self):
-        """Filter table based on search and filter criteria"""
-        search_text = self.search_input.text().lower()
-        filter_type = self.filter_combo.currentText()
-        
-        for row in range(self.table.rowCount()):
-            show_row = True
-            
-            # Search filter
-            if search_text:
-                image_name = self.table.item(row, 1).text().lower()
-                tag = self.table.item(row, 2).text().lower()
-                if search_text not in image_name and search_text not in tag:
-                    show_row = False
-            
-            # Type filter
-            if filter_type != "All Images":
-                local_status = self.table.item(row, 5).text()
-                docker_status = self.table.item(row, 6).text()
-                size_text = self.table.item(row, 3).text()
-                
-                if filter_type == "Downloaded" and local_status != "✓":
-                    show_row = False
-                elif filter_type == "In Docker" and docker_status != "✓":
-                    show_row = False
-                elif filter_type == "Not Downloaded" and local_status != "✗":
-                    show_row = False
-                elif filter_type == "Large (>500MB)":
-                    try:
-                        size_mb = float(size_text.replace(" MB", ""))
-                        if size_mb <= 500:
-                            show_row = False
-                    except:
-                        show_row = False
-            
-            self.table.setRowHidden(row, not show_row)
-    
-    def select_all(self):
-        """Select all visible rows"""
-        for row in range(self.table.rowCount()):
-            if not self.table.isRowHidden(row):
-                checkbox = self.table.cellWidget(row, 0)
-                if checkbox:
-                    checkbox.setChecked(True)
-    
-    def select_none(self):
-        """Deselect all rows"""
-        for row in range(self.table.rowCount()):
-            checkbox = self.table.cellWidget(row, 0)
-            if checkbox:
-                checkbox.setChecked(False)
-    
-    def get_selected_images(self):
-        """Get list of selected images"""
-        selected = []
-        for row in range(self.table.rowCount()):
-            checkbox = self.table.cellWidget(row, 0)
-            if checkbox and checkbox.isChecked():
-                image = self.table.item(row, 1).text()
-                tag = self.table.item(row, 2).text()
-                selected.append((image, tag))
-        return selected
-    
-    def download_selected(self):
-        """Download selected images with progress"""
-        selected = self.get_selected_images()
-        if not selected:
-            QMessageBox.warning(self, "No Selection", "Please select images to download")
-            return
-        
-        # Show progress bar
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 100)
-        
-        # Disable buttons during download
-        self.set_buttons_enabled(False)
-        
-        # Start download worker
-        self.download_worker = DownloadWorker(selected, self.config)
-        self.download_worker.progress.connect(self.on_download_progress)
-        self.download_worker.finished.connect(self.on_download_finished)
-        self.download_worker.start()
-    
-    def on_download_progress(self, percent, message):
-        """Handle download progress updates"""
-        self.progress_bar.setValue(percent)
-        self.status_label.setText(message)
-    
-    def on_download_finished(self, success, message):
-        """Handle download completion"""
-        self.progress_bar.setVisible(False)
-        self.set_buttons_enabled(True)
-        self.status_label.setText(message)
-        self.refresh_all()
-        
-        if success:
-            QMessageBox.information(self, "Download Complete", message)
-    
-    def load_to_docker(self):
-        """Load selected images to Docker"""
-        selected = self.get_selected_images()
-        if not selected:
-            QMessageBox.warning(self, "No Selection", "Please select images to load")
-            return
-        
-        storage = self.config.get('Local', 'storage_path')
-        loaded = 0
-        
-        for image, tag in selected:
-            tar_file = os.path.join(storage, f"{image}_{tag}.tar")
-            if os.path.exists(tar_file):
-                self.status_label.setText(f"Loading {image}:{tag}...")
-                QApplication.processEvents()
-                
-                load_cmd = f'docker load -i "{tar_file}"'
-                result = subprocess.run(load_cmd, shell=True, capture_output=True)
-                
-                if result.returncode == 0:
-                    loaded += 1
-        
-        self.refresh_all()
-        QMessageBox.information(self, "Complete", f"Loaded {loaded} images to Docker")
-    
-    def quick_run(self):
-        """Quick run selected image with default settings"""
-        selected = self.get_selected_images()
-        if not selected:
-            QMessageBox.warning(self, "No Selection", "Please select an image to run")
-            return
-        
-        if len(selected) > 1:
-            QMessageBox.warning(self, "Multiple Selection", "Please select only one image for Quick Run")
-            return
-        
-        image, tag = selected[0]
-        
-        # Show quick run dialog
-        dialog = QuickRunDialog(self, image, tag, self.config)
-        if dialog.exec_():
-            port_mapping = dialog.port_input.text()
-            container_name = dialog.name_input.text()
-            
-            registry = self.config.get('Artifactory', 'registry')
-            repository = self.config.get('Artifactory', 'repository')
-            full_name = f"{registry}/{repository}/{image}:{tag}"
-            
-            # Run container
-            run_cmd = f'docker run -d -p {port_mapping} --name {container_name} {full_name}'
-            result = subprocess.run(run_cmd, shell=True, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                QMessageBox.information(self, "Success", 
-                    f"Container '{container_name}' started!\n\nAccess at: http://localhost:{port_mapping.split(':')[0]}")
-            else:
-                QMessageBox.warning(self, "Error", f"Failed to start container:\n{result.stderr}")
-    
-    def remove_from_docker(self):
-        """Remove selected images from Docker"""
-        selected = self.get_selected_images()
-        if not selected:
-            QMessageBox.warning(self, "No Selection", "Please select images to remove")
-            return
-        
-        reply = QMessageBox.question(self, "Confirm", 
-                                    f"Remove {len(selected)} images from Docker?",
-                                    QMessageBox.Yes | QMessageBox.No)
-        
-        if reply == QMessageBox.Yes:
-            registry = self.config.get('Artifactory', 'registry')
-            repository = self.config.get('Artifactory', 'repository')
-            
-            for image, tag in selected:
-                full_name = f"{registry}/{repository}/{image}:{tag}"
-                remove_cmd = f'docker rmi {full_name} --force'
-                subprocess.run(remove_cmd, shell=True, capture_output=True)
-            
-            self.refresh_all()
-            QMessageBox.information(self, "Complete", f"Removed {len(selected)} images")
-    
-    def delete_local(self):
-        """Delete local tar files"""
-        selected = self.get_selected_images()
-        if not selected:
-            QMessageBox.warning(self, "No Selection", "Please select files to delete")
-            return
-        
-        reply = QMessageBox.question(self, "Confirm", 
-                                    f"Delete {len(selected)} local files?",
-                                    QMessageBox.Yes | QMessageBox.No)
-        
-        if reply == QMessageBox.Yes:
-            storage = self.config.get('Local', 'storage_path')
-            deleted = 0
-            
-            for image, tag in selected:
-                tar_file = os.path.join(storage, f"{image}_{tag}.tar")
-                if os.path.exists(tar_file):
-                    os.remove(tar_file)
-                    deleted += 1
-            
-            self.refresh_all()
-            QMessageBox.information(self, "Complete", f"Deleted {deleted} files")
-    
-    def inspect_image(self, image, tag):
-        """Show image details"""
-        registry = self.config.get('Artifactory', 'registry')
-        repository = self.config.get('Artifactory', 'repository')
-        full_name = f"{registry}/{repository}/{image}:{tag}"
-        
-        # Get image info
-        inspect_cmd = f'docker inspect {full_name}'
-        result = subprocess.run(inspect_cmd, shell=True, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            # Show in dialog
-            dialog = QDialog(self)
-            dialog.setWindowTitle(f"Image Details: {image}:{tag}")
-            dialog.setGeometry(200, 200, 800, 600)
-            
-            layout = QVBoxLayout(dialog)
-            
-            text_edit = QTextEdit()
-            text_edit.setReadOnly(True)
-            
-            # Format JSON
+        self.load_settings()
+        
+    def init_docker_client(self):
+        """Initialize Docker client"""
+        if DOCKER_AVAILABLE:
             try:
-                import json
-                data = json.loads(result.stdout)
-                formatted = json.dumps(data, indent=2)
-                text_edit.setPlainText(formatted)
-            except:
-                text_edit.setPlainText(result.stdout)
-            
-            layout.addWidget(text_edit)
-            
-            close_btn = QPushButton("Close")
-            close_btn.clicked.connect(dialog.close)
-            layout.addWidget(close_btn)
-            
-            dialog.exec_()
-        else:
-            QMessageBox.warning(self, "Not Available", 
-                               "Image must be loaded in Docker to inspect.\nPlease load the image first.")
-    
-    def show_settings(self):
-        """Show settings dialog"""
-        dialog = SettingsDialog(self, self.config)
-        if dialog.exec_():
-            # Reload configuration
-            self.config.load_config()
-            self.apply_theme()
-            self.setup_auto_refresh()
-            self.refresh_all()
-    
-    def set_buttons_enabled(self, enabled):
-        """Enable/disable buttons"""
-        self.download_btn.setEnabled(enabled)
-        self.load_btn.setEnabled(enabled)
-        self.remove_btn.setEnabled(enabled)
-        self.delete_btn.setEnabled(enabled)
-        self.quick_run_btn.setEnabled(enabled)
-    
-    def closeEvent(self, event):
-        """Save window size on close"""
-        self.config.set('UI', 'window_width', str(self.width()))
-        self.config.set('UI', 'window_height', str(self.height()))
-        event.accept()
-
-# ============================================================================
-# Settings Dialog
-# ============================================================================
-
-class SettingsDialog(QDialog):
-    def __init__(self, parent, config):
-        super().__init__(parent)
-        self.config = config
-        self.init_ui()
-    
+                self.docker_client = docker.from_env()
+            except Exception as e:
+                QMessageBox.warning(self, "Docker Error", 
+                                   f"Failed to connect to Docker: {str(e)}\n"
+                                   "Make sure Docker Desktop is running.")
+                
     def init_ui(self):
-        self.setWindowTitle("Settings")
-        self.setGeometry(300, 300, 500, 400)
+        """Initialize the UI"""
+        self.setWindowTitle("Docker Manager - Artifactory Integration")
+        self.setGeometry(100, 100, 1400, 800)
         
-        layout = QVBoxLayout(self)
+        # Set application style
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f0f0f0;
+            }
+            QTabWidget::pane {
+                border: 1px solid #cccccc;
+                background-color: white;
+            }
+            QTabBar::tab {
+                padding: 8px 16px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                border-bottom: 2px solid #0078d4;
+            }
+            QPushButton {
+                padding: 6px 12px;
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton:pressed {
+                background-color: #005a9e;
+            }
+            QTableWidget {
+                gridline-color: #e0e0e0;
+                selection-background-color: #e3f2fd;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #cccccc;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+        """)
         
-        # Artifactory settings
-        group1 = QGroupBox("Artifactory Settings")
-        form1 = QFormLayout()
+        # Create central widget and layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
         
-        self.registry_input = QLineEdit(self.config.get('Artifactory', 'registry'))
-        self.repository_input = QLineEdit(self.config.get('Artifactory', 'repository'))
-        self.username_input = QLineEdit(self.config.get('Artifactory', 'username'))
-        self.password_input = QLineEdit(self.config.get('Artifactory', 'password'))
-        self.password_input.setEchoMode(QLineEdit.Password)
+        # Create toolbar
+        self.create_toolbar()
         
-        form1.addRow("Registry:", self.registry_input)
-        form1.addRow("Repository:", self.repository_input)
-        form1.addRow("Username:", self.username_input)
-        form1.addRow("Password/API Key:", self.password_input)
+        # Create status bar
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Ready")
         
-        group1.setLayout(form1)
-        layout.addWidget(group1)
+        # Create tab widget
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
         
-        # Local settings
-        group2 = QGroupBox("Local Settings")
-        form2 = QFormLayout()
+        # Create tabs
+        self.create_artifactory_tab()
+        self.create_local_images_tab()
+        self.create_containers_tab()
+        self.create_settings_tab()
         
-        self.storage_input = QLineEdit(self.config.get('Local', 'storage_path'))
-        self.refresh_input = QSpinBox()
-        self.refresh_input.setRange(0, 3600)
-        self.refresh_input.setValue(int(self.config.get('Local', 'auto_refresh_interval', fallback='300')))
-        self.refresh_input.setSuffix(" seconds (0 = disabled)")
+        # Auto-refresh timer
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.auto_refresh)
+        self.refresh_timer.start(30000)  # Refresh every 30 seconds
         
-        form2.addRow("Storage Path:", self.storage_input)
-        form2.addRow("Auto-refresh:", self.refresh_input)
+    def create_toolbar(self):
+        """Create application toolbar"""
+        toolbar = self.addToolBar("Main")
+        toolbar.setMovable(False)
         
-        group2.setLayout(form2)
-        layout.addWidget(group2)
+        # Refresh action
+        refresh_action = QAction("🔄 Refresh All", self)
+        refresh_action.triggered.connect(self.refresh_all)
+        toolbar.addAction(refresh_action)
         
-        # UI settings
-        group3 = QGroupBox("UI Settings")
-        form3 = QFormLayout()
+        toolbar.addSeparator()
         
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["light", "dark"])
-        self.theme_combo.setCurrentText(self.config.get('UI', 'theme', fallback='light'))
+        # Connection status
+        self.connection_label = QLabel(" Status: Disconnected ")
+        self.connection_label.setStyleSheet("""
+            QLabel {
+                background-color: #ffcccc;
+                padding: 4px;
+                border-radius: 3px;
+            }
+        """)
+        toolbar.addWidget(self.connection_label)
         
-        form3.addRow("Theme:", self.theme_combo)
+    def create_artifactory_tab(self):
+        """Create Artifactory images tab"""
+        artifactory_widget = QWidget()
+        layout = QVBoxLayout(artifactory_widget)
         
-        group3.setLayout(form3)
-        layout.addWidget(group3)
+        # Connection group
+        conn_group = QGroupBox("Artifactory Connection")
+        conn_layout = QHBoxLayout()
         
-        # Buttons
-        btn_layout = QHBoxLayout()
+        conn_layout.addWidget(QLabel("URL:"))
+        self.artifactory_url = QLineEdit()
+        self.artifactory_url.setPlaceholderText("https://your-artifactory.jfrog.io")
+        conn_layout.addWidget(self.artifactory_url)
         
-        test_btn = QPushButton("Test Connection")
-        test_btn.clicked.connect(self.test_connection)
+        conn_layout.addWidget(QLabel("Username:"))
+        self.artifactory_user = QLineEdit()
+        conn_layout.addWidget(self.artifactory_user)
         
-        save_btn = QPushButton("Save")
+        conn_layout.addWidget(QLabel("Password:"))
+        self.artifactory_pass = QLineEdit()
+        self.artifactory_pass.setEchoMode(QLineEdit.Password)
+        conn_layout.addWidget(self.artifactory_pass)
+        
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.clicked.connect(self.connect_artifactory)
+        conn_layout.addWidget(self.connect_btn)
+        
+        conn_group.setLayout(conn_layout)
+        layout.addWidget(conn_group)
+        
+        # Repository selection
+        repo_layout = QHBoxLayout()
+        repo_layout.addWidget(QLabel("Repository:"))
+        self.repo_combo = QComboBox()
+        self.repo_combo.setMinimumWidth(200)
+        repo_layout.addWidget(self.repo_combo)
+        
+        self.fetch_images_btn = QPushButton("Fetch Images")
+        self.fetch_images_btn.clicked.connect(self.fetch_artifactory_images)
+        repo_layout.addWidget(self.fetch_images_btn)
+        
+        repo_layout.addStretch()
+        layout.addLayout(repo_layout)
+        
+        # Images table
+        self.artifactory_table = QTableWidget()
+        self.artifactory_table.setColumnCount(6)
+        self.artifactory_table.setHorizontalHeaderLabels([
+            "Image Name", "Tag", "Size", "Created", "Actions", "Terminal"
+        ])
+        self.artifactory_table.horizontalHeader().setStretchLastSection(False)
+        self.artifactory_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.artifactory_table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self.artifactory_table)
+        
+        # Bulk actions
+        bulk_layout = QHBoxLayout()
+        self.download_selected_btn = QPushButton("Download Selected")
+        self.download_selected_btn.clicked.connect(self.download_selected_images)
+        bulk_layout.addWidget(self.download_selected_btn)
+        
+        bulk_layout.addStretch()
+        layout.addLayout(bulk_layout)
+        
+        self.tabs.addTab(artifactory_widget, "📦 Artifactory Images")
+        
+    def create_local_images_tab(self):
+        """Create local Docker images tab"""
+        local_widget = QWidget()
+        layout = QVBoxLayout(local_widget)
+        
+        # Refresh button
+        refresh_layout = QHBoxLayout()
+        self.refresh_local_btn = QPushButton("Refresh Local Images")
+        self.refresh_local_btn.clicked.connect(self.refresh_local_images)
+        refresh_layout.addWidget(self.refresh_local_btn)
+        
+        # Search box
+        self.search_local = QLineEdit()
+        self.search_local.setPlaceholderText("Search images...")
+        self.search_local.textChanged.connect(self.filter_local_images)
+        refresh_layout.addWidget(self.search_local)
+        
+        refresh_layout.addStretch()
+        layout.addLayout(refresh_layout)
+        
+        # Local images table
+        self.local_table = QTableWidget()
+        self.local_table.setColumnCount(7)
+        self.local_table.setHorizontalHeaderLabels([
+            "Repository", "Tag", "Image ID", "Size", "Created", "Actions", "Terminal"
+        ])
+        self.local_table.horizontalHeader().setStretchLastSection(False)
+        self.local_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.local_table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self.local_table)
+        
+        # Bulk actions
+        bulk_layout = QHBoxLayout()
+        self.delete_selected_btn = QPushButton("Delete Selected")
+        self.delete_selected_btn.clicked.connect(self.delete_selected_images)
+        self.delete_selected_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+        """)
+        bulk_layout.addWidget(self.delete_selected_btn)
+        
+        self.prune_btn = QPushButton("Prune Unused")
+        self.prune_btn.clicked.connect(self.prune_images)
+        bulk_layout.addWidget(self.prune_btn)
+        
+        bulk_layout.addStretch()
+        layout.addLayout(bulk_layout)
+        
+        self.tabs.addTab(local_widget, "🖥️ Local Images")
+        
+    def create_containers_tab(self):
+        """Create running containers tab"""
+        containers_widget = QWidget()
+        layout = QVBoxLayout(containers_widget)
+        
+        # Refresh and controls
+        control_layout = QHBoxLayout()
+        self.refresh_containers_btn = QPushButton("Refresh Containers")
+        self.refresh_containers_btn.clicked.connect(self.refresh_containers)
+        control_layout.addWidget(self.refresh_containers_btn)
+        
+        self.show_all_checkbox = QCheckBox("Show All (including stopped)")
+        self.show_all_checkbox.stateChanged.connect(self.refresh_containers)
+        control_layout.addWidget(self.show_all_checkbox)
+        
+        control_layout.addStretch()
+        layout.addLayout(control_layout)
+        
+        # Containers table
+        self.containers_table = QTableWidget()
+        self.containers_table.setColumnCount(7)
+        self.containers_table.setHorizontalHeaderLabels([
+            "Container ID", "Image", "Name", "Status", "Ports", "Created", "Actions"
+        ])
+        self.containers_table.horizontalHeader().setStretchLastSection(False)
+        self.containers_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.containers_table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self.containers_table)
+        
+        # Container logs
+        logs_group = QGroupBox("Container Logs")
+        logs_layout = QVBoxLayout()
+        
+        self.logs_output = QTextEdit()
+        self.logs_output.setMaximumHeight(200)
+        self.logs_output.setReadOnly(True)
+        self.logs_output.setStyleSheet("""
+            QTextEdit {
+                background-color: #2b2b2b;
+                color: #ffffff;
+                font-family: monospace;
+            }
+        """)
+        logs_layout.addWidget(self.logs_output)
+        
+        logs_group.setLayout(logs_layout)
+        layout.addWidget(logs_group)
+        
+        self.tabs.addTab(containers_widget, "▶️ Containers")
+        
+    def create_settings_tab(self):
+        """Create settings tab"""
+        settings_widget = QWidget()
+        layout = QVBoxLayout(settings_widget)
+        
+        # Download settings
+        download_group = QGroupBox("Download Settings")
+        download_layout = QFormLayout()
+        
+        # Download location
+        location_layout = QHBoxLayout()
+        self.download_location = QLineEdit()
+        self.download_location.setText(str(Path.home() / "DockerImages"))
+        location_layout.addWidget(self.download_location)
+        
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self.browse_download_location)
+        location_layout.addWidget(browse_btn)
+        
+        download_layout.addRow("Download Location:", location_layout)
+        download_group.setLayout(download_layout)
+        layout.addWidget(download_group)
+        
+        # Container runtime settings
+        runtime_group = QGroupBox("Container Runtime Settings")
+        runtime_layout = QFormLayout()
+        
+        # CPU limit
+        cpu_layout = QHBoxLayout()
+        self.cpu_limit = QSpinBox()
+        self.cpu_limit.setMinimum(1)
+        self.cpu_limit.setMaximum(32)
+        self.cpu_limit.setValue(2)
+        cpu_layout.addWidget(self.cpu_limit)
+        cpu_layout.addWidget(QLabel("cores"))
+        cpu_layout.addStretch()
+        
+        runtime_layout.addRow("CPU Limit:", cpu_layout)
+        
+        # Memory limit
+        mem_layout = QHBoxLayout()
+        self.memory_limit = QSpinBox()
+        self.memory_limit.setMinimum(256)
+        self.memory_limit.setMaximum(32768)
+        self.memory_limit.setSingleStep(256)
+        self.memory_limit.setValue(2048)
+        mem_layout.addWidget(self.memory_limit)
+        mem_layout.addWidget(QLabel("MB"))
+        mem_layout.addStretch()
+        
+        runtime_layout.addRow("Memory Limit:", mem_layout)
+        
+        # Auto-remove containers
+        self.auto_remove = QCheckBox("Auto-remove containers after stop")
+        runtime_layout.addRow("", self.auto_remove)
+        
+        runtime_group.setLayout(runtime_layout)
+        layout.addWidget(runtime_group)
+        
+        # Network settings
+        network_group = QGroupBox("Network Settings")
+        network_layout = QFormLayout()
+        
+        self.network_mode = QComboBox()
+        self.network_mode.addItems(["bridge", "host", "none", "custom"])
+        network_layout.addRow("Network Mode:", self.network_mode)
+        
+        network_group.setLayout(network_layout)
+        layout.addWidget(network_group)
+        
+        # Auto-refresh settings
+        refresh_group = QGroupBox("Auto-Refresh")
+        refresh_layout = QFormLayout()
+        
+        self.auto_refresh_enabled = QCheckBox("Enable auto-refresh")
+        self.auto_refresh_enabled.setChecked(True)
+        refresh_layout.addRow("", self.auto_refresh_enabled)
+        
+        interval_layout = QHBoxLayout()
+        self.refresh_interval = QSpinBox()
+        self.refresh_interval.setMinimum(10)
+        self.refresh_interval.setMaximum(300)
+        self.refresh_interval.setValue(30)
+        self.refresh_interval.valueChanged.connect(self.update_refresh_interval)
+        interval_layout.addWidget(self.refresh_interval)
+        interval_layout.addWidget(QLabel("seconds"))
+        interval_layout.addStretch()
+        
+        refresh_layout.addRow("Refresh Interval:", interval_layout)
+        refresh_group.setLayout(refresh_layout)
+        layout.addWidget(refresh_group)
+        
+        # Save button
+        save_layout = QHBoxLayout()
+        save_btn = QPushButton("Save Settings")
         save_btn.clicked.connect(self.save_settings)
+        save_layout.addWidget(save_btn)
+        save_layout.addStretch()
+        layout.addLayout(save_layout)
         
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
+        layout.addStretch()
         
-        btn_layout.addWidget(test_btn)
-        btn_layout.addStretch()
-        btn_layout.addWidget(save_btn)
-        btn_layout.addWidget(cancel_btn)
+        self.tabs.addTab(settings_widget, "⚙️ Settings")
         
-        layout.addLayout(btn_layout)
-    
-    def test_connection(self):
-        """Test Artifactory connection"""
+    def connect_artifactory(self):
+        """Connect to Artifactory"""
+        url = self.artifactory_url.text().strip()
+        username = self.artifactory_user.text().strip()
+        password = self.artifactory_pass.text()
+        
+        if not all([url, username, password]):
+            QMessageBox.warning(self, "Error", "Please fill in all connection fields")
+            return
+            
         try:
-            url = f"https://{self.registry_input.text()}/artifactory/api/docker/{self.repository_input.text()}/v2/_catalog"
+            # Test connection by fetching repositories
+            api_url = f"{url}/artifactory/api/repositories"
             response = requests.get(
-                url,
-                auth=(self.username_input.text(), self.password_input.text()),
-                timeout=5
+                api_url,
+                auth=HTTPBasicAuth(username, password),
+                timeout=10
             )
             
             if response.status_code == 200:
-                QMessageBox.information(self, "Success", "Connection successful!")
+                repos = response.json()
+                docker_repos = [r['key'] for r in repos if r.get('packageType') == 'docker']
+                
+                self.repo_combo.clear()
+                self.repo_combo.addItems(docker_repos)
+                
+                self.connection_label.setText(" Status: Connected ")
+                self.connection_label.setStyleSheet("""
+                    QLabel {
+                        background-color: #ccffcc;
+                        padding: 4px;
+                        border-radius: 3px;
+                    }
+                """)
+                
+                self.status_bar.showMessage(f"Connected to {url}")
+                QMessageBox.information(self, "Success", "Connected to Artifactory!")
+                
+                # Save credentials for session
+                self.save_settings()
+                
             else:
-                QMessageBox.warning(self, "Failed", f"Connection failed: {response.status_code}")
+                raise Exception(f"HTTP {response.status_code}: {response.text}")
+                
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Connection error:\n{str(e)}")
-    
+            QMessageBox.critical(self, "Connection Failed", f"Failed to connect: {str(e)}")
+            self.connection_label.setText(" Status: Disconnected ")
+            self.connection_label.setStyleSheet("""
+                QLabel {
+                    background-color: #ffcccc;
+                    padding: 4px;
+                    border-radius: 3px;
+                }
+            """)
+            
+    def fetch_artifactory_images(self):
+        """Fetch images from selected Artifactory repository"""
+        if not self.repo_combo.currentText():
+            QMessageBox.warning(self, "Error", "Please select a repository")
+            return
+            
+        url = self.artifactory_url.text().strip()
+        username = self.artifactory_user.text().strip()
+        password = self.artifactory_pass.text()
+        repo = self.repo_combo.currentText()
+        
+        try:
+            # Fetch images from repository
+            api_url = f"{url}/artifactory/api/docker/{repo}/v2/_catalog"
+            response = requests.get(
+                api_url,
+                auth=HTTPBasicAuth(username, password),
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                repositories = data.get('repositories', [])
+                
+                self.artifactory_images = []
+                self.artifactory_table.setRowCount(0)
+                
+                for image in repositories:
+                    # Get tags for each image
+                    tags_url = f"{url}/artifactory/api/docker/{repo}/v2/{image}/tags/list"
+                    tags_response = requests.get(
+                        tags_url,
+                        auth=HTTPBasicAuth(username, password),
+                        timeout=10
+                    )
+                    
+                    if tags_response.status_code == 200:
+                        tags_data = tags_response.json()
+                        tags = tags_data.get('tags', ['latest'])
+                        
+                        for tag in tags:
+                            full_image = f"{url.replace('https://', '').replace('http://', '')}/{repo}/{image}:{tag}"
+                            self.artifactory_images.append({
+                                'name': image,
+                                'tag': tag,
+                                'full_name': full_image,
+                                'size': 'N/A',
+                                'created': 'N/A'
+                            })
+                            
+                self.populate_artifactory_table()
+                self.status_bar.showMessage(f"Found {len(self.artifactory_images)} images")
+                
+            else:
+                raise Exception(f"HTTP {response.status_code}")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to fetch images: {str(e)}")
+            
+    def populate_artifactory_table(self):
+        """Populate Artifactory images table"""
+        self.artifactory_table.setRowCount(len(self.artifactory_images))
+        
+        for row, image in enumerate(self.artifactory_images):
+            # Image name
+            self.artifactory_table.setItem(row, 0, QTableWidgetItem(image['name']))
+            # Tag
+            self.artifactory_table.setItem(row, 1, QTableWidgetItem(image['tag']))
+            # Size
+            self.artifactory_table.setItem(row, 2, QTableWidgetItem(image['size']))
+            # Created
+            self.artifactory_table.setItem(row, 3, QTableWidgetItem(image['created']))
+            
+            # Download button
+            download_btn = QPushButton("Download")
+            download_btn.clicked.connect(lambda checked, img=image: self.download_image(img))
+            self.artifactory_table.setCellWidget(row, 4, download_btn)
+            
+            # Terminal button
+            terminal_btn = QPushButton("🖥️")
+            terminal_btn.clicked.connect(lambda checked, img=image: self.open_terminal(img['full_name']))
+            self.artifactory_table.setCellWidget(row, 5, terminal_btn)
+            
+    def download_image(self, image):
+        """Download Docker image"""
+        reply = QMessageBox.question(
+            self, "Download Image",
+            f"Download {image['name']}:{image['tag']}?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.worker = DockerWorker("pull", image_name=image['full_name'])
+            self.worker.progress.connect(self.status_bar.showMessage)
+            self.worker.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
+            self.worker.finished.connect(self.refresh_local_images)
+            self.worker.start()
+            
+    def download_selected_images(self):
+        """Download selected images from Artifactory"""
+        selected_rows = set()
+        for item in self.artifactory_table.selectedItems():
+            selected_rows.add(item.row())
+            
+        if not selected_rows:
+            QMessageBox.warning(self, "Error", "Please select images to download")
+            return
+            
+        images_to_download = [self.artifactory_images[row] for row in selected_rows]
+        
+        reply = QMessageBox.question(
+            self, "Download Images",
+            f"Download {len(images_to_download)} selected images?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            for image in images_to_download:
+                self.download_image(image)
+                
+    def refresh_local_images(self):
+        """Refresh local Docker images"""
+        if not DOCKER_AVAILABLE or not self.docker_client:
+            QMessageBox.warning(self, "Error", "Docker is not available")
+            return
+            
+        try:
+            images = self.docker_client.images.list()
+            self.local_images = []
+            
+            for image in images:
+                tags = image.tags if image.tags else ['<none>']
+                for tag in tags:
+                    repo, tag_name = tag.split(':') if ':' in tag else (tag, 'latest')
+                    self.local_images.append({
+                        'repository': repo,
+                        'tag': tag_name,
+                        'id': image.short_id,
+                        'size': f"{image.attrs['Size'] / 1024 / 1024:.2f} MB",
+                        'created': image.attrs['Created'][:19],
+                        'full_name': f"{repo}:{tag_name}"
+                    })
+                    
+            self.populate_local_table()
+            self.status_bar.showMessage(f"Found {len(self.local_images)} local images")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to refresh local images: {str(e)}")
+            
+    def populate_local_table(self):
+        """Populate local images table"""
+        self.local_table.setRowCount(len(self.local_images))
+        
+        for row, image in enumerate(self.local_images):
+            # Repository
+            self.local_table.setItem(row, 0, QTableWidgetItem(image['repository']))
+            # Tag
+            self.local_table.setItem(row, 1, QTableWidgetItem(image['tag']))
+            # Image ID
+            self.local_table.setItem(row, 2, QTableWidgetItem(image['id']))
+            # Size
+            self.local_table.setItem(row, 3, QTableWidgetItem(image['size']))
+            # Created
+            self.local_table.setItem(row, 4, QTableWidgetItem(image['created']))
+            
+            # Action buttons
+            action_layout = QHBoxLayout()
+            action_widget = QWidget()
+            
+            run_btn = QPushButton("Run")
+            run_btn.clicked.connect(lambda checked, img=image: self.run_image(img))
+            action_layout.addWidget(run_btn)
+            
+            delete_btn = QPushButton("Delete")
+            delete_btn.clicked.connect(lambda checked, img=image: self.delete_image(img))
+            delete_btn.setStyleSheet("background-color: #dc3545;")
+            action_layout.addWidget(delete_btn)
+            
+            action_widget.setLayout(action_layout)
+            self.local_table.setCellWidget(row, 5, action_widget)
+            
+            # Terminal button
+            terminal_btn = QPushButton("🖥️")
+            terminal_btn.clicked.connect(lambda checked, img=image: self.open_terminal(img['full_name']))
+            self.local_table.setCellWidget(row, 6, terminal_btn)
+            
+    def filter_local_images(self):
+        """Filter local images based on search"""
+        search_text = self.search_local.text().lower()
+        for row in range(self.local_table.rowCount()):
+            hide = True
+            for col in range(3):  # Search in repo, tag, and ID
+                item = self.local_table.item(row, col)
+                if item and search_text in item.text().lower():
+                    hide = False
+                    break
+            self.local_table.setRowHidden(row, hide)
+            
+    def run_image(self, image):
+        """Run Docker image as container"""
+        cpu = self.cpu_limit.value() if self.cpu_limit.value() > 0 else None
+        memory = f"{self.memory_limit.value()}m" if self.memory_limit.value() > 0 else None
+        
+        self.worker = DockerWorker(
+            "run",
+            image_name=image['full_name'],
+            cpu_limit=cpu,
+            mem_limit=memory
+        )
+        self.worker.progress.connect(self.status_bar.showMessage)
+        self.worker.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
+        self.worker.finished.connect(self.refresh_containers)
+        self.worker.start()
+        
+    def delete_image(self, image):
+        """Delete local Docker image"""
+        reply = QMessageBox.question(
+            self, "Delete Image",
+            f"Delete {image['repository']}:{image['tag']}?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.worker = DockerWorker("remove", image_name=image['full_name'])
+            self.worker.progress.connect(self.status_bar.showMessage)
+            self.worker.error.connect(lambda e: QMessageBox.critical(self, "Error", e))
+            self.worker.finished.connect(self.refresh_local_images)
+            self.worker.start()
+            
+    def delete_selected_images(self):
+        """Delete selected local images"""
+        selected_rows = set()
+        for item in self.local_table.selectedItems():
+            selected_rows.add(item.row())
+            
+        if not selected_rows:
+            QMessageBox.warning(self, "Error", "Please select images to delete")
+            return
+            
+        images_to_delete = [self.local_images[row] for row in selected_rows]
+        
+        reply = QMessageBox.question(
+            self, "Delete Images",
+            f"Delete {len(images_to_delete)} selected images?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            for image in images_to_delete:
+                self.delete_image(image)
+                
+    def prune_images(self):
+        """Prune unused Docker images"""
+        reply = QMessageBox.question(
+            self, "Prune Images",
+            "Remove all unused Docker images?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes and self.docker_client:
+            try:
+                self.docker_client.images.prune()
+                self.refresh_local_images()
+                QMessageBox.information(self, "Success", "Unused images pruned")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to prune images: {str(e)}")
+                
+    def refresh_containers(self):
+        """Refresh running containers"""
+        if not DOCKER_AVAILABLE or not self.docker_client:
+            return
+            
+        try:
+            show_all = self.show_all_checkbox.isChecked()
+            containers = self.docker_client.containers.list(all=show_all)
+            
+            self.containers_table.setRowCount(len(containers))
+            
+            for row, container in enumerate(containers):
+                # Container ID
+                self.containers_table.setItem(row, 0, QTableWidgetItem(container.short_id))
+                # Image
+                self.containers_table.setItem(row, 1, QTableWidgetItem(container.image.tags[0] if container.image.tags else 'N/A'))
+                # Name
+                self.containers_table.setItem(row, 2, QTableWidgetItem(container.name))
+                # Status
+                self.containers_table.setItem(row, 3, QTableWidgetItem(container.status))
+                # Ports
+                ports = container.attrs.get('NetworkSettings', {}).get('Ports', {})
+                port_str = ', '.join([f"{k}→{v[0]['HostPort']}" if v else k for k, v in ports.items()])
+                self.containers_table.setItem(row, 4, QTableWidgetItem(port_str))
+                # Created
+                self.containers_table.setItem(row, 5, QTableWidgetItem(container.attrs['Created'][:19]))
+                
+                # Actions
+                action_layout = QHBoxLayout()
+                action_widget = QWidget()
+                
+                if container.status == 'running':
+                    stop_btn = QPushButton("Stop")
+                    stop_btn.clicked.connect(lambda checked, c=container: self.stop_container(c))
+                    action_layout.addWidget(stop_btn)
+                    
+                    logs_btn = QPushButton("Logs")
+                    logs_btn.clicked.connect(lambda checked, c=container: self.show_container_logs(c))
+                    action_layout.addWidget(logs_btn)
+                else:
+                    start_btn = QPushButton("Start")
+                    start_btn.clicked.connect(lambda checked, c=container: self.start_container(c))
+                    action_layout.addWidget(start_btn)
+                    
+                    remove_btn = QPushButton("Remove")
+                    remove_btn.clicked.connect(lambda checked, c=container: self.remove_container(c))
+                    action_layout.addWidget(remove_btn)
+                    
+                action_widget.setLayout(action_layout)
+                self.containers_table.setCellWidget(row, 6, action_widget)
+                
+            self.status_bar.showMessage(f"Found {len(containers)} containers")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to refresh containers: {str(e)}")
+            
+    def stop_container(self, container):
+        """Stop running container"""
+        try:
+            container.stop()
+            self.refresh_containers()
+            self.status_bar.showMessage(f"Stopped container {container.short_id}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to stop container: {str(e)}")
+            
+    def start_container(self, container):
+        """Start stopped container"""
+        try:
+            container.start()
+            self.refresh_containers()
+            self.status_bar.showMessage(f"Started container {container.short_id}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start container: {str(e)}")
+            
+    def remove_container(self, container):
+        """Remove container"""
+        reply = QMessageBox.question(
+            self, "Remove Container",
+            f"Remove container {container.name}?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                container.remove(force=True)
+                self.refresh_containers()
+                self.status_bar.showMessage(f"Removed container {container.short_id}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to remove container: {str(e)}")
+                
+    def show_container_logs(self, container):
+        """Show container logs"""
+        try:
+            logs = container.logs(tail=100).decode('utf-8')
+            self.logs_output.setText(logs)
+        except Exception as e:
+            self.logs_output.setText(f"Error fetching logs: {str(e)}")
+            
+    def open_terminal(self, image_name):
+        """Open terminal for Docker image"""
+        terminal = TerminalDialog(image_name, self)
+        terminal.exec_()
+        
+    def browse_download_location(self):
+        """Browse for download location"""
+        folder = QFileDialog.getExistingDirectory(self, "Select Download Location")
+        if folder:
+            self.download_location.setText(folder)
+            
+    def update_refresh_interval(self):
+        """Update auto-refresh interval"""
+        if self.auto_refresh_enabled.isChecked():
+            self.refresh_timer.setInterval(self.refresh_interval.value() * 1000)
+            
+    def auto_refresh(self):
+        """Auto-refresh data"""
+        if self.auto_refresh_enabled.isChecked():
+            self.refresh_local_images()
+            self.refresh_containers()
+            
+    def refresh_all(self):
+        """Refresh all data"""
+        self.refresh_local_images()
+        self.refresh_containers()
+        if self.repo_combo.currentText():
+            self.fetch_artifactory_images()
+            
     def save_settings(self):
-        """Save settings to config"""
-        self.config.set('Artifactory', 'registry', self.registry_input.text())
-        self.config.set('Artifactory', 'repository', self.repository_input.text())
-        self.config.set('Artifactory', 'username', self.username_input.text())
-        self.config.set('Artifactory', 'password', self.password_input.text())
-        self.config.set('Local', 'storage_path', self.storage_input.text())
-        self.config.set('Local', 'auto_refresh_interval', str(self.refresh_input.value()))
-        self.config.set('UI', 'theme', self.theme_combo.currentText())
+        """Save application settings"""
+        self.settings.setValue("artifactory_url", self.artifactory_url.text())
+        self.settings.setValue("artifactory_user", self.artifactory_user.text())
+        # Note: Password should be stored securely in production
+        self.settings.setValue("download_location", self.download_location.text())
+        self.settings.setValue("cpu_limit", self.cpu_limit.value())
+        self.settings.setValue("memory_limit", self.memory_limit.value())
+        self.settings.setValue("auto_remove", self.auto_remove.isChecked())
+        self.settings.setValue("network_mode", self.network_mode.currentText())
+        self.settings.setValue("auto_refresh", self.auto_refresh_enabled.isChecked())
+        self.settings.setValue("refresh_interval", self.refresh_interval.value())
         
-        self.accept()
+        QMessageBox.information(self, "Success", "Settings saved!")
+        
+    def load_settings(self):
+        """Load application settings"""
+        self.artifactory_url.setText(self.settings.value("artifactory_url", ""))
+        self.artifactory_user.setText(self.settings.value("artifactory_user", ""))
+        self.download_location.setText(self.settings.value("download_location", str(Path.home() / "DockerImages")))
+        self.cpu_limit.setValue(int(self.settings.value("cpu_limit", 2)))
+        self.memory_limit.setValue(int(self.settings.value("memory_limit", 2048)))
+        self.auto_remove.setChecked(self.settings.value("auto_remove", False, type=bool))
+        
+        network = self.settings.value("network_mode", "bridge")
+        index = self.network_mode.findText(network)
+        if index >= 0:
+            self.network_mode.setCurrentIndex(index)
+            
+        self.auto_refresh_enabled.setChecked(self.settings.value("auto_refresh", True, type=bool))
+        self.refresh_interval.setValue(int(self.settings.value("refresh_interval", 30)))
+        
+        # Initial refresh
+        self.refresh_local_images()
+        self.refresh_containers()
 
-# ============================================================================
-# Quick Run Dialog
-# ============================================================================
-
-class QuickRunDialog(QDialog):
-    def __init__(self, parent, image, tag, config):
-        super().__init__(parent)
-        self.image = image
-        self.tag = tag
-        self.config = config
-        self.init_ui()
-    
-    def init_ui(self):
-        self.setWindowTitle(f"Quick Run: {self.image}:{self.tag}")
-        self.setGeometry(400, 400, 400, 200)
-        
-        layout = QFormLayout(self)
-        
-        # Container name
-        self.name_input = QLineEdit(f"{self.image}-{self.tag}".replace(":", "-"))
-        layout.addRow("Container Name:", self.name_input)
-        
-        # Port mapping
-        self.port_input = QLineEdit("8080:5000")
-        layout.addRow("Port Mapping:", self.port_input)
-        
-        # Buttons
-        btn_layout = QHBoxLayout()
-        
-        run_btn = QPushButton("Run")
-        run_btn.clicked.connect(self.accept)
-        
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        
-        btn_layout.addWidget(run_btn)
-        btn_layout.addWidget(cancel_btn)
-        
-        layout.addRow(btn_layout)
-
-# ============================================================================
-# Main Entry Point
-# ============================================================================
 
 def main():
+    """Main application entry point"""
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
+    app.setApplicationName("Docker Manager")
     
-    window = EnhancedDockerManager()
+    # Set application icon if available
+    app.setWindowIcon(QIcon())
+    
+    # Create and show main window
+    window = DockerManagerApp()
     window.show()
     
     sys.exit(app.exec_())
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
