@@ -626,8 +626,11 @@ pipeline {
 // ================================================================================
 def calculateAppContentHash(appDir) {
     try {
+        echo "[HASH] Starting hash calculation for ${appDir}..."
+        
         // Get all files in the directory
         def allFiles = getAllFiles(appDir)
+        echo "[HASH] Found ${allFiles.size()} total files in ${appDir}"
         
         // Parse .dockerignore if it exists
         def ignorePatterns = []
@@ -637,12 +640,14 @@ def calculateAppContentHash(appDir) {
                 .split('\n')
                 .findAll { it.trim() && !it.startsWith('#') }
                 .collect { it.trim() }
+            echo "[HASH] Loaded ${ignorePatterns.size()} ignore patterns from .dockerignore"
         }
         
         // Filter files based on .dockerignore patterns
         def filesToHash = allFiles.findAll { file ->
             !isIgnored(file, ignorePatterns)
         }
+        echo "[HASH] ${filesToHash.size()} files to hash after filtering"
         
         // Sort for consistent ordering
         filesToHash.sort()
@@ -652,26 +657,34 @@ def calculateAppContentHash(appDir) {
         filesToHash.each { relativePath ->
             def fullPath = "${appDir}/${relativePath}"
             if (fileExists(fullPath)) {
-                // Get file size and modification time
-                def fileStats = bat(
-                    script: "@for %%I in (\"${fullPath.replace('/', '\\')}\") do @echo %%~zI %%~tI",
-                    returnStdout: true
-                ).trim()
-                
-                // Read file content
-                def content = readFile(fullPath)
-                
-                // Combine path, stats, and content hash
-                hashContent.append("${relativePath}:${fileStats}:${content.hashCode()}\n")
+                try {
+                    // Read file content
+                    def content = readFile(fullPath)
+                    // Use content hash and relative path (not file stats which can change)
+                    hashContent.append("${relativePath}:${content.hashCode()}\n")
+                } catch (Exception e) {
+                    // If can't read file, just use the path
+                    hashContent.append("${relativePath}:unreadable\n")
+                }
             }
         }
         
-        // Return MD5 hash of combined content
-        return createMD5Hash(hashContent.toString())
+        // If no content to hash, return a stable hash based on app name
+        if (hashContent.length() == 0) {
+            echo "[HASH] No files to hash for ${appDir}, using stable default"
+            return "empty-${appDir}".hashCode().toString()
+        }
+        
+        // Return hash of combined content
+        def finalHash = hashContent.toString().hashCode().toString()
+        echo "[HASH] Final hash for ${appDir}: ${finalHash}"
+        return finalHash
         
     } catch (Exception e) {
-        echo "[HASH ERROR] ${appDir}: ${e.message}"
-        return "error-${System.currentTimeMillis()}"
+        echo "[HASH ERROR] Failed to calculate hash for ${appDir}: ${e.message}"
+        echo "[HASH ERROR] Stack trace: ${e.printStackTrace()}"
+        // Return a stable fallback based on app name, not timestamp!
+        return "fallback-${appDir}".hashCode().toString()
     }
 }
 
@@ -681,22 +694,40 @@ def calculateAppContentHash(appDir) {
 def getAllFiles(appDir) {
     def files = []
     
-    def output = bat(
-        script: "@dir /b /s /a:-d \"${appDir}\" 2>nul",
-        returnStdout: true
-    ).trim()
-    
-    if (output) {
-        def appPath = new File("${env.WORKSPACE}/${appDir}").canonicalPath
-        output.split('\r?\n').each { absolutePath ->
-            if (absolutePath) {
-                // Convert to relative path
-                def relativePath = absolutePath
-                    .replace(appPath + '\\', '')
-                    .replace('\\', '/')
-                files.add(relativePath)
+    try {
+        // Use Windows dir command to get all files
+        def output = bat(
+            script: "@dir /b /s /a:-d \"${appDir}\" 2>nul",
+            returnStdout: true
+        ).trim()
+        
+        if (output) {
+            // Get the absolute path of the app directory for proper path calculation
+            def workspacePath = env.WORKSPACE.replace('/', '\\')
+            def appFullPath = "${workspacePath}\\${appDir}"
+            
+            output.split('\r?\n').each { absolutePath ->
+                if (absolutePath && absolutePath.trim()) {
+                    // Convert absolute path to relative path from app directory
+                    if (absolutePath.startsWith(appFullPath)) {
+                        def relativePath = absolutePath
+                            .substring(appFullPath.length())
+                            .replace('\\', '/')
+                        
+                        // Remove leading slash if present
+                        if (relativePath.startsWith('/')) {
+                            relativePath = relativePath.substring(1)
+                        }
+                        
+                        if (relativePath) {
+                            files.add(relativePath)
+                        }
+                    }
+                }
             }
         }
+    } catch (Exception e) {
+        echo "[HASH WARNING] Error listing files in ${appDir}: ${e.message}"
     }
     
     return files
@@ -718,40 +749,61 @@ def isIgnored(filePath, patterns) {
 // HELPER FUNCTION: Match File Against Dockerignore Pattern
 // ================================================================================
 def matchesDockerignorePattern(filePath, pattern) {
+    // Handle negation patterns (starting with !)
+    if (pattern.startsWith('!')) {
+        return false  // Negation patterns need special handling in the main logic
+    }
+    
     // Handle directory patterns (ending with /)
     if (pattern.endsWith('/')) {
         def dir = pattern[0..-2]
         return filePath.startsWith("${dir}/") || filePath == dir
     }
     
-    // Convert dockerignore pattern to regex
-    def regexPattern = pattern
-        .replace('.', '\\.')
-        .replace('**/', '(.*/)?')  // ** matches any number of directories
-        .replace('*', '[^/]*')      // * matches any character except /
-        .replace('?', '.')           // ? matches single character
-    
-    // Add anchors
-    if (pattern.contains('/')) {
-        // Path pattern - must match from start
-        regexPattern = '^' + regexPattern + '$'
-    } else {
-        // Filename pattern - can match anywhere
-        regexPattern = '(^|/)' + regexPattern + '$'
+    // Handle patterns with wildcards
+    if (pattern.contains('*') || pattern.contains('?')) {
+        // Convert dockerignore pattern to regex
+        def regexPattern = pattern
+            .replace('\\', '/')  // Normalize path separators
+            .replace('.', '\\.')  // Escape dots
+            .replace('**/', '(.*/)?')  // ** matches any number of directories
+            .replace('**', '.*')  // ** at end matches everything
+            .replace('*', '[^/]*')  // * matches any character except /
+            .replace('?', '.')  // ? matches single character
+        
+        // Determine if pattern should match from root or anywhere
+        if (pattern.startsWith('/')) {
+            // Absolute pattern - must match from start
+            regexPattern = '^' + regexPattern.substring(1) + '$'
+        } else if (pattern.contains('/')) {
+            // Relative path pattern - can match as path
+            regexPattern = '(^|/)' + regexPattern + '$'
+        } else {
+            // Filename pattern - can match anywhere
+            regexPattern = '(^|.*/)'+ regexPattern + '$'
+        }
+        
+        try {
+            return filePath.matches(regexPattern)
+        } catch (Exception e) {
+            // If regex fails, fall back to simple contains
+            return filePath.contains(pattern.replace('*', ''))
+        }
     }
     
-    try {
-        return filePath.matches(regexPattern)
-    } catch (Exception e) {
-        // Fallback to simple string matching
-        return filePath == pattern || 
-               filePath.endsWith("/${pattern}") || 
-               filePath.startsWith("${pattern}/")
+    // Handle exact matches and simple patterns
+    if (pattern.contains('/')) {
+        // Path pattern
+        return filePath == pattern || filePath.startsWith("${pattern}/")
+    } else {
+        // Filename pattern - match basename
+        def fileName = filePath.contains('/') ? filePath.substring(filePath.lastIndexOf('/') + 1) : filePath
+        return fileName == pattern
     }
 }
 
 // ================================================================================
-// HELPER FUNCTION: Create MD5 Hash Using Windows Certutil
+// ALTERNATIVE: Simpler MD5 Hash Using certutil (if you want real MD5)
 // ================================================================================
 def createMD5Hash(content) {
     def tempFile = "${env.WORKSPACE}/.temp_hash_${BUILD_NUMBER}_${System.nanoTime()}.txt"
@@ -769,6 +821,10 @@ def createMD5Hash(content) {
     } catch (Exception e) {
         return content.hashCode().toString()
     } finally {
-        bat "del \"${tempFile}\" 2>nul || exit 0"
+        try {
+            bat "del \"${tempFile}\" 2>nul || exit 0"
+        } catch (Exception ignored) {
+            // Ignore cleanup errors
+        }
     }
 }
