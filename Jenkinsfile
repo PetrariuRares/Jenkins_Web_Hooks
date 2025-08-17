@@ -13,16 +13,6 @@ pipeline {
             choices: ['auto', 'latest', 'dev'],
             description: 'Where to deploy (auto = based on branch, latest = production, dev = development)'
         )
-        booleanParam(
-            name: 'FORCE_BUILD',
-            defaultValue: false,
-            description: '[DEPRECATED] This parameter is ignored - builds only occur when changes are detected'
-        )
-        booleanParam(
-            name: 'CLEANUP_OLD_SHA256',
-            defaultValue: true,
-            description: 'Clean up old SHA256 digests in Artifactory after pushing new images'
-        )
     }
 
     triggers {
@@ -44,9 +34,6 @@ pipeline {
         
         // Pipeline status flags
         NO_APPS = 'false'
-        
-        // Artifactory API URL
-        ARTIFACTORY_API_URL = "https://${DOCKER_REGISTRY}/artifactory/api"
     }
 
     stages {
@@ -63,7 +50,6 @@ pipeline {
                     echo "Build Number: ${BUILD_NUMBER}"
                     echo "Manual Branch Override: ${params.BRANCH_NAME ?: 'none'}"
                     echo "Deploy Target: ${params.DEPLOY_TARGET}"
-                    echo "Cleanup Old SHA256: ${params.CLEANUP_OLD_SHA256}"
                     if (params.FORCE_BUILD) {
                         echo "[WARNING] FORCE_BUILD parameter is deprecated and ignored"
                         echo "[INFO] Builds only occur when actual changes are detected"
@@ -280,27 +266,6 @@ pipeline {
                                         script: "@docker inspect ${imageName} --format=\"{{index .Config.Labels \\\"content.hash\\\"}}\" 2>nul || echo \"\"",
                                         returnStdout: true
                                     ).trim()
-                                    
-                                    // Store the old SHA256 digest for potential cleanup later
-                                    if (params.CLEANUP_OLD_SHA256) {
-                                        try {
-                                            def oldDigest = bat(
-                                                script: "@docker inspect ${imageName} --format=\"{{.RepoDigests}}\" 2>nul || echo \"\"",
-                                                returnStdout: true
-                                            ).trim()
-                                            
-                                            if (oldDigest && oldDigest.contains('@sha256:')) {
-                                                def sha256Match = (oldDigest =~ /sha256:([a-f0-9]{64})/)
-                                                if (sha256Match.find()) {
-                                                    def oldSha256 = sha256Match.group(1)
-                                                    writeFile file: "${app}_old_sha256.txt", text: oldSha256
-                                                    echo "[SHA256 TRACKING] Stored old SHA256 for ${app}: ${oldSha256.substring(0, 12)}..."
-                                                }
-                                            }
-                                        } catch (Exception sha256Ex) {
-                                            echo "[SHA256 WARNING] Could not extract old SHA256 for ${app}: ${sha256Ex.message}"
-                                        }
-                                    }
 
                                     if (existingHash && existingHash != currentHash) {
                                         echo "[CHANGE DETECTED] ${app}: Content changed (${existingHash} -> ${currentHash})"
@@ -431,9 +396,8 @@ pipeline {
         }
 
         // ================================================================================
-        // STAGE 5: Push to Artifactory with SHA256 Cleanup
+        // STAGE 5: Push to Artifactory
         // Pushes built images to JFrog Artifactory
-        // Captures new SHA256 digests and removes old ones if enabled
         // Uses parallel uploads for efficiency
         // ================================================================================
         stage('Push to Artifactory') {
@@ -447,7 +411,6 @@ pipeline {
                     echo "========================================="
 
                     def apps = env.APPS_TO_BUILD.split(',')
-                    def sha256Cleanup = [:]
 
                     // Authenticate with Artifactory
                     withCredentials([usernamePassword(
@@ -475,35 +438,6 @@ pipeline {
                                     // Store pushed tag for summary report
                                     env."${app}_PUSHED_TAG" = imageTag
                                     
-                                    // Get the new SHA256 digest after push
-                                    try {
-                                        def newDigest = bat(
-                                            script: "@docker inspect ${imageName}:${imageTag} --format=\"{{.RepoDigests}}\" 2>nul || echo \"\"",
-                                            returnStdout: true
-                                        ).trim()
-                                        
-                                        if (newDigest && newDigest.contains('@sha256:')) {
-                                            def sha256Match = (newDigest =~ /sha256:([a-f0-9]{64})/)
-                                            if (sha256Match.find()) {
-                                                def newSha256 = sha256Match.group(1)
-                                                writeFile file: "${app}_new_sha256.txt", text: newSha256
-                                                echo "[SHA256] New digest for ${app}: ${newSha256.substring(0, 12)}..."
-                                                
-                                                // Schedule cleanup if old SHA256 exists and is different
-                                                if (params.CLEANUP_OLD_SHA256 && fileExists("${app}_old_sha256.txt")) {
-                                                    def oldSha256 = readFile("${app}_old_sha256.txt").trim()
-                                                    if (oldSha256 && oldSha256 != newSha256) {
-                                                        sha256Cleanup[app] = [old: oldSha256, new: newSha256]
-                                                        echo "[SHA256 CLEANUP] Scheduled cleanup for ${app}: old ${oldSha256.substring(0, 12)}..."
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } catch (Exception sha256Ex) {
-                                        echo "[SHA256 WARNING] Could not extract SHA256 for ${app}: ${sha256Ex.message}"
-                                        echo "[SHA256 WARNING] Continuing without SHA256 cleanup for ${app}"
-                                    }
-                                    
                                 } catch (Exception e) {
                                     echo "[PUSH ERROR] ${app}: ${e.message}"
                                     throw e
@@ -513,62 +447,6 @@ pipeline {
 
                         // Execute all push jobs in parallel
                         parallel pushJobs
-                        
-                        // Perform SHA256 cleanup after successful pushes
-                        if (params.CLEANUP_OLD_SHA256 && sha256Cleanup.size() > 0) {
-                            echo "========================================="
-                            echo ">>> SHA256 CLEANUP"
-                            echo "========================================="
-                            
-                            sha256Cleanup.each { app, digests ->
-                                try {
-                                    echo "[SHA256 CLEANUP] Processing ${app}..."
-                                    echo "  Old SHA256: ${digests.old.substring(0, 12)}..."
-                                    echo "  New SHA256: ${digests.new.substring(0, 12)}..."
-                                    
-                                    // Use Artifactory REST API to delete old SHA256
-                                    def deleteUrl = "${env.ARTIFACTORY_API_URL}/docker/${env.DOCKER_REPO}/v2/${app}/manifests/sha256:${digests.old}"
-                                    
-                                    def deleteResult = bat(
-                                        script: """
-                                            @curl -X DELETE \
-                                                -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \
-                                                -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-                                                "${deleteUrl}" \
-                                                -w "\\n%%{http_code}" \
-                                                -o delete_response.txt \
-                                                -s
-                                        """,
-                                        returnStdout: true
-                                    ).trim()
-                                    
-                                    def httpCode = deleteResult.split('\n')[-1]
-                                    
-                                    if (httpCode == '200' || httpCode == '202' || httpCode == '204') {
-                                        echo "[SHA256 CLEANUP SUCCESS] ${app}: Removed old SHA256 ${digests.old.substring(0, 12)}..."
-                                    } else if (httpCode == '404') {
-                                        echo "[SHA256 CLEANUP INFO] ${app}: Old SHA256 already removed or not found"
-                                    } else {
-                                        echo "[SHA256 CLEANUP WARNING] ${app}: Unexpected response code ${httpCode}"
-                                        if (fileExists('delete_response.txt')) {
-                                            def response = readFile('delete_response.txt')
-                                            echo "  Response: ${response}"
-                                        }
-                                    }
-                                    
-                                    // Clean up response file
-                                    bat 'del /Q delete_response.txt 2>nul || exit 0'
-                                    
-                                } catch (Exception e) {
-                                    echo "[SHA256 CLEANUP ERROR] ${app}: ${e.message}"
-                                    echo "[SHA256 CLEANUP] Continuing despite error..."
-                                }
-                            }
-                            
-                            echo "========================================="
-                            echo "[SHA256 CLEANUP] Cleanup process completed"
-                            echo "========================================="
-                        }
                     }
 
                     // Logout from registry
@@ -593,9 +471,6 @@ pipeline {
                         // Remove temporary tag and hash files
                         bat 'del /Q *_tag.txt 2>nul || exit 0'
                         bat 'del /Q *_hash.txt 2>nul || exit 0'
-                        bat 'del /Q *_old_sha256.txt 2>nul || exit 0'
-                        bat 'del /Q *_new_sha256.txt 2>nul || exit 0'
-                        bat 'del /Q delete_response.txt 2>nul || exit 0'
                         
                         echo "[CLEANUP] Temporary files removed"
                     } catch (Exception e) {
@@ -620,7 +495,6 @@ pipeline {
                     echo "Author: ${env.GIT_AUTHOR}"
                     echo "Build #: ${env.BUILD_NUMBER}"
                     echo "Target: ${env.DEPLOY_ENV}"
-                    echo "SHA256 Cleanup: ${params.CLEANUP_OLD_SHA256 ? 'Enabled' : 'Disabled'}"
                     
                     if (params.BRANCH_NAME) {
                         echo "Manual Branch Override: ${params.BRANCH_NAME}"
@@ -638,12 +512,6 @@ pipeline {
                             echo "\n  ${app}:"
                             echo "    Image: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
                             echo "    Registry: https://${env.DOCKER_REGISTRY}/artifactory/webapp/#/artifacts/browse/tree/General/${env.DOCKER_REPO}/${app}"
-                            
-                            // Show new SHA256 if available
-                            if (fileExists("${app}_new_sha256.txt")) {
-                                def newSha256 = readFile("${app}_new_sha256.txt").trim()
-                                echo "    SHA256: ${newSha256.substring(0, 12)}..."
-                            }
                         }
                         
                         // Provide docker pull commands for easy access
@@ -688,9 +556,6 @@ pipeline {
                     echo "[DOCKER CLEANUP] Removing temporary files..."
                     bat 'del /Q *_tag.txt 2>nul || exit 0'
                     bat 'del /Q *_hash.txt 2>nul || exit 0'
-                    bat 'del /Q *_old_sha256.txt 2>nul || exit 0'
-                    bat 'del /Q *_new_sha256.txt 2>nul || exit 0'
-                    bat 'del /Q delete_response.txt 2>nul || exit 0'
                     
                     // Remove local Docker images to save disk space
                     if (env.APPS_TO_BUILD) {
@@ -759,186 +624,90 @@ pipeline {
 // HELPER FUNCTION: Calculate Content Hash
 // Creates a hash representing the current state of an application
 // Used to determine if Docker image needs rebuilding
-// Dynamically scans all files in the application directory
 // ================================================================================
 def calculateAppContentHash(appDir) {
     try {
+        // List of file patterns to include in hash calculation
+        def filePatterns = ['*.py', '*.txt', 'Dockerfile', '*.json', '*.yml', '*.yaml', '*.sh', '*.sql']
         def combinedContent = ''
-        def fileMap = [:] // Map to store file paths and their hashes for consistent ordering
         
         // Read .dockerignore patterns if exists
         def dockerignorePath = "${appDir}/.dockerignore"
-        def ignorePatterns = getDockerignorePatterns(dockerignorePath)
+        def ignorePatterns = []
+        if (fileExists(dockerignorePath)) {
+            def dockerignore = readFile(dockerignorePath)
+            ignorePatterns = dockerignore.split('\n').findAll { it.trim() && !it.startsWith('#') }
+        }
         
-        // Add default ignore patterns (always skip these)
-        def defaultIgnores = ['.git', '.svn', '.hg', 'node_modules', '__pycache__', '.pytest_cache', '.tox', '*.pyc', '*.pyo', '*.pyd', '.DS_Store', 'Thumbs.db']
-        ignorePatterns.addAll(defaultIgnores)
-        
-        echo "[HASH] Calculating content hash for ${appDir}..."
-        echo "[HASH] Active ignore patterns: ${ignorePatterns.size()} patterns loaded"
-        
-        // Get all files recursively using Windows dir command
-        def allFiles = bat(
-            script: "@dir /s /b /a:-d \"${appDir}\" 2>nul || exit 0",
-            returnStdout: true
-        ).trim()
-        
-        if (allFiles) {
-            def fileCount = 0
-            def skippedCount = 0
-            
-            allFiles.split('\r?\n').each { fullPath ->
-                if (fullPath && fullPath.trim()) {
-                    // Get relative path from app directory
-                    def relativePath = fullPath.replace(env.WORKSPACE + '\\', '')
-                        .replace('\\', '/')
-                        .replace(appDir + '/', '')
-                    
-                    // Skip if file should be ignored
-                    if (shouldIgnoreFile(relativePath, ignorePatterns)) {
-                        skippedCount++
-                        return // continue to next file
-                    }
-                    
-                    // Skip binary files and large files
-                    if (isBinaryOrLargeFile(fullPath)) {
-                        skippedCount++
-                        return // continue to next file
-                    }
-                    
-                    try {
-                        // Read file content and calculate hash
-                        def content = readFile(fullPath)
-                        def fileHash = content.hashCode().toString()
+        // Process each file pattern
+        filePatterns.each { pattern ->
+            try {
+                def files = bat(
+                    script: "@dir /b \"${appDir}\\${pattern}\" 2>nul || exit 0",
+                    returnStdout: true
+                ).trim().split('\r?\n')
+                
+                files.each { file ->
+                    if (file && file.trim()) {
+                        def filePath = "${appDir}/${file}"
+                        def shouldInclude = true
                         
-                        // Store in map for consistent ordering
-                        fileMap[relativePath] = fileHash
-                        fileCount++
+                        // Check against ignore patterns
+                        ignorePatterns.each { ignorePattern ->
+                            if (file.contains(ignorePattern.replace('*', ''))) {
+                                shouldInclude = false
+                            }
+                        }
                         
-                    } catch (Exception e) {
-                        // Skip files that can't be read (permissions, binary, etc.)
-                        skippedCount++
+                        if (shouldInclude && fileExists(filePath)) {
+                            // Read file content and add to combined content
+                            def content = readFile(filePath)
+                            combinedContent += file + ':' + content.hashCode().toString() + ';'
+                        }
                     }
                 }
+            } catch (Exception e) {
+                // Ignore errors for missing file patterns
             }
-            
-            echo "[HASH] Processed ${fileCount} files, skipped ${skippedCount} files"
-            
-            // Build combined content string in sorted order for consistency
-            fileMap.keySet().sort().each { path ->
-                combinedContent += "${path}:${fileMap[path]};"
+        }
+        
+        // Also hash subdirectories if they exist
+        def subdirs = ['src', 'lib', 'utils', 'config', 'scripts']
+        subdirs.each { subdir ->
+            def subdirPath = "${appDir}/${subdir}"
+            if (fileExists(subdirPath)) {
+                filePatterns.each { pattern ->
+                    try {
+                        def files = bat(
+                            script: "@dir /b /s \"${subdirPath}\\${pattern}\" 2>nul || exit 0",
+                            returnStdout: true
+                        ).trim().split('\r?\n')
+                        
+                        files.each { file ->
+                            if (file && file.trim() && fileExists(file)) {
+                                def content = readFile(file)
+                                def relativePath = file.replace(env.WORKSPACE + '\\', '')
+                                combinedContent += relativePath + ':' + content.hashCode().toString() + ';'
+                            }
+                        }
+                    } catch (Exception e) {
+                        // Ignore errors for missing patterns
+                    }
+                }
             }
         }
         
         // Return hash of combined content
+        // If no content found, use timestamp to force build
         if (combinedContent) {
-            def finalHash = combinedContent.hashCode().toString()
-            echo "[HASH] Final hash for ${appDir}: ${finalHash}"
-            return finalHash
+            return combinedContent.hashCode().toString()
         } else {
-            echo "[HASH] No files found to hash in ${appDir}, using timestamp"
             return new Date().getTime().toString()
         }
         
     } catch (Exception e) {
-        echo "[HASH ERROR] Could not calculate hash for ${appDir}: ${e.message}"
+        echo "[HASH WARNING] Could not calculate hash for ${appDir}: ${e.message}"
         // Return timestamp as fallback to ensure build happens
         return new Date().getTime().toString()
-    }
-}
-
-// Helper function to parse .dockerignore patterns
-def getDockerignorePatterns(dockerignorePath) {
-    def patterns = []
-    
-    if (fileExists(dockerignorePath)) {
-        try {
-            def dockerignore = readFile(dockerignorePath)
-            dockerignore.split('\n').each { line ->
-                line = line.trim()
-                // Skip empty lines and comments
-                if (line && !line.startsWith('#')) {
-                    // Convert dockerignore patterns to simple patterns we can match
-                    // Remove leading slash if present
-                    if (line.startsWith('/')) {
-                        line = line.substring(1)
-                    }
-                    patterns.add(line)
-                }
-            }
-        } catch (Exception e) {
-            echo "[HASH] Could not read .dockerignore: ${e.message}"
-        }
-    }
-    
-    return patterns
-}
-
-// Helper function to check if a file should be ignored
-def shouldIgnoreFile(relativePath, ignorePatterns) {
-    def pathToCheck = relativePath.toLowerCase()
-    
-    for (pattern in ignorePatterns) {
-        def patternLower = pattern.toLowerCase()
-        
-        // Handle different pattern types
-        if (patternLower.contains('*')) {
-            // Wildcard pattern
-            def regexPattern = patternLower
-                .replace('.', '\\.')
-                .replace('**/', '.*')
-                .replace('*', '[^/]*')
-                .replace('?', '.')
-            
-            if (pathToCheck.matches(".*${regexPattern}.*")) {
-                return true
-            }
-        } else if (patternLower.startsWith('.')) {
-            // File extension pattern
-            if (pathToCheck.endsWith(patternLower)) {
-                return true
-            }
-        } else {
-            // Direct match or directory match
-            if (pathToCheck.contains(patternLower)) {
-                return true
-            }
-        }
-    }
-    
-    return false
-}
-
-// Helper function to detect binary or large files that shouldn't be hashed
-def isBinaryOrLargeFile(filePath) {
-    try {
-        // Check file size first (skip files larger than 10MB)
-        def file = new File(filePath)
-        if (file.length() > 10 * 1024 * 1024) {
-            return true
-        }
-        
-        // Check for common binary extensions
-        def binaryExtensions = [
-            '.exe', '.dll', '.so', '.dylib', '.bin', '.dat',
-            '.zip', '.tar', '.gz', '.7z', '.rar',
-            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg',
-            '.mp3', '.mp4', '.avi', '.mov', '.wav',
-            '.pdf', '.doc', '.docx', '.xls', '.xlsx',
-            '.pyc', '.pyo', '.pyd', '.class', '.jar', '.war',
-            '.db', '.sqlite', '.sqlite3'
-        ]
-        
-        def fileName = filePath.toLowerCase()
-        for (ext in binaryExtensions) {
-            if (fileName.endsWith(ext)) {
-                return true
-            }
-        }
-        
-        return false
-    } catch (Exception e) {
-        // If we can't check, assume it's okay to process
-        return false
     }
 }
