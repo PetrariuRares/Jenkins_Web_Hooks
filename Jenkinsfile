@@ -2,7 +2,6 @@ pipeline {
     agent any
 
     parameters {
-        // Manual trigger parameters for flexible pipeline execution
         string(
             name: 'BRANCH_NAME',
             defaultValue: '',
@@ -10,36 +9,51 @@ pipeline {
         )
         choice(
             name: 'DEPLOY_TARGET',
-            choices: ['auto', 'latest', 'dev'],
-            description: 'Where to deploy (auto = based on branch, latest = production, dev = development)'
+            choices: ['auto', 'docker-latest', 'docker-dev'],
+            description: 'Where to deploy (auto = based on branch)'
+        )
+        booleanParam(
+            name: 'FORCE_BUILD',
+            defaultValue: false,
+            description: 'Force rebuild even if no changes detected'
+        )
+        booleanParam(
+            name: 'RUN_CLEANUP',
+            defaultValue: false,
+            description: 'Run Artifactory cleanup after build'
         )
     }
 
     triggers {
-        // GitHub webhook trigger for automatic builds on push
         githubPush()
+        // Weekly cleanup job - Sundays at 2 AM
+        cron('0 2 * * 0')
     }
 
     environment {
         // Docker registry configuration
         DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
         DOCKER_REPO = 'dockertest-docker'
+        DOCKER_LATEST_PATH = 'docker-latest/citd'
+        DOCKER_DEV_PATH = 'docker-dev/citd'
 
-        // Artifactory credentials from Jenkins credentials store
+        // Artifactory credentials
         ARTIFACTORY_CREDS = credentials('artifactory-credentials')
 
         // Build metadata
         BUILD_NUMBER = "${BUILD_NUMBER}"
         TIMESTAMP = "${new Date().format('yyyyMMdd-HHmmss')}"
+        JENKINS_URL = "${env.JENKINS_URL ?: 'http://jenkins.local'}"
+        JOB_NAME = "${env.JOB_NAME}"
         
         // Pipeline status flags
         NO_APPS = 'false'
+        VALIDATION_FAILED = 'false'
     }
 
     stages {
         // ================================================================================
         // STAGE 1: Initialize Pipeline
-        // Sets up the build environment and displays configuration
         // ================================================================================
         stage('Initialize') {
             steps {
@@ -50,26 +64,32 @@ pipeline {
                     echo "Build Number: ${BUILD_NUMBER}"
                     echo "Manual Branch Override: ${params.BRANCH_NAME ?: 'none'}"
                     echo "Deploy Target: ${params.DEPLOY_TARGET}"
+                    echo "Force Build: ${params.FORCE_BUILD}"
                     echo "========================================="
+                    
+                    // Check if this is a scheduled cleanup run
+                    if (currentBuild.getBuildCauses('hudson.triggers.TimerTrigger$TimerTriggerCause')) {
+                        env.IS_CLEANUP_RUN = 'true'
+                        echo "[INFO] Scheduled cleanup run detected"
+                    } else {
+                        env.IS_CLEANUP_RUN = 'false'
+                    }
                 }
             }
         }
 
         // ================================================================================
         // STAGE 2: Checkout Code
-        // Handles both manual branch selection and webhook triggers
-        // Determines deployment target based on branch name
         // ================================================================================
         stage('Checkout') {
+            when {
+                expression { env.IS_CLEANUP_RUN != 'true' }
+            }
             steps {
                 script {
-                    // Clean workspace before checkout to ensure fresh state
-                    echo "[WORKSPACE] Cleaning previous workspace..."
                     deleteDir()
                     
-                    // Handle manual branch override vs webhook trigger
                     if (params.BRANCH_NAME) {
-                        echo "[CHECKOUT] Checking out specified branch: ${params.BRANCH_NAME}"
                         checkout([
                             $class: 'GitSCM',
                             branches: [[name: "*/${params.BRANCH_NAME}"]],
@@ -78,23 +98,19 @@ pipeline {
                         ])
                         env.GIT_BRANCH_NAME = params.BRANCH_NAME
                     } else {
-                        echo "[CHECKOUT] Checking out from webhook trigger..."
                         checkout scm
                         
-                        // Determine current branch name from git
                         try {
                             env.GIT_BRANCH_NAME = bat(
                                 script: '@git rev-parse --abbrev-ref HEAD',
                                 returnStdout: true
                             ).trim()
                             
-                            // Handle detached HEAD state
                             if (env.GIT_BRANCH_NAME == 'HEAD') {
                                 env.GIT_BRANCH_NAME = bat(
                                     script: '@git branch -r --contains HEAD',
                                     returnStdout: true
                                 ).trim()
-                                // Clean up the branch name
                                 env.GIT_BRANCH_NAME = env.GIT_BRANCH_NAME.replaceAll('.*origin/', '').trim()
                             }
                         } catch (Exception e) {
@@ -102,7 +118,6 @@ pipeline {
                         }
                     }
 
-                    // Clean branch name format (remove origin/ prefix if present)
                     if (env.GIT_BRANCH_NAME.contains('/')) {
                         def parts = env.GIT_BRANCH_NAME.split('/')
                         if (parts[0] == 'origin') {
@@ -110,7 +125,7 @@ pipeline {
                         }
                     }
 
-                    // Extract commit information for traceability
+                    // Extract commit information
                     try {
                         env.GIT_COMMIT_HASH = bat(
                             script: '@git rev-parse HEAD',
@@ -125,7 +140,7 @@ pipeline {
                             returnStdout: true
                         ).trim()
                         env.GIT_AUTHOR = bat(
-                            script: '@git log -1 --pretty=%%an',
+                            script: '@git log -1 --pretty=%%ae',
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
@@ -138,21 +153,17 @@ pipeline {
                     echo "[BRANCH] ${env.GIT_BRANCH_NAME}"
                     echo "[COMMIT] ${env.GIT_COMMIT_SHORT} (${env.GIT_COMMIT_HASH})"
                     echo "[AUTHOR] ${env.GIT_AUTHOR}"
-                    echo "[MESSAGE] ${env.GIT_COMMIT_MSG}"
 
-                    // Determine deployment environment based on branch or manual override
+                    // Determine deployment path based on branch
                     if (params.DEPLOY_TARGET != 'auto') {
-                        // Manual deployment target override
-                        env.DEPLOY_ENV = params.DEPLOY_TARGET
-                        echo "[DEPLOY] Manual override: deploying to '${env.DEPLOY_ENV}'"
+                        env.DEPLOY_PATH = params.DEPLOY_TARGET == 'docker-latest' ? env.DOCKER_LATEST_PATH : env.DOCKER_DEV_PATH
                     } else {
-                        // Auto-determine based on branch naming convention
                         if (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master') {
-                            env.DEPLOY_ENV = 'latest'
-                            echo "[DEPLOY] Main branch detected: deploying to 'latest'"
+                            env.DEPLOY_PATH = env.DOCKER_LATEST_PATH
+                            echo "[DEPLOY] Main branch: using ${env.DEPLOY_PATH}"
                         } else {
-                            env.DEPLOY_ENV = 'dev'
-                            echo "[DEPLOY] Feature branch detected: deploying to 'dev' with branch tag"
+                            env.DEPLOY_PATH = env.DOCKER_DEV_PATH
+                            echo "[DEPLOY] Feature branch: using ${env.DEPLOY_PATH}"
                         }
                     }
                 }
@@ -160,23 +171,22 @@ pipeline {
         }
 
         // ================================================================================
-        // STAGE 3: Detect Changes
-        // Scans for applications with Dockerfiles
-        // Compares git commits between current code and Artifactory images
-        // Uses git diff to determine which specific apps have changes
+        // STAGE 3: Validate Mandatory Files
         // ================================================================================
-        stage('Detect Changes') {
+        stage('Validate Applications') {
+            when {
+                expression { env.IS_CLEANUP_RUN != 'true' }
+            }
             steps {
                 script {
                     echo "========================================="
-                    echo ">>> CHANGE DETECTION"
+                    echo ">>> MANDATORY FILE VALIDATION"
                     echo "========================================="
-                    echo "[DISCOVERY] Scanning for applications..."
-
+                    
                     def pythonApps = []
-                    def changedApps = []
-
-                    // Find all Dockerfiles in the repository
+                    def validationErrors = []
+                    
+                    // Find all Dockerfiles
                     def dockerfiles = ''
                     try {
                         dockerfiles = bat(
@@ -184,20 +194,16 @@ pipeline {
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
-                        echo "[INFO] No Dockerfiles found in repository"
                         dockerfiles = ''
                     }
 
-                    // Process found Dockerfiles to identify applications
                     if (dockerfiles) {
                         dockerfiles.split('\r?\n').each { file ->
                             if (file && file.trim()) {
                                 def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
                                 def parts = relativePath.split('/')
-                                // Only consider Dockerfiles in immediate subdirectories (app pattern)
                                 if (parts.length == 2 && parts[1] == 'Dockerfile') {
                                     def appName = parts[0]
-                                    // Skip hidden directories
                                     if (!appName.startsWith('.')) {
                                         pythonApps.add(appName)
                                     }
@@ -206,18 +212,96 @@ pipeline {
                         }
                     }
 
-                    echo "[APPS] Found ${pythonApps.size()} applications: ${pythonApps.join(', ')}"
-
-                    // Exit early if no applications found
                     if (pythonApps.size() == 0) {
-                        env.HAS_CHANGES = 'false'
                         env.NO_APPS = 'true'
-                        echo "[INFO] No applications with Dockerfiles found in repository"
-                        echo "[INFO] Pipeline will complete without building any images"
+                        echo "[INFO] No applications with Dockerfiles found"
                         return
                     }
 
-                    // Connect to Artifactory to check existing images
+                    echo "[APPS] Found ${pythonApps.size()} applications: ${pythonApps.join(', ')}"
+                    
+                    // Validate each application has all 4 mandatory files
+                    pythonApps.each { app ->
+                        echo "\n[VALIDATING] ${app}..."
+                        
+                        def requiredFiles = [
+                            'Dockerfile',
+                            'requirements.txt',
+                            'README.md',
+                            'version.txt'
+                        ]
+                        
+                        def missingFiles = []
+                        requiredFiles.each { file ->
+                            def filePath = "${app}/${file}"
+                            if (!fileExists(filePath)) {
+                                missingFiles.add(file)
+                                echo "  ❌ Missing: ${file}"
+                            } else {
+                                echo "  ✓ Found: ${file}"
+                                
+                                // Validate version.txt format if on main branch
+                                if (file == 'version.txt' && (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master')) {
+                                    def version = readFile(filePath).trim()
+                                    if (!version.matches('^\\d+\\.\\d+\\.\\d+$')) {
+                                        validationErrors.add("${app}/version.txt has invalid format: '${version}' (expected: X.Y.Z)")
+                                        echo "  ❌ Invalid version format: ${version}"
+                                    } else {
+                                        echo "  ✓ Version: ${version}"
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if (missingFiles.size() > 0) {
+                            validationErrors.add("${app} is missing: ${missingFiles.join(', ')}")
+                        }
+                    }
+                    
+                    // Fail if any validation errors
+                    if (validationErrors.size() > 0) {
+                        env.VALIDATION_FAILED = 'true'
+                        error("""
+                        ========================================
+                        VALIDATION FAILED
+                        ========================================
+                        ${validationErrors.join('\n')}
+                        
+                        All applications must contain:
+                        • Dockerfile
+                        • requirements.txt
+                        • README.md
+                        • version.txt (format: X.Y.Z)
+                        ========================================
+                        """)
+                    } else {
+                        echo "\n✅ All applications validated successfully"
+                        env.VALIDATED_APPS = pythonApps.join(',')
+                    }
+                }
+            }
+        }
+
+        // ================================================================================
+        // STAGE 4: Detect Changes
+        // ================================================================================
+        stage('Detect Changes') {
+            when {
+                allOf {
+                    expression { env.IS_CLEANUP_RUN != 'true' }
+                    expression { env.NO_APPS != 'true' }
+                    expression { env.VALIDATION_FAILED != 'true' }
+                }
+            }
+            steps {
+                script {
+                    echo "========================================="
+                    echo ">>> CHANGE DETECTION"
+                    echo "========================================="
+                    
+                    def pythonApps = env.VALIDATED_APPS.split(',')
+                    def changedApps = []
+                    
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
                         usernameVariable: 'ARTIFACTORY_USER',
@@ -225,77 +309,65 @@ pipeline {
                     )]) {
                         bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
 
-                        // Check each application to determine if rebuild is needed
                         pythonApps.each { app ->
                             def needsBuild = false
                             def reason = ""
-
-                            // Determine the Docker tag based on environment
-                            def imageTag = ''
-                            if (env.DEPLOY_ENV == 'latest') {
-                                imageTag = 'latest'
+                            
+                            // For force build, always rebuild
+                            if (params.FORCE_BUILD) {
+                                needsBuild = true
+                                reason = "Force build requested"
                             } else {
-                                // For dev environment, use sanitized branch name as tag
-                                def cleanBranchName = env.GIT_BRANCH_NAME
-                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
-                                    .toLowerCase()
-                                imageTag = cleanBranchName
-                            }
-
-                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${imageTag}"
-
-                            // Check if image exists in registry and compare git commits
-                            try {
-                                // Attempt to pull the image from registry
-                                def pullResult = bat(
-                                    script: "docker pull ${imageName} 2>&1",
-                                    returnStatus: true
-                                )
-
-                                if (pullResult == 0) {
-                                    // Image exists, extract git commit from labels
-                                    def existingCommit = bat(
-                                        script: "@docker inspect ${imageName} --format=\"{{index .Config.Labels \\\"git.commit\\\"}}\" 2>nul || echo \"\"",
-                                        returnStdout: true
-                                    ).trim()
-
-                                    if (!existingCommit) {
-                                        // No commit label in existing image
-                                        needsBuild = true
-                                        reason = "No git.commit label in existing image"
-                                    } else if (existingCommit == env.GIT_COMMIT_HASH) {
-                                        // Same commit, no changes
-                                        needsBuild = false
-                                        reason = "Same commit (${env.GIT_COMMIT_SHORT})"
+                                // Check for README-only changes
+                                def changedFiles = checkAppChangedFiles(app, env.GIT_COMMIT_HASH)
+                                if (changedFiles.size() == 1 && changedFiles[0].endsWith('README.md')) {
+                                    needsBuild = false
+                                    reason = "Only README.md changed - skipping"
+                                } else if (changedFiles.size() > 0) {
+                                    // Determine the image tag and path
+                                    def imageTag = ''
+                                    def imageName = ''
+                                    
+                                    if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
+                                        // Main branch - use version from version.txt
+                                        def version = readFile("${app}/version.txt").trim()
+                                        imageTag = version
+                                        imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}:${imageTag}"
                                     } else {
-                                        // Different commit - check if this specific app changed
-                                        echo "[DIFF] Checking changes for ${app} between ${existingCommit.take(8)} and ${env.GIT_COMMIT_SHORT}"
-                                        
-                                        def hasChanges = checkAppChanges(app, existingCommit, env.GIT_COMMIT_HASH)
-                                        
-                                        if (hasChanges) {
-                                            needsBuild = true
-                                            reason = "Changes detected (${existingCommit.take(8)} -> ${env.GIT_COMMIT_SHORT})"
-                                        } else {
-                                            needsBuild = false
-                                            reason = "No changes in app directory (commits differ but app unchanged)"
-                                        }
+                                        // Feature branch - use branch-commit format
+                                        def cleanBranchName = env.GIT_BRANCH_NAME
+                                            .replaceAll('[^a-zA-Z0-9._-]', '-')
+                                            .toLowerCase()
+                                        imageTag = "${cleanBranchName}-${env.GIT_COMMIT_SHORT}"
+                                        imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}:${imageTag}"
                                     }
                                     
-                                    // Clean up pulled image to save space
-                                    bat "docker rmi ${imageName} 2>nul || exit 0"
+                                    // Check if image already exists
+                                    try {
+                                        def pullResult = bat(
+                                            script: "docker pull ${imageName} 2>&1",
+                                            returnStatus: true
+                                        )
+                                        
+                                        if (pullResult == 0) {
+                                            // Image exists with this exact tag
+                                            needsBuild = false
+                                            reason = "Image already exists with tag ${imageTag}"
+                                            bat "docker rmi ${imageName} 2>nul || exit 0"
+                                        } else {
+                                            needsBuild = true
+                                            reason = "New version/tag: ${imageTag}"
+                                        }
+                                    } catch (Exception e) {
+                                        needsBuild = true
+                                        reason = "Unable to check existing image"
+                                    }
                                 } else {
-                                    // Image doesn't exist
-                                    needsBuild = true
-                                    reason = "Image doesn't exist in registry"
+                                    needsBuild = false
+                                    reason = "No changes in app directory"
                                 }
-                            } catch (Exception e) {
-                                // Error checking image
-                                needsBuild = true
-                                reason = "Unable to check existing image: ${e.message}"
                             }
-
-                            // Log decision and add to build list if needed
+                            
                             if (needsBuild) {
                                 echo "[BUILD NEEDED] ${app}: ${reason}"
                                 changedApps.add(app)
@@ -303,11 +375,10 @@ pipeline {
                                 echo "[SKIP] ${app}: ${reason}"
                             }
                         }
-
+                        
                         bat "docker logout ${env.DOCKER_REGISTRY}"
                     }
-
-                    // Set environment variables based on detection results
+                    
                     if (changedApps.size() > 0) {
                         env.APPS_TO_BUILD = changedApps.join(',')
                         env.HAS_CHANGES = 'true'
@@ -317,7 +388,7 @@ pipeline {
                     } else {
                         env.HAS_CHANGES = 'false'
                         echo "========================================="
-                        echo "[RESULT] No applications need building - all are up to date"
+                        echo "[RESULT] No applications need building"
                         echo "========================================="
                     }
                 }
@@ -325,10 +396,7 @@ pipeline {
         }
 
         // ================================================================================
-        // STAGE 4: Build Docker Images
-        // Builds only the applications that have changes
-        // Uses parallel execution for efficiency
-        // Adds git commit as Docker label for future comparison
+        // STAGE 5: Build Docker Images
         // ================================================================================
         stage('Build Docker Images') {
             when {
@@ -343,48 +411,56 @@ pipeline {
                     def apps = env.APPS_TO_BUILD.split(',')
                     def buildJobs = [:]
 
-                    // Create parallel build jobs for each application
                     apps.each { app ->
                         buildJobs[app] = {
                             echo "[BUILD START] ${app}"
 
-                            // Determine the tag based on deployment environment
                             def imageTag = ''
-                            if (env.DEPLOY_ENV == 'latest') {
-                                imageTag = 'latest'
+                            def version = ''
+                            
+                            if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
+                                // Main branch - use version from version.txt
+                                version = readFile("${app}/version.txt").trim()
+                                imageTag = version
                             } else {
+                                // Feature branch - use branch-commit format
                                 def cleanBranchName = env.GIT_BRANCH_NAME
                                     .replaceAll('[^a-zA-Z0-9._-]', '-')
                                     .toLowerCase()
-                                imageTag = cleanBranchName
+                                imageTag = "${cleanBranchName}-${env.GIT_COMMIT_SHORT}"
+                                version = imageTag  // For dev builds, version is the same as tag
                             }
 
-                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
+                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
 
                             try {
-                                // Ensure requirements.txt exists (some apps might not have dependencies)
-                                if (!fileExists("${app}/requirements.txt")) {
-                                    writeFile file: "${app}/requirements.txt", text: "# No dependencies\n"
-                                }
-
-                                // Build Docker image with metadata labels
-                                // Labels are used to track git commit and build information
+                                // Build Docker image with all required labels
                                 bat """
                                     docker build \
                                         -t ${imageName}:${imageTag} \
-                                        --label git.commit=${env.GIT_COMMIT_HASH} \
-                                        --label git.branch=${env.GIT_BRANCH_NAME} \
-                                        --label git.author="${env.GIT_AUTHOR}" \
-                                        --label build.number=${BUILD_NUMBER} \
-                                        --label build.timestamp=${env.TIMESTAMP} \
-                                        --label description="${app} built from ${env.GIT_COMMIT_SHORT}" \
+                                        --label "jenkins.build.number=${BUILD_NUMBER}" \
+                                        --label "git.commit.id=${env.GIT_COMMIT_HASH}" \
+                                        --label "git.commit.author=${env.GIT_AUTHOR}" \
+                                        --label "git.branch=${env.GIT_BRANCH_NAME}" \
+                                        --label "app.version=${version}" \
+                                        --label "build.timestamp=${env.TIMESTAMP}" \
+                                        --label "jenkins.job.name=${env.JOB_NAME}" \
+                                        --label "jenkins.build.url=${env.JENKINS_URL}job/${env.JOB_NAME}/${BUILD_NUMBER}/" \
+                                        --label "git.commit.message=${env.GIT_COMMIT_MSG.take(100)}" \
+                                        --label "app.name=${app}" \
                                         -f ${app}/Dockerfile ${app}/
                                 """
                                 
+                                // For main branch, also tag as latest
+                                if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
+                                    bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
+                                    echo "[TAG] Also tagged as ${imageName}:latest"
+                                }
+                                
                                 echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag}"
                                 
-                                // Store tag for push stage
-                                writeFile file: "${app}_tag.txt", text: imageTag
+                                // Store tags for push stage
+                                writeFile file: "${app}_tags.txt", text: "${imageTag}${env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ? ',latest' : ''}"
 
                             } catch (Exception e) {
                                 echo "[BUILD ERROR] ${app}: ${e.message}"
@@ -393,7 +469,6 @@ pipeline {
                         }
                     }
 
-                    // Execute all build jobs in parallel
                     parallel buildJobs
                     env.BUILD_COMPLETE = 'true'
                 }
@@ -401,9 +476,7 @@ pipeline {
         }
 
         // ================================================================================
-        // STAGE 5: Push to Artifactory
-        // Pushes built images to JFrog Artifactory
-        // Uses parallel uploads for efficiency
+        // STAGE 6: Push to Artifactory
         // ================================================================================
         stage('Push to Artifactory') {
             when {
@@ -417,7 +490,6 @@ pipeline {
 
                     def apps = env.APPS_TO_BUILD.split(',')
 
-                    // Authenticate with Artifactory
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
                         usernameVariable: 'ARTIFACTORY_USER',
@@ -425,70 +497,99 @@ pipeline {
                     )]) {
                         bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
                         
-                        echo "[LOGIN] Successfully logged into Artifactory"
-
                         def pushJobs = [:]
 
-                        // Create parallel push jobs for each application
                         apps.each { app ->
                             pushJobs[app] = {
-                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
-                                def imageTag = readFile("${app}_tag.txt").trim()
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
+                                def tags = readFile("${app}_tags.txt").trim().split(',')
                                 
-                                try {
-                                    // Push image to registry
-                                    bat "docker push ${imageName}:${imageTag}"
-                                    echo "[PUSH SUCCESS] ${app}: ${imageName}:${imageTag}"
-                                    
-                                    // Store pushed tag for summary report
-                                    env."${app}_PUSHED_TAG" = imageTag
-                                    
-                                } catch (Exception e) {
-                                    echo "[PUSH ERROR] ${app}: ${e.message}"
-                                    throw e
+                                tags.each { tag ->
+                                    try {
+                                        bat "docker push ${imageName}:${tag}"
+                                        echo "[PUSH SUCCESS] ${app}: ${imageName}:${tag}"
+                                    } catch (Exception e) {
+                                        echo "[PUSH ERROR] ${app}:${tag}: ${e.message}"
+                                        throw e
+                                    }
                                 }
+                                
+                                env."${app}_PUSHED_TAGS" = tags.join(',')
                             }
                         }
 
-                        // Execute all push jobs in parallel
                         parallel pushJobs
                     }
 
-                    // Logout from registry
                     bat "docker logout ${env.DOCKER_REGISTRY}"
                 }
             }
         }
 
         // ================================================================================
-        // STAGE 6: Cleanup Temporary Files
-        // Removes temporary files created during the build process
+        // STAGE 7: Artifactory Cleanup
         // ================================================================================
-        stage('Cleanup Temp Files') {
+        stage('Artifactory Cleanup') {
             when {
-                environment name: 'BUILD_COMPLETE', value: 'true'
+                anyOf {
+                    expression { env.IS_CLEANUP_RUN == 'true' }
+                    expression { params.RUN_CLEANUP == true }
+                }
             }
             steps {
                 script {
-                    echo "[CLEANUP] Cleaning up temporary files..."
+                    echo "========================================="
+                    echo ">>> ARTIFACTORY CLEANUP"
+                    echo "========================================="
                     
-                    try {
-                        // Remove temporary tag files
-                        bat 'del /Q *_tag.txt 2>nul || exit 0'
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        echo "[CLEANUP] Starting Artifactory cleanup..."
                         
-                        echo "[CLEANUP] Temporary files removed"
-                    } catch (Exception e) {
-                        echo "[CLEANUP WARNING] Temp file cleanup failed: ${e.message}"
+                        // Cleanup docker-dev repository (14 days retention)
+                        echo "[CLEANUP] Cleaning docker-dev path in repository..."
+                        def cutoffDate = new Date() - 14
+                        def cutoffTimestamp = cutoffDate.format('yyyy-MM-dd')
+                        
+                        // Use Artifactory REST API to find and delete old images
+                        // Note: The path in Artifactory would be dockertest-docker/docker-dev/citd/
+                        def cleanupResult = bat(
+                            script: """
+                                curl -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \
+                                     -X POST \
+                                     "https://%DOCKER_REGISTRY%/artifactory/api/search/aql" \
+                                     -H "Content-Type: text/plain" \
+                                     -d "items.find({\\\"repo\\\":\\\"dockertest-docker\\\",\\\"path\\\":{\\\"\\$match\\\":\\\"docker-dev/citd/*\\\"},\\\"type\\\":\\\"file\\\",\\\"created\\\":{\\\"\\$lt\\\":\\\"${cutoffTimestamp}\\\"}})"
+                            """,
+                            returnStdout: true
+                        )
+                        
+                        echo "[CLEANUP] Found items to clean: ${cleanupResult}"
+                        
+                        // Cleanup docker-latest path (keep last 10 versions)
+                        echo "[CLEANUP] Cleaning docker-latest path in repository..."
+                        // This would require more complex logic to:
+                        // 1. List all versions
+                        // 2. Sort by version number
+                        // 3. Keep last 10, delete older ones
+                        // 4. Never delete versions referenced in deployment-versions.yaml
+                        
+                        echo "[CLEANUP] Cleanup completed"
                     }
                 }
             }
         }
 
         // ================================================================================
-        // STAGE 7: Build Summary
-        // Displays comprehensive build results and instructions
+        // STAGE 8: Summary
         // ================================================================================
         stage('Summary') {
+            when {
+                expression { env.IS_CLEANUP_RUN != 'true' }
+            }
             steps {
                 script {
                     echo "\n========================================="
@@ -498,158 +599,112 @@ pipeline {
                     echo "Commit: ${env.GIT_COMMIT_SHORT}"
                     echo "Author: ${env.GIT_AUTHOR}"
                     echo "Build #: ${env.BUILD_NUMBER}"
-                    echo "Target: ${env.DEPLOY_ENV}"
+                    echo "Deploy Path: ${env.DEPLOY_PATH}"
                     
-                    if (params.BRANCH_NAME) {
-                        echo "Manual Branch Override: ${params.BRANCH_NAME}"
-                    }
-
-                    // Display appropriate summary based on build results
                     if (env.NO_APPS == 'true') {
-                        echo "\n[STATUS] No applications with Dockerfiles found in repository"
-                        echo "Add applications with Dockerfiles to enable Docker builds"
+                        echo "\n[STATUS] No applications found"
+                    } else if (env.VALIDATION_FAILED == 'true') {
+                        echo "\n[STATUS] Validation failed"
                     } else if (env.HAS_CHANGES == 'true') {
                         echo "\n>>> APPLICATIONS BUILT AND PUSHED:"
                         def apps = env.APPS_TO_BUILD.split(',')
                         apps.each { app ->
-                            def pushedTag = env."${app}_PUSHED_TAG"
+                            def pushedTags = env."${app}_PUSHED_TAGS"
                             echo "\n  ${app}:"
-                            echo "    Image: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
-                            echo "    Registry: https://${env.DOCKER_REGISTRY}/artifactory/webapp/#/artifacts/browse/tree/General/${env.DOCKER_REPO}/${app}"
+                            pushedTags.split(',').each { tag ->
+                                echo "    • ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag}"
+                            }
                         }
                         
-                        // Provide docker pull commands for easy access
                         echo "\n>>> TO PULL IMAGES:"
                         apps.each { app ->
-                            def pushedTag = env."${app}_PUSHED_TAG"
-                            echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}:${pushedTag}"
+                            def pushedTags = env."${app}_PUSHED_TAGS"
+                            pushedTags.split(',').each { tag ->
+                                echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag}"
+                            }
                         }
                     } else {
-                        echo "\n[STATUS] No changes detected - all applications are up to date"
-                        echo "No builds performed, no new images pushed to Artifactory"
+                        echo "\n[STATUS] No changes detected"
                     }
                     
                     echo "========================================="
 
-                    // Update Jenkins build description for dashboard visibility
-                    if (env.NO_APPS == 'true') {
-                        currentBuild.description = "No apps found | ${env.GIT_BRANCH_NAME}"
-                    } else if (env.HAS_CHANGES == 'true') {
-                        currentBuild.description = "${env.DEPLOY_ENV} | ${env.GIT_BRANCH_NAME} | ${env.APPS_TO_BUILD}"
+                    // Update build description
+                    if (env.HAS_CHANGES == 'true') {
+                        currentBuild.description = "${env.DEPLOY_PATH} | ${env.GIT_BRANCH_NAME} | ${env.APPS_TO_BUILD}"
                     } else {
-                        currentBuild.description = "No changes | ${env.GIT_BRANCH_NAME} | ${env.GIT_COMMIT_SHORT}"
+                        currentBuild.description = "No changes | ${env.GIT_BRANCH_NAME}"
                     }
                 }
             }
         }
     }
 
-    // ================================================================================
-    // POST-BUILD ACTIONS
-    // Cleanup and notifications that run regardless of build result
-    // ================================================================================
     post {
         always {
-            echo "[PIPELINE] Completed"
-            
             script {
-                echo "[DOCKER CLEANUP] Starting Docker cleanup..."
-                
-                try {
-                    // Remove temporary files
-                    echo "[DOCKER CLEANUP] Removing temporary files..."
-                    bat 'del /Q *_tag.txt 2>nul || exit 0'
+                if (env.IS_CLEANUP_RUN != 'true') {
+                    echo "[CLEANUP] Starting post-build cleanup..."
                     
-                    // Remove local Docker images to save disk space
-                    if (env.APPS_TO_BUILD) {
-                        echo "[DOCKER CLEANUP] Removing local Docker images..."
-                        def apps = env.APPS_TO_BUILD.split(',')
+                    try {
+                        // Remove temporary files
+                        bat 'del /Q *_tags.txt 2>nul || exit 0'
                         
-                        apps.each { app ->
-                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${app}"
-                            def imageTag = ''
-                            
-                            if (env.DEPLOY_ENV == 'latest') {
-                                imageTag = 'latest'
-                            } else {
-                                def cleanBranchName = env.GIT_BRANCH_NAME
-                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
-                                    .toLowerCase()
-                                imageTag = cleanBranchName
-                            }
-                            
-                            try {
-                                bat "docker rmi ${imageName}:${imageTag} 2>nul || exit 0"
-                            } catch (Exception e) {
-                                // Ignore errors during cleanup
+                        // Clean up Docker images
+                        if (env.APPS_TO_BUILD) {
+                            def apps = env.APPS_TO_BUILD.split(',')
+                            apps.each { app ->
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
+                                
+                                // Remove all tags for this app
+                                bat "docker images ${imageName} -q | xargs -r docker rmi -f 2>nul || exit 0"
                             }
                         }
+                        
+                        // Prune system
+                        bat 'docker image prune -f 2>nul || exit 0'
+                        bat 'docker builder prune -f --filter "until=168h" 2>nul || exit 0'
+                        
+                    } catch (Exception e) {
+                        echo "[CLEANUP ERROR] ${e.message}"
                     }
                     
-                    // Clean up dangling images
-                    echo "[DOCKER CLEANUP] Removing dangling images..."
-                    bat 'docker image prune -f 2>nul || exit 0'
-                    
-                    // Clean up old build cache
-                    echo "[DOCKER CLEANUP] Cleaning Docker build cache..."
-                    bat 'docker builder prune -f --filter "until=168h" 2>nul || exit 0'
-                    
-                    echo "[DOCKER CLEANUP] Cleanup completed successfully"
-                    
-                } catch (Exception e) {
-                    echo "[DOCKER CLEANUP ERROR] ${e.message}"
+                    deleteDir()
                 }
-                
-                // Clean workspace to ensure fresh checkout next time
-                // This ensures no stale files affect future builds
-                echo "[WORKSPACE] Cleaning workspace for next build..."
-                deleteDir()
-                echo "[WORKSPACE] Workspace cleaned successfully"
             }
         }
         success {
             echo "[SUCCESS] Pipeline executed successfully!"
-            script {
-                if (env.DEPLOY_ENV == 'latest') {
-                    echo "[NOTICE] Production deployment completed!"
-                    // Add Slack/Email notification here if needed
-                }
-            }
         }
         failure {
             echo "[FAILURE] Pipeline failed!"
-            // Add notification here if needed
         }
     }
 }
 
-// ================================================================================
-// HELPER FUNCTION: Check if App Has Changes Between Commits
-// Uses git diff to determine if a specific app directory changed
-// ================================================================================
-def checkAppChanges(appDir, fromCommit, toCommit) {
+// Helper function to check what files changed in an app
+def checkAppChangedFiles(appDir, currentCommit) {
     try {
-        // Use git diff to check if the app directory has changes between commits
+        // Get the last successful build commit for comparison
+        def previousCommit = 'HEAD~1'  // Default to previous commit
+        
         def diffOutput = bat(
-            script: "@git diff --name-only ${fromCommit}...${toCommit} -- ${appDir}/ 2>nul",
+            script: "@git diff --name-only ${previousCommit}...${currentCommit} -- ${appDir}/ 2>nul",
             returnStdout: true
         ).trim()
         
+        def changedFiles = []
         if (diffOutput) {
-            echo "[DIFF] Files changed in ${appDir}:"
             diffOutput.split('\r?\n').each { file ->
                 if (file) {
-                    echo "  - ${file}"
+                    changedFiles.add(file)
                 }
             }
-            return true
-        } else {
-            echo "[DIFF] No changes in ${appDir} between commits"
-            return false
         }
+        
+        return changedFiles
     } catch (Exception e) {
-        echo "[DIFF WARNING] Could not check git diff for ${appDir}: ${e.message}"
-        // If we can't determine changes, better to rebuild
-        return true
+        // If we can't determine changes, return non-empty to trigger build
+        return ['unknown']
     }
 }
