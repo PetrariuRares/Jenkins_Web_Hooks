@@ -34,8 +34,8 @@ pipeline {
         // Docker registry configuration - Marvel themed variables
         STARK_REGISTRY = 'trialqlk1tc.jfrog.io'              // Tony Stark's registry
         SHIELD_REPO = 'dockertest-docker'                    // SHIELD's repository
-        AVENGERS_PATH = 'docker-latest'                      // Production path (Avengers-ready)
-        XMEN_PATH = 'docker-dev'                             // Development path (X-Men training)
+        AVENGERS_PATH = 'docker-latest'                 // Production path (Avengers-ready)
+        XMEN_PATH = 'docker-dev'                        // Development path (X-Men training)
         JARVIS_MANIFEST_PATH = 'metadata/build-manifests'    // Production manifests
         FRIDAY_MANIFEST_PATH = 'metadata/temporary-builds'   // Dev manifests
 
@@ -490,29 +490,29 @@ pipeline {
             steps {
                 script {
                     echo "========================================="
-                    echo ">>> ARTIFACTORY PUSH"
+                    echo ">>> ARTIFACTORY PUSH (SHIELD DEPLOYMENT)"
                     echo "========================================="
 
-                    def apps = env.APPS_TO_BUILD.split(',')
+                    def apps = env.HULK_APPS.split(',')
 
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
-                        usernameVariable: 'ARTIFACTORY_USER',
-                        passwordVariable: 'ARTIFACTORY_PASS'
+                        usernameVariable: 'CAPTAIN_USER',
+                        passwordVariable: 'CAPTAIN_PASS'
                     )]) {
-                        bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
+                        bat 'echo %CAPTAIN_PASS% | docker login %STARK_REGISTRY% -u %CAPTAIN_USER% --password-stdin'
                         
                         def pushJobs = [:]
 
                         apps.each { app ->
                             pushJobs[app] = {
-                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
+                                def imageName = "${env.STARK_REGISTRY}/${env.SHIELD_REPO}/${env.THOR_PATH}/${app}"
                                 def tags = readFile("${app}_tags.txt").trim().split(',')
                                 
                                 tags.each { tag ->
                                     try {
                                         bat "docker push ${imageName}:${tag}"
-                                        echo "[PUSH SUCCESS] ${app}: ${imageName}:${tag}"
+                                        echo "[PUSH SUCCESS] ${app}: ${imageName}:${tag} - Deployed to SHIELD!"
                                     } catch (Exception e) {
                                         echo "[PUSH ERROR] ${app}:${tag}: ${e.message}"
                                         throw e
@@ -526,13 +526,13 @@ pipeline {
                         parallel pushJobs
                     }
 
-                    bat "docker logout ${env.DOCKER_REGISTRY}"
+                    bat "docker logout ${env.STARK_REGISTRY}"
                 }
             }
         }
 
         // ================================================================================
-        // STAGE 7: Artifactory Cleanup
+        // STAGE 7: Artifactory Cleanup (Thanos Snap)
         // ================================================================================
         stage('Artifactory Cleanup') {
             when {
@@ -544,45 +544,44 @@ pipeline {
             steps {
                 script {
                     echo "========================================="
-                    echo ">>> ARTIFACTORY CLEANUP"
+                    echo ">>> ARTIFACTORY CLEANUP (THANOS SNAP)"
                     echo "========================================="
                     
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
-                        usernameVariable: 'ARTIFACTORY_USER',
-                        passwordVariable: 'ARTIFACTORY_PASS'
+                        usernameVariable: 'THANOS_USER',
+                        passwordVariable: 'THANOS_PASS'
                     )]) {
-                        echo "[CLEANUP] Starting Artifactory cleanup..."
+                        echo "[CLEANUP] Thanos initiating cleanup..."
                         
                         // Cleanup docker-dev repository (14 days retention)
-                        echo "[CLEANUP] Cleaning docker-dev path in repository..."
+                        echo "[CLEANUP] Snapping old X-Men training images..."
                         def cutoffDate = new Date() - 14
                         def cutoffTimestamp = cutoffDate.format('yyyy-MM-dd')
                         
                         // Use Artifactory REST API to find and delete old images
-                        // Note: The path in Artifactory would be dockertest-docker/docker-dev/citd/
                         def cleanupResult = bat(
                             script: """
-                                curl -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \
+                                curl -u %THANOS_USER%:%THANOS_PASS% \
                                      -X POST \
-                                     "https://%DOCKER_REGISTRY%/artifactory/api/search/aql" \
+                                     "https://%STARK_REGISTRY%/artifactory/api/search/aql" \
                                      -H "Content-Type: text/plain" \
-                                     -d "items.find({\\\"repo\\\":\\\"dockertest-docker\\\",\\\"path\\\":{\\\"\\$match\\\":\\\"docker-dev/citd/*\\\"},\\\"type\\\":\\\"file\\\",\\\"created\\\":{\\\"\\$lt\\\":\\\"${cutoffTimestamp}\\\"}})"
+                                     -d "items.find({\\\"repo\\\":\\\"%SHIELD_REPO%\\\",\\\"path\\\":{\\\"\\$match\\\":\\\"${env.XMEN_PATH}/*\\\"},\\\"type\\\":\\\"file\\\",\\\"created\\\":{\\\"\\$lt\\\":\\\"${cutoffTimestamp}\\\"}})"
                             """,
                             returnStdout: true
                         )
                         
-                        echo "[CLEANUP] Found items to clean: ${cleanupResult}"
+                        echo "[CLEANUP] Found items to snap: ${cleanupResult}"
                         
                         // Cleanup docker-latest path (keep last 10 versions)
-                        echo "[CLEANUP] Cleaning docker-latest path in repository..."
+                        echo "[CLEANUP] Preserving Avengers-approved images..."
                         // This would require more complex logic to:
                         // 1. List all versions
                         // 2. Sort by version number
                         // 3. Keep last 10, delete older ones
                         // 4. Never delete versions referenced in deployment-versions.yaml
                         
-                        echo "[CLEANUP] Cleanup completed"
+                        echo "[CLEANUP] Thanos snap completed - perfectly balanced"
                     }
                 }
             }
@@ -656,14 +655,20 @@ pipeline {
                         // Remove temporary files
                         bat 'del /Q *_tags.txt 2>nul || exit 0'
                         
-                        // Clean up Docker images
+                        // Clean up Docker images - Windows compatible version
                         if (env.HULK_APPS) {
                             def apps = env.HULK_APPS.split(',')
                             apps.each { app ->
                                 def imageName = "${env.STARK_REGISTRY}/${env.SHIELD_REPO}/${env.THOR_PATH}/${app}"
                                 
-                                // Remove all tags for this app
-                                bat "docker images ${imageName} -q | xargs -r docker rmi -f 2>nul || exit 0"
+                                // Remove all tags for this app - Windows compatible
+                                bat """
+                                    @echo off
+                                    for /f "tokens=*" %%i in ('docker images ${imageName} -q 2^>nul') do (
+                                        docker rmi -f %%i 2>nul
+                                    )
+                                    exit /b 0
+                                """
                             }
                         }
                         
@@ -680,10 +685,10 @@ pipeline {
             }
         }
         success {
-            echo "[SUCCESS] Pipeline executed successfully!"
+            echo "[SUCCESS] Mission accomplished - Avengers assemble!"
         }
         failure {
-            echo "[FAILURE] Pipeline failed!"
+            echo "[FAILURE] Mission failed - We need backup!"
         }
     }
 }
