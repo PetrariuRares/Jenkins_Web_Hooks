@@ -31,16 +31,14 @@ pipeline {
     }
 
     environment {
-        // Docker registry configuration - Marvel themed variables
-        STARK_REGISTRY = 'trialqlk1tc.jfrog.io'              // Tony Stark's registry
-        SHIELD_REPO = 'dockertest-docker'                    // SHIELD's repository
-        AVENGERS_PATH = 'docker-latest'                 // Production path (Avengers-ready)
-        XMEN_PATH = 'docker-dev'                        // Development path (X-Men training)
-        JARVIS_MANIFEST_PATH = 'metadata/build-manifests'    // Production manifests
-        FRIDAY_MANIFEST_PATH = 'metadata/temporary-builds'   // Dev manifests
+        // Docker registry configuration
+        DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
+        DOCKER_REPO = 'dockertest-docker'
+        DOCKER_LATEST_PATH = 'docker-latest'
+        DOCKER_DEV_PATH = 'docker-dev'
 
         // Artifactory credentials
-        FURY_CREDENTIALS = credentials('artifactory-credentials')  // Nick Fury's access
+        ARTIFACTORY_CREDS = credentials('artifactory-credentials')
 
         // Build metadata
         BUILD_NUMBER = "${BUILD_NUMBER}"
@@ -158,16 +156,14 @@ pipeline {
 
                     // Determine deployment path based on branch
                     if (params.DEPLOY_TARGET != 'auto') {
-                        env.THOR_PATH = params.DEPLOY_TARGET == 'docker-latest' ? env.AVENGERS_PATH : env.XMEN_PATH
+                        env.DEPLOY_PATH = params.DEPLOY_TARGET == 'docker-latest' ? env.DOCKER_LATEST_PATH : env.DOCKER_DEV_PATH
                     } else {
                         if (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master') {
-                            env.THOR_PATH = env.AVENGERS_PATH
-                            env.MANIFEST_PATH = env.JARVIS_MANIFEST_PATH
-                            echo "[DEPLOY] Main branch: using ${env.THOR_PATH} (Production)"
+                            env.DEPLOY_PATH = env.DOCKER_LATEST_PATH
+                            echo "[DEPLOY] Main branch: using ${env.DEPLOY_PATH}"
                         } else {
-                            env.THOR_PATH = env.XMEN_PATH
-                            env.MANIFEST_PATH = env.FRIDAY_MANIFEST_PATH
-                            echo "[DEPLOY] Feature branch: using ${env.THOR_PATH} (Development)"
+                            env.DEPLOY_PATH = env.DOCKER_DEV_PATH
+                            echo "[DEPLOY] Feature branch: using ${env.DEPLOY_PATH}"
                         }
                     }
                 }
@@ -308,10 +304,10 @@ pipeline {
                     
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
-                        usernameVariable: 'SPIDER_USER',
-                        passwordVariable: 'SPIDER_PASS'
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
                     )]) {
-                        bat 'echo %SPIDER_PASS% | docker login %STARK_REGISTRY% -u %SPIDER_USER% --password-stdin'
+                        bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
 
                         pythonApps.each { app ->
                             def needsBuild = false
@@ -332,18 +328,18 @@ pipeline {
                                     def imageTag = ''
                                     def imageName = ''
                                     
-                                    if (env.THOR_PATH == env.AVENGERS_PATH) {
+                                    if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
                                         // Main branch - use version from version.txt
                                         def version = readFile("${app}/version.txt").trim()
                                         imageTag = version
-                                        imageName = "${env.STARK_REGISTRY}/${env.SHIELD_REPO}/${env.AVENGERS_PATH}/${app}:${imageTag}"
+                                        imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}:${imageTag}"
                                     } else {
                                         // Feature branch - use branch-commit format
                                         def cleanBranchName = env.GIT_BRANCH_NAME
                                             .replaceAll('[^a-zA-Z0-9._-]', '-')
                                             .toLowerCase()
                                         imageTag = "${cleanBranchName}-${env.GIT_COMMIT_SHORT}"
-                                        imageName = "${env.STARK_REGISTRY}/${env.SHIELD_REPO}/${env.XMEN_PATH}/${app}:${imageTag}"
+                                        imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}:${imageTag}"
                                     }
                                     
                                     // Check if image already exists
@@ -380,14 +376,14 @@ pipeline {
                             }
                         }
                         
-                        bat "docker logout ${env.STARK_REGISTRY}"
+                        bat "docker logout ${env.DOCKER_REGISTRY}"
                     }
                     
                     if (changedApps.size() > 0) {
-                        env.HULK_APPS = changedApps.join(',')
+                        env.APPS_TO_BUILD = changedApps.join(',')
                         env.HAS_CHANGES = 'true'
                         echo "========================================="
-                        echo "[BUILD LIST] Applications to build: ${env.HULK_APPS}"
+                        echo "[BUILD LIST] Applications to build: ${env.APPS_TO_BUILD}"
                         echo "========================================="
                     } else {
                         env.HAS_CHANGES = 'false'
@@ -409,20 +405,20 @@ pipeline {
             steps {
                 script {
                     echo "========================================="
-                    echo ">>> DOCKER BUILD (IRON MAN ASSEMBLY)"
+                    echo ">>> DOCKER BUILD"
                     echo "========================================="
 
-                    def apps = env.HULK_APPS.split(',')
+                    def apps = env.APPS_TO_BUILD.split(',')
                     def buildJobs = [:]
 
                     apps.each { app ->
                         buildJobs[app] = {
-                            echo "[BUILD START] ${app} - Jarvis initiating build sequence..."
+                            echo "[BUILD START] ${app}"
 
                             def imageTag = ''
                             def version = ''
                             
-                            if (env.THOR_PATH == env.AVENGERS_PATH) {
+                            if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
                                 // Main branch - use version from version.txt
                                 version = readFile("${app}/version.txt").trim()
                                 imageTag = version
@@ -435,7 +431,7 @@ pipeline {
                                 version = imageTag  // For dev builds, version is the same as tag
                             }
 
-                            def imageName = "${env.STARK_REGISTRY}/${env.SHIELD_REPO}/${env.THOR_PATH}/${app}"
+                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
 
                             try {
                                 // Build Docker image with all required labels
@@ -452,20 +448,19 @@ pipeline {
                                         --label "jenkins.build.url=${env.JENKINS_URL}job/${env.JOB_NAME}/${BUILD_NUMBER}/" \
                                         --label "git.commit.message=${env.GIT_COMMIT_MSG.take(100)}" \
                                         --label "app.name=${app}" \
-                                        --label "manifest.location=${env.MANIFEST_PATH}" \
                                         -f ${app}/Dockerfile ${app}/
                                 """
                                 
                                 // For main branch, also tag as latest
-                                if (env.THOR_PATH == env.AVENGERS_PATH) {
+                                if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
                                     bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
-                                    echo "[TAG] Also tagged as ${imageName}:latest (Avengers approved)"
+                                    echo "[TAG] Also tagged as ${imageName}:latest"
                                 }
                                 
-                                echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag} - Arc reactor powered!"
+                                echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag}"
                                 
                                 // Store tags for push stage
-                                writeFile file: "${app}_tags.txt", text: "${imageTag}${env.THOR_PATH == env.AVENGERS_PATH ? ',latest' : ''}"
+                                writeFile file: "${app}_tags.txt", text: "${imageTag}${env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ? ',latest' : ''}"
 
                             } catch (Exception e) {
                                 echo "[BUILD ERROR] ${app}: ${e.message}"
@@ -490,29 +485,29 @@ pipeline {
             steps {
                 script {
                     echo "========================================="
-                    echo ">>> ARTIFACTORY PUSH (SHIELD DEPLOYMENT)"
+                    echo ">>> ARTIFACTORY PUSH"
                     echo "========================================="
 
-                    def apps = env.HULK_APPS.split(',')
+                    def apps = env.APPS_TO_BUILD.split(',')
 
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
-                        usernameVariable: 'CAPTAIN_USER',
-                        passwordVariable: 'CAPTAIN_PASS'
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
                     )]) {
-                        bat 'echo %CAPTAIN_PASS% | docker login %STARK_REGISTRY% -u %CAPTAIN_USER% --password-stdin'
+                        bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
                         
                         def pushJobs = [:]
 
                         apps.each { app ->
                             pushJobs[app] = {
-                                def imageName = "${env.STARK_REGISTRY}/${env.SHIELD_REPO}/${env.THOR_PATH}/${app}"
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
                                 def tags = readFile("${app}_tags.txt").trim().split(',')
                                 
                                 tags.each { tag ->
                                     try {
                                         bat "docker push ${imageName}:${tag}"
-                                        echo "[PUSH SUCCESS] ${app}: ${imageName}:${tag} - Deployed to SHIELD!"
+                                        echo "[PUSH SUCCESS] ${app}: ${imageName}:${tag}"
                                     } catch (Exception e) {
                                         echo "[PUSH ERROR] ${app}:${tag}: ${e.message}"
                                         throw e
@@ -526,13 +521,13 @@ pipeline {
                         parallel pushJobs
                     }
 
-                    bat "docker logout ${env.STARK_REGISTRY}"
+                    bat "docker logout ${env.DOCKER_REGISTRY}"
                 }
             }
         }
 
         // ================================================================================
-        // STAGE 7: Artifactory Cleanup (Thanos Snap)
+        // STAGE 7: Artifactory Cleanup
         // ================================================================================
         stage('Artifactory Cleanup') {
             when {
@@ -544,44 +539,45 @@ pipeline {
             steps {
                 script {
                     echo "========================================="
-                    echo ">>> ARTIFACTORY CLEANUP (THANOS SNAP)"
+                    echo ">>> ARTIFACTORY CLEANUP"
                     echo "========================================="
                     
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
-                        usernameVariable: 'THANOS_USER',
-                        passwordVariable: 'THANOS_PASS'
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
                     )]) {
-                        echo "[CLEANUP] Thanos initiating cleanup..."
+                        echo "[CLEANUP] Starting Artifactory cleanup..."
                         
                         // Cleanup docker-dev repository (14 days retention)
-                        echo "[CLEANUP] Snapping old X-Men training images..."
+                        echo "[CLEANUP] Cleaning docker-dev path in repository..."
                         def cutoffDate = new Date() - 14
                         def cutoffTimestamp = cutoffDate.format('yyyy-MM-dd')
                         
                         // Use Artifactory REST API to find and delete old images
+                        // Note: The path in Artifactory would be dockertest-docker/docker-dev/citd/
                         def cleanupResult = bat(
                             script: """
-                                curl -u %THANOS_USER%:%THANOS_PASS% \
+                                curl -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \
                                      -X POST \
-                                     "https://%STARK_REGISTRY%/artifactory/api/search/aql" \
+                                     "https://%DOCKER_REGISTRY%/artifactory/api/search/aql" \
                                      -H "Content-Type: text/plain" \
-                                     -d "items.find({\\\"repo\\\":\\\"%SHIELD_REPO%\\\",\\\"path\\\":{\\\"\\$match\\\":\\\"${env.XMEN_PATH}/*\\\"},\\\"type\\\":\\\"file\\\",\\\"created\\\":{\\\"\\$lt\\\":\\\"${cutoffTimestamp}\\\"}})"
+                                     -d "items.find({\\\"repo\\\":\\\"dockertest-docker\\\",\\\"path\\\":{\\\"\\$match\\\":\\\"docker-dev/citd/*\\\"},\\\"type\\\":\\\"file\\\",\\\"created\\\":{\\\"\\$lt\\\":\\\"${cutoffTimestamp}\\\"}})"
                             """,
                             returnStdout: true
                         )
                         
-                        echo "[CLEANUP] Found items to snap: ${cleanupResult}"
+                        echo "[CLEANUP] Found items to clean: ${cleanupResult}"
                         
                         // Cleanup docker-latest path (keep last 10 versions)
-                        echo "[CLEANUP] Preserving Avengers-approved images..."
+                        echo "[CLEANUP] Cleaning docker-latest path in repository..."
                         // This would require more complex logic to:
                         // 1. List all versions
                         // 2. Sort by version number
                         // 3. Keep last 10, delete older ones
                         // 4. Never delete versions referenced in deployment-versions.yaml
                         
-                        echo "[CLEANUP] Thanos snap completed - perfectly balanced"
+                        echo "[CLEANUP] Cleanup completed"
                     }
                 }
             }
@@ -597,46 +593,45 @@ pipeline {
             steps {
                 script {
                     echo "\n========================================="
-                    echo ">>> MISSION REPORT"
+                    echo ">>> BUILD SUMMARY"
                     echo "========================================="
                     echo "Branch: ${env.GIT_BRANCH_NAME}"
                     echo "Commit: ${env.GIT_COMMIT_SHORT}"
                     echo "Author: ${env.GIT_AUTHOR}"
                     echo "Build #: ${env.BUILD_NUMBER}"
-                    echo "Deploy Path: ${env.THOR_PATH}"
-                    echo "Manifest Storage: ${env.MANIFEST_PATH}"
+                    echo "Deploy Path: ${env.DEPLOY_PATH}"
                     
                     if (env.NO_APPS == 'true') {
-                        echo "\n[STATUS] No applications found - Avengers standing by"
+                        echo "\n[STATUS] No applications found"
                     } else if (env.VALIDATION_FAILED == 'true') {
-                        echo "\n[STATUS] Validation failed - Call the Avengers!"
+                        echo "\n[STATUS] Validation failed"
                     } else if (env.HAS_CHANGES == 'true') {
-                        echo "\n>>> APPLICATIONS ASSEMBLED AND DEPLOYED:"
-                        def apps = env.HULK_APPS.split(',')
+                        echo "\n>>> APPLICATIONS BUILT AND PUSHED:"
+                        def apps = env.APPS_TO_BUILD.split(',')
                         apps.each { app ->
                             def pushedTags = env."${app}_PUSHED_TAGS"
                             echo "\n  ${app}:"
                             pushedTags.split(',').each { tag ->
-                                echo "    • ${env.STARK_REGISTRY}/${env.SHIELD_REPO}/${env.THOR_PATH}/${app}:${tag}"
+                                echo "    • ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag}"
                             }
                         }
                         
-                        echo "\n>>> TO SUMMON IMAGES (DOCKER PULL):"
+                        echo "\n>>> TO PULL IMAGES:"
                         apps.each { app ->
                             def pushedTags = env."${app}_PUSHED_TAGS"
                             pushedTags.split(',').each { tag ->
-                                echo "  docker pull ${env.STARK_REGISTRY}/${env.SHIELD_REPO}/${env.THOR_PATH}/${app}:${tag}"
+                                echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag}"
                             }
                         }
                     } else {
-                        echo "\n[STATUS] No changes detected - All systems operational"
+                        echo "\n[STATUS] No changes detected"
                     }
                     
                     echo "========================================="
 
                     // Update build description
                     if (env.HAS_CHANGES == 'true') {
-                        currentBuild.description = "${env.THOR_PATH} | ${env.GIT_BRANCH_NAME} | ${env.HULK_APPS}"
+                        currentBuild.description = "${env.DEPLOY_PATH} | ${env.GIT_BRANCH_NAME} | ${env.APPS_TO_BUILD}"
                     } else {
                         currentBuild.description = "No changes | ${env.GIT_BRANCH_NAME}"
                     }
@@ -655,20 +650,14 @@ pipeline {
                         // Remove temporary files
                         bat 'del /Q *_tags.txt 2>nul || exit 0'
                         
-                        // Clean up Docker images - Windows compatible version
-                        if (env.HULK_APPS) {
-                            def apps = env.HULK_APPS.split(',')
+                        // Clean up Docker images
+                        if (env.APPS_TO_BUILD) {
+                            def apps = env.APPS_TO_BUILD.split(',')
                             apps.each { app ->
-                                def imageName = "${env.STARK_REGISTRY}/${env.SHIELD_REPO}/${env.THOR_PATH}/${app}"
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
                                 
-                                // Remove all tags for this app - Windows compatible
-                                bat """
-                                    @echo off
-                                    for /f "tokens=*" %%i in ('docker images ${imageName} -q 2^>nul') do (
-                                        docker rmi -f %%i 2>nul
-                                    )
-                                    exit /b 0
-                                """
+                                // Remove all tags for this app
+                                bat "docker images ${imageName} -q | xargs -r docker rmi -f 2>nul || exit 0"
                             }
                         }
                         
@@ -685,10 +674,10 @@ pipeline {
             }
         }
         success {
-            echo "[SUCCESS] Mission accomplished - Avengers assemble!"
+            echo "[SUCCESS] Pipeline executed successfully!"
         }
         failure {
-            echo "[FAILURE] Mission failed - We need backup!"
+            echo "[FAILURE] Pipeline failed!"
         }
     }
 }
