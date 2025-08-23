@@ -318,71 +318,70 @@ pipeline {
                                 needsBuild = true
                                 reason = "Force build requested"
                             } else {
-                                // For main branch, check if version has changed first
+                                // Check for file changes using git diff
+                                def changedFiles = checkAppChangedFiles(app, env.GIT_COMMIT_HASH)
+                                def hasFileChanges = changedFiles.size() > 0 && !(changedFiles.size() == 1 && changedFiles[0].endsWith('README.md'))
+
+                                // Determine the image tag and path
+                                def imageTag = ''
+                                def imageName = ''
+
                                 if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
+                                    // Main branch - use version from version.txt
                                     def version = readFile("${app}/version.txt").trim()
-                                    def imageTag = version
-                                    def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}:${imageTag}"
-
-                                    // Check if image with this version already exists
-                                    try {
-                                        def pullResult = bat(
-                                            script: "docker pull ${imageName} 2>&1",
-                                            returnStatus: true
-                                        )
-
-                                        if (pullResult == 0) {
-                                            // Image exists with this version
-                                            needsBuild = false
-                                            reason = "Image already exists with version ${imageTag}"
-                                            bat "docker rmi ${imageName} 2>nul || exit 0"
-                                        } else {
-                                            // Image doesn't exist with this version - build needed
-                                            needsBuild = true
-                                            reason = "New version: ${imageTag}"
-                                        }
-                                    } catch (Exception e) {
-                                        needsBuild = true
-                                        reason = "Unable to check existing image - building"
-                                    }
+                                    imageTag = version
+                                    imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}:${imageTag}"
                                 } else {
-                                    // For feature branches, use the original change detection logic
-                                    def changedFiles = checkAppChangedFiles(app, env.GIT_COMMIT_HASH)
-                                    if (changedFiles.size() == 1 && changedFiles[0].endsWith('README.md')) {
-                                        needsBuild = false
-                                        reason = "Only README.md changed - skipping"
-                                    } else if (changedFiles.size() > 0) {
-                                        // Feature branch - use branch-commit format
-                                        def cleanBranchName = env.GIT_BRANCH_NAME
-                                            .replaceAll('[^a-zA-Z0-9._-]', '-')
-                                            .toLowerCase()
-                                        def imageTag = "${cleanBranchName}-${env.GIT_COMMIT_SHORT}"
-                                        def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}:${imageTag}"
+                                    // Feature branch - use branch-commit format
+                                    def cleanBranchName = env.GIT_BRANCH_NAME
+                                        .replaceAll('[^a-zA-Z0-9._-]', '-')
+                                        .toLowerCase()
+                                    imageTag = "${cleanBranchName}-${env.GIT_COMMIT_SHORT}"
+                                    imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}:${imageTag}"
+                                }
 
-                                        // Check if image already exists
-                                        try {
-                                            def pullResult = bat(
-                                                script: "docker pull ${imageName} 2>&1",
-                                                returnStatus: true
-                                            )
+                                // Check if image already exists in Artifactory
+                                def imageExists = false
+                                try {
+                                    def pullResult = bat(
+                                        script: "docker pull ${imageName} 2>&1",
+                                        returnStatus: true
+                                    )
 
-                                            if (pullResult == 0) {
-                                                // Image exists with this exact tag
-                                                needsBuild = false
-                                                reason = "Image already exists with tag ${imageTag}"
-                                                bat "docker rmi ${imageName} 2>nul || exit 0"
-                                            } else {
-                                                needsBuild = true
-                                                reason = "New version/tag: ${imageTag}"
-                                            }
-                                        } catch (Exception e) {
-                                            needsBuild = true
-                                            reason = "Unable to check existing image"
-                                        }
-                                    } else {
-                                        needsBuild = false
-                                        reason = "No changes in app directory"
+                                    if (pullResult == 0) {
+                                        imageExists = true
+                                        bat "docker rmi ${imageName} 2>nul || exit 0"
                                     }
+                                } catch (Exception e) {
+                                    // If we can't check, assume image doesn't exist and build
+                                    imageExists = false
+                                }
+
+                                // Determine if build is needed based on multiple criteria
+                                if (changedFiles.size() == 1 && changedFiles[0].endsWith('README.md')) {
+                                    // Only README changed - skip
+                                    needsBuild = false
+                                    reason = "Only README.md changed - skipping"
+                                } else if (hasFileChanges && !imageExists) {
+                                    // Files changed and image doesn't exist
+                                    needsBuild = true
+                                    reason = "Files changed and new tag: ${imageTag}"
+                                } else if (hasFileChanges && imageExists) {
+                                    // Files changed but image exists - this shouldn't happen normally
+                                    needsBuild = false
+                                    reason = "Files changed but image already exists with tag ${imageTag}"
+                                } else if (!hasFileChanges && !imageExists) {
+                                    // No file changes but image doesn't exist (version bump scenario)
+                                    needsBuild = true
+                                    reason = "New version/tag: ${imageTag}"
+                                } else if (!hasFileChanges && imageExists) {
+                                    // No changes and image exists
+                                    needsBuild = false
+                                    reason = "No changes and image already exists with tag ${imageTag}"
+                                } else {
+                                    // Fallback case
+                                    needsBuild = false
+                                    reason = "No changes in app directory"
                                 }
                             }
                             
