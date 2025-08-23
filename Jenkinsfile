@@ -446,7 +446,7 @@ pipeline {
                                         --label "build.timestamp=${env.TIMESTAMP}" \
                                         --label "jenkins.job.name=${env.JOB_NAME}" \
                                         --label "jenkins.build.url=${env.JENKINS_URL}job/${env.JOB_NAME}/${BUILD_NUMBER}/" \
-                                        --label "git.commit.message=${env.GIT_COMMIT_MSG.take(100)}" \
+                                        --label "git.commit.message=${env.GIT_COMMIT_MSG.replaceAll('[\r\n]+', ' ').take(100)}" \
                                         --label "app.name=${app}" \
                                         -f ${app}/Dockerfile ${app}/
                                 """
