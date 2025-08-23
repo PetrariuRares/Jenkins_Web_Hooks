@@ -34,8 +34,8 @@ pipeline {
         // Docker registry configuration
         DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
         DOCKER_REPO = 'dockertest-docker'
-        DOCKER_LATEST_PATH = 'docker-latest'
-        DOCKER_DEV_PATH = 'docker-dev'
+        DOCKER_LATEST_PATH = 'releases'
+        DOCKER_DEV_PATH = 'development'
 
         // Artifactory credentials
         ARTIFACTORY_CREDS = credentials('artifactory-credentials')
@@ -451,7 +451,7 @@ pipeline {
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
 
                             try {
-                                // Build Docker image with all required labels
+                                // Build Docker image with enhanced labels for better organization
                                 bat """
                                     docker build \
                                         -t ${imageName}:${imageTag} \
@@ -460,22 +460,25 @@ pipeline {
                                         --label "git.commit.author=${env.GIT_AUTHOR}" \
                                         --label "git.branch=${env.GIT_BRANCH_NAME}" \
                                         --label "app.version=${version}" \
+                                        --label "app.name=${app}" \
                                         --label "build.timestamp=${env.TIMESTAMP}" \
+                                        --label "build.type=${env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ? 'release' : 'development'}" \
+                                        --label "repository.path=${env.DEPLOY_PATH}" \
                                         --label "jenkins.job.name=${env.JOB_NAME}" \
                                         --label "jenkins.build.url=${env.JENKINS_URL}job/${env.JOB_NAME}/${BUILD_NUMBER}/" \
                                         --label "git.commit.message=${env.GIT_COMMIT_MSG.replaceAll('[\r\n]+', ' ').take(100)}" \
-                                        --label "app.name=${app}" \
+                                        --label "artifactory.cleanup.policy=${env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ? 'keep-versions' : 'time-based'}" \
                                         -f ${app}/Dockerfile ${app}/
                                 """
-                                
+
                                 // For main branch, also tag as latest
                                 if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
                                     bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
                                     echo "[TAG] Also tagged as ${imageName}:latest"
                                 }
-                                
+
                                 echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag}"
-                                
+
                                 // Store tags for push stage
                                 writeFile file: "${app}_tags.txt", text: "${imageTag}${env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ? ',latest' : ''}"
 
@@ -520,17 +523,21 @@ pipeline {
                             pushJobs[app] = {
                                 def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
                                 def tags = readFile("${app}_tags.txt").trim().split(',')
-                                
+
                                 tags.each { tag ->
                                     try {
                                         bat "docker push ${imageName}:${tag}"
                                         echo "[PUSH SUCCESS] ${app}: ${imageName}:${tag}"
+
+                                        // Add Artifactory properties for better organization
+                                        addArtifactoryProperties(app, tag, env.DEPLOY_PATH)
+
                                     } catch (Exception e) {
                                         echo "[PUSH ERROR] ${app}:${tag}: ${e.message}"
                                         throw e
                                     }
                                 }
-                                
+
                                 env."${app}_PUSHED_TAGS" = tags.join(',')
                             }
                         }
@@ -704,12 +711,12 @@ def checkAppChangedFiles(appDir, currentCommit) {
     try {
         // Get the last successful build commit for comparison
         def previousCommit = 'HEAD~1'  // Default to previous commit
-        
+
         def diffOutput = bat(
             script: "@git diff --name-only ${previousCommit}...${currentCommit} -- ${appDir}/ 2>nul",
             returnStdout: true
         ).trim()
-        
+
         def changedFiles = []
         if (diffOutput) {
             diffOutput.split('\r?\n').each { file ->
@@ -718,10 +725,38 @@ def checkAppChangedFiles(appDir, currentCommit) {
                 }
             }
         }
-        
+
         return changedFiles
     } catch (Exception e) {
         // If we can't determine changes, return non-empty to trigger build
         return ['unknown']
+    }
+}
+
+// Helper function to add Artifactory properties for better organization
+def addArtifactoryProperties(appName, imageTag, deployPath) {
+    try {
+        withCredentials([usernamePassword(
+            credentialsId: 'artifactory-credentials',
+            usernameVariable: 'ARTIFACTORY_USER',
+            passwordVariable: 'ARTIFACTORY_PASS'
+        )]) {
+            def buildType = deployPath == env.DOCKER_LATEST_PATH ? 'release' : 'development'
+            def retentionPolicy = deployPath == env.DOCKER_LATEST_PATH ? 'keep-versions' : 'time-based'
+
+            // Set properties on the image manifest
+            def propertiesUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${deployPath}/${appName}/${imageTag}/list.manifest.json"
+
+            bat """
+                curl -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \
+                     -X PUT \
+                     "${propertiesUrl}?properties=build.type=${buildType};app.name=${appName};repository.path=${deployPath};retention.policy=${retentionPolicy};build.number=${BUILD_NUMBER};build.timestamp=${env.TIMESTAMP};git.branch=${env.GIT_BRANCH_NAME};git.commit=${env.GIT_COMMIT_SHORT}" \
+                     2>nul || echo "Properties update completed"
+            """
+
+            echo "[PROPERTIES] Added metadata properties for ${appName}:${imageTag}"
+        }
+    } catch (Exception e) {
+        echo "[WARNING] Could not add Artifactory properties: ${e.message}"
     }
 }
