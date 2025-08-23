@@ -31,12 +31,6 @@ pipeline {
     }
 
     environment {
-        // Docker registry configuration
-        DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
-        DOCKER_REPO = 'dockertest-docker'
-        DOCKER_LATEST_PATH = 'docker-latest'
-        DOCKER_DEV_PATH = 'docker-dev'
-
         // Artifactory credentials
         ARTIFACTORY_CREDS = credentials('artifactory-credentials')
 
@@ -49,6 +43,9 @@ pipeline {
         // Pipeline status flags
         NO_APPS = 'false'
         VALIDATION_FAILED = 'false'
+        
+        // Config values will be loaded from deployment-versions.yaml
+        CONFIG_LOADED = 'false'
     }
 
     stages {
@@ -73,6 +70,38 @@ pipeline {
                         echo "[INFO] Scheduled cleanup run detected"
                     } else {
                         env.IS_CLEANUP_RUN = 'false'
+                    }
+                    
+                    // Load configuration from deployment-versions.yaml if it exists
+                    if (fileExists('deployment-versions.yaml')) {
+                        def deployConfig = readYaml file: 'deployment-versions.yaml'
+                        
+                        // Load all config values into environment
+                        env.DOCKER_REGISTRY = deployConfig.config.docker_registry
+                        env.DOCKER_REPO = deployConfig.config.docker_repo
+                        env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
+                        env.DOCKER_DEV_PATH = deployConfig.config.docker_dev_path
+                        env.METADATA_PATH = deployConfig.config.metadata_path
+                        env.BUILD_MANIFESTS_PATH = deployConfig.config.build_manifests_path
+                        env.TEMP_BUILDS_PATH = deployConfig.config.temp_builds_path
+                        env.DEV_RETENTION_DAYS = deployConfig.config.dev_retention_days.toString()
+                        env.LATEST_VERSIONS_TO_KEEP = deployConfig.config.latest_versions_to_keep.toString()
+                        
+                        env.CONFIG_LOADED = 'true'
+                        echo "[CONFIG] Loaded configuration from deployment-versions.yaml"
+                    } else {
+                        // Use default values if config file doesn't exist
+                        env.DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
+                        env.DOCKER_REPO = 'dockertest-docker'
+                        env.DOCKER_LATEST_PATH = 'docker-latest'
+                        env.DOCKER_DEV_PATH = 'docker-dev'
+                        env.METADATA_PATH = 'metadata'
+                        env.BUILD_MANIFESTS_PATH = 'metadata/build-manifests'
+                        env.TEMP_BUILDS_PATH = 'metadata/temporary-builds'
+                        env.DEV_RETENTION_DAYS = '14'
+                        env.LATEST_VERSIONS_TO_KEEP = '10'
+                        
+                        echo "[CONFIG] Using default configuration (deployment-versions.yaml not found)"
                     }
                 }
             }
@@ -101,14 +130,14 @@ pipeline {
                         checkout scm
                         
                         try {
-                            env.GIT_BRANCH_NAME = bat(
-                                script: '@git rev-parse --abbrev-ref HEAD',
+                            env.GIT_BRANCH_NAME = sh(
+                                script: 'git rev-parse --abbrev-ref HEAD',
                                 returnStdout: true
                             ).trim()
                             
                             if (env.GIT_BRANCH_NAME == 'HEAD') {
-                                env.GIT_BRANCH_NAME = bat(
-                                    script: '@git branch -r --contains HEAD',
+                                env.GIT_BRANCH_NAME = sh(
+                                    script: 'git branch -r --contains HEAD | head -1',
                                     returnStdout: true
                                 ).trim()
                                 env.GIT_BRANCH_NAME = env.GIT_BRANCH_NAME.replaceAll('.*origin/', '').trim()
@@ -127,20 +156,26 @@ pipeline {
 
                     // Extract commit information
                     try {
-                        env.GIT_COMMIT_HASH = bat(
-                            script: '@git rev-parse HEAD',
+                        env.GIT_COMMIT_HASH = sh(
+                            script: 'git rev-parse HEAD',
                             returnStdout: true
                         ).trim()
-                        env.GIT_COMMIT_SHORT = bat(
-                            script: '@git rev-parse --short=8 HEAD',
+                        env.GIT_COMMIT_SHORT = sh(
+                            script: 'git rev-parse --short=8 HEAD',
                             returnStdout: true
                         ).trim()
-                        env.GIT_COMMIT_MSG = bat(
-                            script: '@git log -1 --pretty=%%B',
+                        env.GIT_COMMIT_MSG = sh(
+                            script: 'git log -1 --pretty=%B',
                             returnStdout: true
                         ).trim()
-                        env.GIT_AUTHOR = bat(
-                            script: '@git log -1 --pretty=%%ae',
+                        env.GIT_AUTHOR = sh(
+                            script: 'git log -1 --pretty=%ae',
+                            returnStdout: true
+                        ).trim()
+                        
+                        // Get previous successful commit for better change detection
+                        env.GIT_PREVIOUS_COMMIT = sh(
+                            script: 'git rev-parse HEAD~1 2>/dev/null || echo ""',
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
@@ -148,11 +183,31 @@ pipeline {
                         env.GIT_COMMIT_SHORT = "unknown-${BUILD_NUMBER}"
                         env.GIT_COMMIT_MSG = "Unknown"
                         env.GIT_AUTHOR = "Unknown"
+                        env.GIT_PREVIOUS_COMMIT = ""
                     }
 
                     echo "[BRANCH] ${env.GIT_BRANCH_NAME}"
                     echo "[COMMIT] ${env.GIT_COMMIT_SHORT} (${env.GIT_COMMIT_HASH})"
                     echo "[AUTHOR] ${env.GIT_AUTHOR}"
+                    
+                    // Reload configuration after checkout
+                    if (fileExists('deployment-versions.yaml')) {
+                        def deployConfig = readYaml file: 'deployment-versions.yaml'
+                        
+                        // Load all config values into environment
+                        env.DOCKER_REGISTRY = deployConfig.config.docker_registry
+                        env.DOCKER_REPO = deployConfig.config.docker_repo
+                        env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
+                        env.DOCKER_DEV_PATH = deployConfig.config.docker_dev_path
+                        env.METADATA_PATH = deployConfig.config.metadata_path
+                        env.BUILD_MANIFESTS_PATH = deployConfig.config.build_manifests_path
+                        env.TEMP_BUILDS_PATH = deployConfig.config.temp_builds_path
+                        env.DEV_RETENTION_DAYS = deployConfig.config.dev_retention_days.toString()
+                        env.LATEST_VERSIONS_TO_KEEP = deployConfig.config.latest_versions_to_keep.toString()
+                        
+                        env.CONFIG_LOADED = 'true'
+                        echo "[CONFIG] Reloaded configuration from deployment-versions.yaml"
+                    }
 
                     // Determine deployment path based on branch
                     if (params.DEPLOY_TARGET != 'auto') {
@@ -171,7 +226,7 @@ pipeline {
         }
 
         // ================================================================================
-        // STAGE 3: Validate Mandatory Files
+        // STAGE 3: Validate Applications
         // ================================================================================
         stage('Validate Applications') {
             when {
@@ -189,8 +244,8 @@ pipeline {
                     // Find all Dockerfiles
                     def dockerfiles = ''
                     try {
-                        dockerfiles = bat(
-                            script: '@dir /s /b Dockerfile 2>nul || exit 0',
+                        dockerfiles = sh(
+                            script: 'find . -name "Dockerfile" -type f 2>/dev/null || true',
                             returnStdout: true
                         ).trim()
                     } catch (Exception e) {
@@ -198,9 +253,9 @@ pipeline {
                     }
 
                     if (dockerfiles) {
-                        dockerfiles.split('\r?\n').each { file ->
+                        dockerfiles.split('\n').each { file ->
                             if (file && file.trim()) {
-                                def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
+                                def relativePath = file.replace('./', '')
                                 def parts = relativePath.split('/')
                                 if (parts.length == 2 && parts[1] == 'Dockerfile') {
                                     def appName = parts[0]
@@ -307,7 +362,7 @@ pipeline {
                         usernameVariable: 'ARTIFACTORY_USER',
                         passwordVariable: 'ARTIFACTORY_PASS'
                     )]) {
-                        bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
+                        sh 'echo $ARTIFACTORY_PASS | docker login $DOCKER_REGISTRY -u $ARTIFACTORY_USER --password-stdin'
 
                         pythonApps.each { app ->
                             def needsBuild = false
@@ -318,9 +373,12 @@ pipeline {
                                 needsBuild = true
                                 reason = "Force build requested"
                             } else {
-                                // Check for file changes using git diff
-                                def changedFiles = checkAppChangedFiles(app, env.GIT_COMMIT_HASH)
-                                def hasFileChanges = changedFiles.size() > 0 && !(changedFiles.size() == 1 && changedFiles[0].endsWith('README.md'))
+                                // Check for file changes using improved logic
+                                def changedFiles = checkAppChangedFiles(app)
+                                
+                                // Filter out README-only changes
+                                def significantChanges = changedFiles.findAll { !it.endsWith('README.md') }
+                                def hasSignificantChanges = significantChanges.size() > 0
 
                                 // Determine the image tag and path
                                 def imageTag = ''
@@ -341,47 +399,24 @@ pipeline {
                                 }
 
                                 // Check if image already exists in Artifactory
-                                def imageExists = false
-                                try {
-                                    def pullResult = bat(
-                                        script: "docker pull ${imageName} 2>&1",
-                                        returnStatus: true
-                                    )
+                                def imageExists = sh(
+                                    script: "docker pull ${imageName} > /dev/null 2>&1",
+                                    returnStatus: true
+                                ) == 0
 
-                                    if (pullResult == 0) {
-                                        imageExists = true
-                                        bat "docker rmi ${imageName} 2>nul || exit 0"
-                                    }
-                                } catch (Exception e) {
-                                    // If we can't check, assume image doesn't exist and build
-                                    imageExists = false
+                                if (imageExists) {
+                                    sh "docker rmi ${imageName} 2>/dev/null || true"
                                 }
 
-                                // Determine if build is needed based on multiple criteria
-                                if (changedFiles.size() == 1 && changedFiles[0].endsWith('README.md')) {
-                                    // Only README changed - skip
-                                    needsBuild = false
-                                    reason = "Only README.md changed - skipping"
-                                } else if (hasFileChanges && !imageExists) {
-                                    // Files changed and image doesn't exist
+                                // Simplified decision logic
+                                if (hasSignificantChanges || !imageExists) {
                                     needsBuild = true
-                                    reason = "Files changed and new tag: ${imageTag}"
-                                } else if (hasFileChanges && imageExists) {
-                                    // Files changed but image exists - this shouldn't happen normally
-                                    needsBuild = false
-                                    reason = "Files changed but image already exists with tag ${imageTag}"
-                                } else if (!hasFileChanges && !imageExists) {
-                                    // No file changes but image doesn't exist (version bump scenario)
-                                    needsBuild = true
-                                    reason = "New version/tag: ${imageTag}"
-                                } else if (!hasFileChanges && imageExists) {
-                                    // No changes and image exists
-                                    needsBuild = false
-                                    reason = "No changes and image already exists with tag ${imageTag}"
+                                    reason = hasSignificantChanges ? 
+                                        "Files changed (${significantChanges.size()} files)" : 
+                                        "New version/tag: ${imageTag}"
                                 } else {
-                                    // Fallback case
                                     needsBuild = false
-                                    reason = "No changes in app directory"
+                                    reason = "No changes and image exists"
                                 }
                             }
                             
@@ -393,7 +428,7 @@ pipeline {
                             }
                         }
                         
-                        bat "docker logout ${env.DOCKER_REGISTRY}"
+                        sh "docker logout ${env.DOCKER_REGISTRY}"
                     }
                     
                     if (changedApps.size() > 0) {
@@ -449,10 +484,16 @@ pipeline {
                             }
 
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
+                            
+                            // Sanitize commit message for Docker label
+                            def sanitizedMsg = env.GIT_COMMIT_MSG
+                                .replaceAll('["\\\\]', '')
+                                .replaceAll('[\r\n]+', ' ')
+                                .take(100)
 
                             try {
                                 // Build Docker image with all required labels
-                                bat """
+                                sh """
                                     docker build \
                                         -t ${imageName}:${imageTag} \
                                         --label "jenkins.build.number=${BUILD_NUMBER}" \
@@ -463,14 +504,14 @@ pipeline {
                                         --label "build.timestamp=${env.TIMESTAMP}" \
                                         --label "jenkins.job.name=${env.JOB_NAME}" \
                                         --label "jenkins.build.url=${env.JENKINS_URL}job/${env.JOB_NAME}/${BUILD_NUMBER}/" \
-                                        --label "git.commit.message=${env.GIT_COMMIT_MSG.replaceAll('[\r\n]+', ' ').take(100)}" \
+                                        --label "git.commit.message=${sanitizedMsg}" \
                                         --label "app.name=${app}" \
                                         -f ${app}/Dockerfile ${app}/
                                 """
                                 
                                 // For main branch, also tag as latest
                                 if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
-                                    bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
+                                    sh "docker tag ${imageName}:${imageTag} ${imageName}:latest"
                                     echo "[TAG] Also tagged as ${imageName}:latest"
                                 }
                                 
@@ -512,7 +553,7 @@ pipeline {
                         usernameVariable: 'ARTIFACTORY_USER',
                         passwordVariable: 'ARTIFACTORY_PASS'
                     )]) {
-                        bat 'echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin'
+                        sh 'echo $ARTIFACTORY_PASS | docker login $DOCKER_REGISTRY -u $ARTIFACTORY_USER --password-stdin'
                         
                         def pushJobs = [:]
 
@@ -523,13 +564,16 @@ pipeline {
                                 
                                 tags.each { tag ->
                                     try {
-                                        bat "docker push ${imageName}:${tag}"
+                                        sh "docker push ${imageName}:${tag}"
                                         echo "[PUSH SUCCESS] ${app}: ${imageName}:${tag}"
                                     } catch (Exception e) {
                                         echo "[PUSH ERROR] ${app}:${tag}: ${e.message}"
                                         throw e
                                     }
                                 }
+                                
+                                // Create and upload build manifest
+                                createBuildManifest(app, tags[0])
                                 
                                 env."${app}_PUSHED_TAGS" = tags.join(',')
                             }
@@ -538,7 +582,7 @@ pipeline {
                         parallel pushJobs
                     }
 
-                    bat "docker logout ${env.DOCKER_REGISTRY}"
+                    sh "docker logout ${env.DOCKER_REGISTRY}"
                 }
             }
         }
@@ -559,42 +603,48 @@ pipeline {
                     echo ">>> ARTIFACTORY CLEANUP"
                     echo "========================================="
                     
+                    // For scheduled cleanup runs, we need to checkout first to get config
+                    if (env.IS_CLEANUP_RUN == 'true' && env.CONFIG_LOADED != 'true') {
+                        checkout scm
+                        
+                        if (fileExists('deployment-versions.yaml')) {
+                            def deployConfig = readYaml file: 'deployment-versions.yaml'
+                            
+                            // Load all config values
+                            env.DOCKER_REGISTRY = deployConfig.config.docker_registry
+                            env.DOCKER_REPO = deployConfig.config.docker_repo
+                            env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
+                            env.DOCKER_DEV_PATH = deployConfig.config.docker_dev_path
+                            env.METADATA_PATH = deployConfig.config.metadata_path
+                            env.BUILD_MANIFESTS_PATH = deployConfig.config.build_manifests_path
+                            env.TEMP_BUILDS_PATH = deployConfig.config.temp_builds_path
+                            env.DEV_RETENTION_DAYS = deployConfig.config.dev_retention_days.toString()
+                            env.LATEST_VERSIONS_TO_KEEP = deployConfig.config.latest_versions_to_keep.toString()
+                            
+                            echo "[CONFIG] Loaded configuration for cleanup"
+                        }
+                    }
+                    
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
                         usernameVariable: 'ARTIFACTORY_USER',
                         passwordVariable: 'ARTIFACTORY_PASS'
                     )]) {
-                        echo "[CLEANUP] Starting Artifactory cleanup..."
+                        echo "[CLEANUP] Configuration:"
+                        echo "  Dev retention: ${env.DEV_RETENTION_DAYS} days"
+                        echo "  Latest versions to keep: ${env.LATEST_VERSIONS_TO_KEEP}"
+                        echo "  Registry: ${env.DOCKER_REGISTRY}"
                         
-                        // Cleanup docker-dev repository (14 days retention)
-                        echo "[CLEANUP] Cleaning docker-dev path in repository..."
-                        def cutoffDate = new Date() - 14
-                        def cutoffTimestamp = cutoffDate.format('yyyy-MM-dd')
+                        // 1. Cleanup docker-dev repository
+                        cleanupDevImages()
                         
-                        // Use Artifactory REST API to find and delete old images
-                        // Note: The path in Artifactory would be dockertest-docker/docker-dev/citd/
-                        def cleanupResult = bat(
-                            script: """
-                                curl -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \
-                                     -X POST \
-                                     "https://%DOCKER_REGISTRY%/artifactory/api/search/aql" \
-                                     -H "Content-Type: text/plain" \
-                                     -d "items.find({\\\"repo\\\":\\\"dockertest-docker\\\",\\\"path\\\":{\\\"\\$match\\\":\\\"docker-dev/citd/*\\\"},\\\"type\\\":\\\"file\\\",\\\"created\\\":{\\\"\\$lt\\\":\\\"${cutoffTimestamp}\\\"}})"
-                            """,
-                            returnStdout: true
-                        )
+                        // 2. Cleanup docker-latest repository (keep last N versions per app)
+                        cleanupLatestImages()
                         
-                        echo "[CLEANUP] Found items to clean: ${cleanupResult}"
+                        // 3. Cleanup metadata/temporary-builds
+                        cleanupTempManifests()
                         
-                        // Cleanup docker-latest path (keep last 10 versions)
-                        echo "[CLEANUP] Cleaning docker-latest path in repository..."
-                        // This would require more complex logic to:
-                        // 1. List all versions
-                        // 2. Sort by version number
-                        // 3. Keep last 10, delete older ones
-                        // 4. Never delete versions referenced in deployment-versions.yaml
-                        
-                        echo "[CLEANUP] Cleanup completed"
+                        echo "[CLEANUP] Cleanup completed successfully"
                     }
                 }
             }
@@ -665,7 +715,7 @@ pipeline {
                     
                     try {
                         // Remove temporary files
-                        bat 'del /Q *_tags.txt 2>nul || exit 0'
+                        sh 'rm -f *_tags.txt 2>/dev/null || true'
                         
                         // Clean up Docker images
                         if (env.APPS_TO_BUILD) {
@@ -674,13 +724,15 @@ pipeline {
                                 def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
                                 
                                 // Remove all tags for this app
-                                bat "docker images ${imageName} -q | xargs -r docker rmi -f 2>nul || exit 0"
+                                sh """
+                                    docker images ${imageName} -q | xargs -r docker rmi -f 2>/dev/null || true
+                                """
                             }
                         }
                         
                         // Prune system
-                        bat 'docker image prune -f 2>nul || exit 0'
-                        bat 'docker builder prune -f --filter "until=168h" 2>nul || exit 0'
+                        sh 'docker image prune -f 2>/dev/null || true'
+                        sh 'docker builder prune -f --filter "until=168h" 2>/dev/null || true'
                         
                     } catch (Exception e) {
                         echo "[CLEANUP ERROR] ${e.message}"
@@ -699,29 +751,282 @@ pipeline {
     }
 }
 
-// Helper function to check what files changed in an app
-def checkAppChangedFiles(appDir, currentCommit) {
+// ================================================================================
+// HELPER FUNCTIONS
+// ================================================================================
+
+// Improved change detection function
+def checkAppChangedFiles(appDir) {
     try {
-        // Get the last successful build commit for comparison
-        def previousCommit = 'HEAD~1'  // Default to previous commit
+        def changedFiles = []
         
-        def diffOutput = bat(
-            script: "@git diff --name-only ${previousCommit}...${currentCommit} -- ${appDir}/ 2>nul",
+        // First build or no previous commit
+        if (!env.GIT_PREVIOUS_COMMIT || env.GIT_PREVIOUS_COMMIT == "") {
+            echo "  First build detected for ${appDir}"
+            return ['first-build']
+        }
+        
+        // Check if this is the first build by looking for previous successful build
+        def lastSuccessfulCommit = sh(
+            script: """
+                git log --format="%H" -n 50 | while read commit; do
+                    if [ "\$commit" != "${env.GIT_COMMIT_HASH}" ]; then
+                        echo "\$commit"
+                        break
+                    fi
+                done
+            """,
             returnStdout: true
         ).trim()
         
-        def changedFiles = []
+        if (!lastSuccessfulCommit) {
+            lastSuccessfulCommit = env.GIT_PREVIOUS_COMMIT
+        }
+        
+        def diffOutput = sh(
+            script: "git diff --name-only ${lastSuccessfulCommit}...${env.GIT_COMMIT_HASH} -- ${appDir}/ 2>/dev/null || echo ''",
+            returnStdout: true
+        ).trim()
+        
         if (diffOutput) {
-            diffOutput.split('\r?\n').each { file ->
-                if (file) {
+            diffOutput.split('\n').each { file ->
+                if (file && file.trim()) {
                     changedFiles.add(file)
+                    echo "    Changed: ${file}"
                 }
             }
         }
         
         return changedFiles
     } catch (Exception e) {
+        echo "  Error detecting changes: ${e.message}"
         // If we can't determine changes, return non-empty to trigger build
         return ['unknown']
+    }
+}
+
+// Create and upload build manifest
+def createBuildManifest(appName, version) {
+    def manifestPath = env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ? 
+        env.BUILD_MANIFESTS_PATH : env.TEMP_BUILDS_PATH
+    
+    def manifest = [
+        app: appName,
+        version: version,
+        build_number: env.BUILD_NUMBER,
+        timestamp: env.TIMESTAMP,
+        git_commit: env.GIT_COMMIT_HASH,
+        git_branch: env.GIT_BRANCH_NAME,
+        git_author: env.GIT_AUTHOR,
+        jenkins_job: env.JOB_NAME,
+        docker_image: "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${appName}:${version}"
+    ]
+    
+    def manifestJson = groovy.json.JsonOutput.toJson(manifest)
+    def manifestFile = "${appName}-${version}-manifest.json"
+    
+    writeFile file: manifestFile, text: groovy.json.JsonOutput.prettyPrint(manifestJson)
+    
+    // Upload manifest to Artifactory
+    sh """
+        curl -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+             -T ${manifestFile} \
+             "https://${DOCKER_REGISTRY}/artifactory/${DOCKER_REPO}/${manifestPath}/${appName}/${version}.json"
+    """
+    
+    echo "[MANIFEST] Uploaded ${manifestPath}/${appName}/${version}.json"
+}
+
+// Cleanup docker-dev images older than 14 days
+def cleanupDevImages() {
+    echo "[CLEANUP] Cleaning docker-dev images older than ${env.DEV_RETENTION_DAYS} days..."
+    
+    def cutoffDate = new Date() - Integer.parseInt(env.DEV_RETENTION_DAYS)
+    def cutoffTimestamp = cutoffDate.format("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+    
+    // AQL query to find old dev images
+    def aqlQuery = """
+    {
+        "repo": "${DOCKER_REPO}",
+        "path": {"\\$match": "${DOCKER_DEV_PATH}/*"},
+        "type": "folder",
+        "created": {"\\$lt": "${cutoffTimestamp}"}
+    }
+    """
+    
+    def queryResult = sh(
+        script: """
+            curl -s -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+                 -X POST \
+                 -H "Content-Type: text/plain" \
+                 -d 'items.find(${aqlQuery})' \
+                 "https://${DOCKER_REGISTRY}/artifactory/api/search/aql"
+        """,
+        returnStdout: true
+    ).trim()
+    
+    // Parse results and delete old images
+    def parser = new groovy.json.JsonSlurper()
+    try {
+        def results = parser.parseText(queryResult)
+        results.results.each { item ->
+            def path = "${item.repo}/${item.path}/${item.name}"
+            echo "  Deleting: ${path}"
+            sh """
+                curl -s -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+                     -X DELETE \
+                     "https://${DOCKER_REGISTRY}/artifactory/${path}"
+            """
+        }
+        echo "[CLEANUP] Deleted ${results.results.size()} old dev images"
+    } catch (Exception e) {
+        echo "[CLEANUP] Error parsing results: ${e.message}"
+    }
+}
+
+// Cleanup docker-latest images keeping only last N versions
+def cleanupLatestImages() {
+    echo "[CLEANUP] Cleaning docker-latest images (keeping last ${env.LATEST_VERSIONS_TO_KEEP} versions)..."
+    
+    // Read deployment-versions.yaml to get protected versions
+    def protectedVersions = [:]
+    if (fileExists('deployment-versions.yaml')) {
+        def deployConfig = readYaml file: 'deployment-versions.yaml'
+        deployConfig.production.each { app, version ->
+            if (!protectedVersions[app]) {
+                protectedVersions[app] = []
+            }
+            protectedVersions[app].add(version)
+            echo "  Protected: ${app}:${version} (in production)"
+        }
+    } else {
+        echo "  Warning: deployment-versions.yaml not found, no versions will be protected"
+    }
+    
+    // Get list of all apps in docker-latest
+    def appsResult = sh(
+        script: """
+            curl -s -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+                 "https://${DOCKER_REGISTRY}/artifactory/api/storage/${DOCKER_REPO}/${DOCKER_LATEST_PATH}" | \
+                 python3 -c "import sys, json; data = json.load(sys.stdin); [print(child['uri'][1:]) for child in data.get('children', []) if child['folder']]"
+        """,
+        returnStdout: true
+    ).trim()
+    
+    if (appsResult) {
+        appsResult.split('\n').each { app ->
+            echo "\n  Processing ${app}..."
+            
+            // Get all versions for this app
+            def versionsResult = sh(
+                script: """
+                    curl -s -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+                         "https://${DOCKER_REGISTRY}/artifactory/api/docker/${DOCKER_REPO}/v2/${DOCKER_LATEST_PATH}/${app}/tags/list" | \
+                         python3 -c "import sys, json; data = json.load(sys.stdin); [print(tag) for tag in data.get('tags', [])]"
+                """,
+                returnStdout: true
+            ).trim()
+            
+            if (versionsResult) {
+                def allVersions = versionsResult.split('\n').findAll { 
+                    it && it != 'latest' && it.matches('^\\d+\\.\\d+\\.\\d+$')
+                }
+                
+                // Sort versions properly (semantic versioning)
+                allVersions = allVersions.sort { a, b ->
+                    def aParts = a.split('\\.').collect { Integer.parseInt(it) }
+                    def bParts = b.split('\\.').collect { Integer.parseInt(it) }
+                    
+                    for (int i = 0; i < 3; i++) {
+                        if (aParts[i] != bParts[i]) {
+                            return bParts[i] - aParts[i]  // Descending order
+                        }
+                    }
+                    return 0
+                }
+                
+                echo "    Found ${allVersions.size()} versions"
+                
+                // Determine which versions to keep
+                def versionsToKeep = []
+                def versionsToDelete = []
+                
+                allVersions.eachWithIndex { version, index ->
+                    def isProtected = protectedVersions[app]?.contains(version)
+                    def isRecent = index < Integer.parseInt(env.LATEST_VERSIONS_TO_KEEP)
+                    
+                    if (isProtected || isRecent) {
+                        versionsToKeep.add(version)
+                        echo "    ✓ Keep: ${version}${isProtected ? ' (protected)' : ''}"
+                    } else {
+                        versionsToDelete.add(version)
+                        echo "    ✗ Delete: ${version}"
+                    }
+                }
+                
+                // Delete old versions
+                versionsToDelete.each { version ->
+                    sh """
+                        curl -s -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+                             -X DELETE \
+                             "https://${DOCKER_REGISTRY}/artifactory/${DOCKER_REPO}/${DOCKER_LATEST_PATH}/${app}/${version}"
+                    """
+                }
+                
+                if (versionsToDelete.size() > 0) {
+                    echo "    Deleted ${versionsToDelete.size()} old versions"
+                } else {
+                    echo "    No versions to delete"
+                }
+            }
+        }
+    }
+}
+
+// Cleanup temporary build manifests older than 14 days
+def cleanupTempManifests() {
+    echo "[CLEANUP] Cleaning temporary build manifests older than ${env.DEV_RETENTION_DAYS} days..."
+    
+    def cutoffDate = new Date() - Integer.parseInt(env.DEV_RETENTION_DAYS)
+    def cutoffTimestamp = cutoffDate.format("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+    
+    // AQL query to find old manifests
+    def aqlQuery = """
+    {
+        "repo": "${DOCKER_REPO}",
+        "path": {"\\$match": "${TEMP_BUILDS_PATH}/*"},
+        "type": "file",
+        "name": {"\\$match": "*.json"},
+        "created": {"\\$lt": "${cutoffTimestamp}"}
+    }
+    """
+    
+    def queryResult = sh(
+        script: """
+            curl -s -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+                 -X POST \
+                 -H "Content-Type: text/plain" \
+                 -d 'items.find(${aqlQuery})' \
+                 "https://${DOCKER_REGISTRY}/artifactory/api/search/aql"
+        """,
+        returnStdout: true
+    ).trim()
+    
+    // Parse results and delete old manifests
+    def parser = new groovy.json.JsonSlurper()
+    try {
+        def results = parser.parseText(queryResult)
+        results.results.each { item ->
+            def path = "${item.repo}/${item.path}/${item.name}"
+            echo "  Deleting manifest: ${path}"
+            sh """
+                curl -s -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+                     -X DELETE \
+                     "https://${DOCKER_REGISTRY}/artifactory/${path}"
+            """
+        }
+        echo "[CLEANUP] Deleted ${results.results.size()} old manifests"
+    } catch (Exception e) {
+        echo "[CLEANUP] Error parsing results: ${e.message}"
     }
 }

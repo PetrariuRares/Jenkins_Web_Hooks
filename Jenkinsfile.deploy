@@ -1,0 +1,473 @@
+// File location: /Jenkinsfile.deploy (root of repo)
+// This pipeline is for MANUAL deployment only - no automatic triggers
+
+pipeline {
+    agent any
+    
+    parameters {
+        booleanParam(
+            name: 'CONFIRM_DEPLOYMENT',
+            defaultValue: false,
+            description: 'Check this box to confirm production deployment'
+        )
+        booleanParam(
+            name: 'UPDATE_LATEST_TAGS',
+            defaultValue: true,
+            description: 'Update the "latest" tags to point to production versions'
+        )
+        booleanParam(
+            name: 'RUN_HEALTH_CHECKS',
+            defaultValue: true,
+            description: 'Run health checks after deployment'
+        )
+    }
+    
+    options {
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        disableConcurrentBuilds()
+    }
+    
+    environment {
+        // These will be loaded from deployment-versions.yaml config section
+        DOCKER_REGISTRY = ''
+        DOCKER_REPO = ''
+        DOCKER_LATEST_PATH = ''
+        ARTIFACTORY_CREDS = credentials('artifactory-credentials')
+    }
+    
+    // NO TRIGGERS - This pipeline is manual only
+    
+    stages {
+        // ================================================================================
+        // STAGE 1: Pre-flight Checks
+        // ================================================================================
+        stage('Pre-flight Checks') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo ">>> PRODUCTION DEPLOYMENT PIPELINE"
+                    echo "========================================="
+                    
+                    if (!params.CONFIRM_DEPLOYMENT) {
+                        error("❌ Deployment not confirmed. Please check 'CONFIRM_DEPLOYMENT' to proceed.")
+                    }
+                    
+                    echo "✅ Deployment confirmed by user"
+                    echo "Build Number: ${env.BUILD_NUMBER}"
+                    echo "Triggered by: ${env.BUILD_USER ?: 'Jenkins'}"
+                    echo "========================================="
+                }
+            }
+        }
+        
+        // ================================================================================
+        // STAGE 2: Checkout and Load Configuration
+        // ================================================================================
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    // Get current branch
+                    env.GIT_BRANCH_NAME = sh(
+                        script: 'git rev-parse --abbrev-ref HEAD',
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Only allow deployment from main/master branch
+                    if (env.GIT_BRANCH_NAME != 'main' && env.GIT_BRANCH_NAME != 'master') {
+                        error("❌ Deployment only allowed from main/master branch. Current branch: ${env.GIT_BRANCH_NAME}")
+                    }
+                    
+                    echo "✅ On ${env.GIT_BRANCH_NAME} branch"
+                }
+            }
+        }
+        
+        // ================================================================================
+        // STAGE 3: Read Deployment Configuration
+        // ================================================================================
+        stage('Read Configuration') {
+            steps {
+                script {
+                    echo "📖 Reading deployment-versions.yaml..."
+                    
+                    if (!fileExists('deployment-versions.yaml')) {
+                        error("❌ deployment-versions.yaml not found in repository root")
+                    }
+                    
+                    // Read the YAML file
+                    def deployConfig = readYaml file: 'deployment-versions.yaml'
+                    
+                    // Load config values into environment
+                    env.DOCKER_REGISTRY = deployConfig.config.docker_registry
+                    env.DOCKER_REPO = deployConfig.config.docker_repo
+                    env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
+                    env.BUILD_MANIFESTS_PATH = deployConfig.config.build_manifests_path
+                    
+                    echo "\n>>> Configuration loaded:"
+                    echo "  Registry: ${env.DOCKER_REGISTRY}"
+                    echo "  Repository: ${env.DOCKER_REPO}"
+                    echo "  Path: ${env.DOCKER_LATEST_PATH}"
+                    
+                    echo "\n>>> Applications to deploy:"
+                    deployConfig.production.each { app, version ->
+                        env["VERSION_${app.toUpperCase().replace('-', '_')}"] = version
+                        echo "  ${app}: ${version}"
+                    }
+                    
+                    // Store for later stages
+                    env.DEPLOY_CONFIG_JSON = groovy.json.JsonOutput.toJson(deployConfig.production)
+                }
+            }
+        }
+        
+        // ================================================================================
+        // STAGE 4: Verify Images Exist
+        // ================================================================================
+        stage('Verify Images') {
+            steps {
+                script {
+                    echo "✅ Verifying all images exist in Artifactory..."
+                    
+                    def deployConfig = readYaml file: 'deployment-versions.yaml'
+                    def missingImages = []
+                    def foundImages = []
+                    
+                    deployConfig.production.each { app, version ->
+                        echo "\n  Checking ${app}:${version}..."
+                        
+                        // Check if image exists using Docker registry API
+                        def checkUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_LATEST_PATH}/${app}/manifests/${version}"
+                        
+                        def exists = sh(
+                            script: """
+                                curl -s -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+                                     -X GET "${checkUrl}" \
+                                     -o /dev/null -w "%{http_code}"
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (exists == "200") {
+                            echo "    ✅ Found: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}:${version}"
+                            foundImages.add("${app}:${version}")
+                        } else {
+                            echo "    ❌ NOT FOUND: ${app}:${version}"
+                            missingImages.add("${app}:${version}")
+                        }
+                    }
+                    
+                    if (missingImages.size() > 0) {
+                        error("""
+                        ❌ Missing images in Artifactory:
+                        ${missingImages.join('\n')}
+                        
+                        Please ensure these images are built and pushed before deployment.
+                        """)
+                    }
+                    
+                    echo "\n✅ All ${foundImages.size()} images verified successfully"
+                }
+            }
+        }
+        
+        // ================================================================================
+        // STAGE 5: Update Latest Tags
+        // ================================================================================
+        stage('Update Latest Tags') {
+            when {
+                expression { params.UPDATE_LATEST_TAGS == true }
+            }
+            steps {
+                script {
+                    echo "🏷️ Updating 'latest' tags in Artifactory..."
+                    
+                    def deployConfig = readYaml file: 'deployment-versions.yaml'
+                    
+                    // Login to Docker registry
+                    sh """
+                        echo ${ARTIFACTORY_CREDS_PSW} | docker login ${env.DOCKER_REGISTRY} \
+                            -u ${ARTIFACTORY_CREDS_USR} --password-stdin
+                    """
+                    
+                    def updateJobs = [:]
+                    
+                    deployConfig.production.each { app, version ->
+                        updateJobs[app] = {
+                            echo "\n  Updating ${app}:latest to point to ${version}..."
+                            
+                            def imagePath = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}"
+                            
+                            // Pull the specific version
+                            sh "docker pull ${imagePath}:${version}"
+                            
+                            // Tag as latest
+                            sh "docker tag ${imagePath}:${version} ${imagePath}:latest"
+                            
+                            // Push latest tag
+                            sh "docker push ${imagePath}:latest"
+                            
+                            echo "  ✅ ${app}:latest now points to ${version}"
+                            
+                            // Clean up local images
+                            sh """
+                                docker rmi ${imagePath}:${version} 2>/dev/null || true
+                                docker rmi ${imagePath}:latest 2>/dev/null || true
+                            """
+                        }
+                    }
+                    
+                    parallel updateJobs
+                    
+                    // Logout
+                    sh "docker logout ${env.DOCKER_REGISTRY}"
+                    
+                    echo "\n✅ All 'latest' tags updated successfully"
+                }
+            }
+        }
+        
+        // ================================================================================
+        // STAGE 6: Deploy to Production
+        // ================================================================================
+        stage('Deploy to Production') {
+            steps {
+                script {
+                    echo "🚀 Deploying to production environment..."
+                    
+                    def deployConfig = readYaml file: 'deployment-versions.yaml'
+                    
+                    deployConfig.production.each { app, version ->
+                        echo "\n  Deploying ${app}:${version}..."
+                        
+                        def imagePath = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}:latest"
+                        
+                        // Example deployment - adjust based on your infrastructure
+                        
+                        // Option 1: Docker Swarm
+                        /*
+                        sh """
+                            docker service update \
+                                --image ${imagePath} \
+                                ${app}-service || \
+                            docker service create \
+                                --name ${app}-service \
+                                --replicas 2 \
+                                ${imagePath}
+                        """
+                        */
+                        
+                        // Option 2: Kubernetes
+                        /*
+                        sh """
+                            kubectl set image deployment/${app} ${app}=${imagePath} \
+                                --namespace=production
+                        """
+                        */
+                        
+                        // Option 3: Docker Compose
+                        /*
+                        sh """
+                            docker-compose pull ${app}
+                            docker-compose up -d ${app}
+                        """
+                        */
+                        
+                        // Option 4: Direct Docker run (for testing)
+                        sh """
+                            docker stop ${app} 2>/dev/null || true
+                            docker rm ${app} 2>/dev/null || true
+                            docker run -d --name ${app} --restart=unless-stopped ${imagePath}
+                        """
+                        
+                        echo "  ✅ ${app} deployed"
+                    }
+                    
+                    echo "\n✅ All applications deployed successfully"
+                }
+            }
+        }
+        
+        // ================================================================================
+        // STAGE 7: Health Checks
+        // ================================================================================
+        stage('Health Checks') {
+            when {
+                expression { params.RUN_HEALTH_CHECKS == true }
+            }
+            steps {
+                script {
+                    echo "🏥 Running health checks..."
+                    
+                    def deployConfig = readYaml file: 'deployment-versions.yaml'
+                    def healthStatus = [:]
+                    def failedChecks = []
+                    
+                    // Wait for services to stabilize
+                    echo "  Waiting 15 seconds for services to stabilize..."
+                    sleep(time: 15, unit: 'SECONDS')
+                    
+                    deployConfig.production.each { app, version ->
+                        echo "\n  Checking ${app}..."
+                        
+                        // Adjust health check based on your application
+                        // Example: Check if container is running
+                        def containerStatus = sh(
+                            script: "docker ps --filter name=${app} --format '{{.Status}}' | head -1",
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (containerStatus && containerStatus.contains('Up')) {
+                            echo "    ✅ ${app} - Container running: ${containerStatus}"
+                            healthStatus[app] = 'healthy'
+                        } else {
+                            echo "    ❌ ${app} - Container not running or unhealthy"
+                            healthStatus[app] = 'unhealthy'
+                            failedChecks.add(app)
+                        }
+                        
+                        // Additional health check via HTTP (if applicable)
+                        /*
+                        def httpStatus = sh(
+                            script: """
+                                curl -s -o /dev/null -w "%{http_code}" \
+                                     http://localhost:${app_port}/health || echo "000"
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (httpStatus == "200") {
+                            echo "    ✅ HTTP health check passed"
+                        } else {
+                            echo "    ⚠️ HTTP health check returned: ${httpStatus}"
+                        }
+                        */
+                    }
+                    
+                    if (failedChecks.size() > 0) {
+                        error("""
+                        ❌ Health checks failed for:
+                        ${failedChecks.join('\n')}
+                        
+                        Please check the application logs for details.
+                        """)
+                    }
+                    
+                    echo "\n✅ All health checks passed"
+                }
+            }
+        }
+        
+        // ================================================================================
+        // STAGE 8: Record Deployment
+        // ================================================================================
+        stage('Record Deployment') {
+            steps {
+                script {
+                    echo "📝 Recording deployment information..."
+                    
+                    def deployConfig = readYaml file: 'deployment-versions.yaml'
+                    
+                    // Create deployment record
+                    def deploymentInfo = [
+                        timestamp: new Date().format("yyyy-MM-dd HH:mm:ss"),
+                        build_number: env.BUILD_NUMBER,
+                        deployed_by: env.BUILD_USER ?: 'Jenkins',
+                        branch: env.GIT_BRANCH_NAME,
+                        versions: deployConfig.production,
+                        git_commit: sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                    ]
+                    
+                    // Write deployment record
+                    def recordFile = "deployment-record-${env.BUILD_NUMBER}.yaml"
+                    writeYaml file: recordFile, data: deploymentInfo
+                    
+                    // Archive the deployment record
+                    archiveArtifacts artifacts: recordFile, fingerprint: true
+                    
+                    // Upload to Artifactory metadata
+                    sh """
+                        curl -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
+                             -T ${recordFile} \
+                             "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.BUILD_MANIFESTS_PATH}/deployments/deployment-${env.BUILD_NUMBER}.yaml"
+                    """
+                    
+                    // Display deployment summary
+                    echo """
+                    
+                    ╔════════════════════════════════════════╗
+                    ║      DEPLOYMENT SUCCESSFUL             ║
+                    ╠════════════════════════════════════════╣
+                    ║ Build:     #${env.BUILD_NUMBER}
+                    ║ Timestamp: ${deploymentInfo.timestamp}
+                    ║ By:        ${deploymentInfo.deployed_by}
+                    ║ Branch:    ${env.GIT_BRANCH_NAME}
+                    ║ Commit:    ${deploymentInfo.git_commit.take(8)}
+                    ╠════════════════════════════════════════╣
+                    ║ Deployed Versions:
+                    """
+                    
+                    deployConfig.production.each { app, version ->
+                        echo "║   • ${app}: ${version}"
+                    }
+                    
+                    echo """╚════════════════════════════════════════╝
+                    
+                    Deployment record saved to: ${recordFile}
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                echo """
+                ========================================
+                ✅ DEPLOYMENT COMPLETED SUCCESSFULLY
+                ========================================
+                All applications have been deployed to production.
+                Check the deployment record for details.
+                """
+                
+                // Optional: Send notification
+                // slackSend(channel: '#deployments', color: 'good', 
+                //          message: "Production deployment #${env.BUILD_NUMBER} completed successfully")
+            }
+        }
+        
+        failure {
+            script {
+                echo """
+                ========================================
+                ❌ DEPLOYMENT FAILED
+                ========================================
+                The deployment has failed. Please check the logs above for details.
+                
+                ROLLBACK INSTRUCTIONS:
+                1. Revert deployment-versions.yaml to previous version
+                2. Re-run this deployment job
+                3. Check application logs for errors
+                """
+                
+                // Optional: Send notification
+                // slackSend(channel: '#deployments', color: 'danger',
+                //          message: "Production deployment #${env.BUILD_NUMBER} FAILED! Immediate attention required.")
+            }
+        }
+        
+        always {
+            // Cleanup
+            sh """
+                docker logout ${env.DOCKER_REGISTRY} 2>/dev/null || true
+                docker system prune -f 2>/dev/null || true
+            """
+            
+            // Clean workspace
+            deleteDir()
+        }
+    }
+}

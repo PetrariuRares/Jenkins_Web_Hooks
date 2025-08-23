@@ -1,0 +1,26 @@
+# File location: /deployment-versions.yaml (root of repo)
+# This file controls which versions are deployed to production
+# Any version listed here is protected from cleanup
+
+# Production versions - these will NEVER be deleted by cleanup
+production:
+  app1: "1.2.7"
+  app2: "1.1.0"
+  app3-ml-engine: "1.0.0"
+
+# Configuration settings for pipelines
+config:
+  # Artifactory settings
+  docker_registry: "trialqlk1tc.jfrog.io"
+  docker_repo: "dockertest-docker"
+  docker_latest_path: "docker-latest"
+  docker_dev_path: "docker-dev"
+  
+  # Metadata paths in Artifactory
+  metadata_path: "metadata"
+  build_manifests_path: "metadata/build-manifests"      # Production build manifests
+  temp_builds_path: "metadata/temporary-builds"         # Dev/feature build manifests
+  
+  # Cleanup settings
+  dev_retention_days: 14                                # Days to keep dev images
+  latest_versions_to_keep: 10                           # Number of versions to keep per app in docker-latest
