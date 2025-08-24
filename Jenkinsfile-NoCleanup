@@ -1411,9 +1411,9 @@ def validateCleanupConfig() {
     return true
 }
 
-// Test Artifactory connectivity
+// Test Artifactory connectivity and API endpoints
 def testArtifactoryConnectivity() {
-    echo "[CLEANUP] Testing Artifactory connectivity..."
+    echo "[CLEANUP] Testing Artifactory connectivity and API endpoints..."
 
     withCredentials([usernamePassword(
         credentialsId: 'artifactory-credentials',
@@ -1421,16 +1421,41 @@ def testArtifactoryConnectivity() {
         passwordVariable: 'ARTIFACTORY_PASS'
     )]) {
         try {
+            // Test 1: Basic connectivity
             def testUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/system/ping"
             def result = makeHttpCall(testUrl, 'GET', 1)
 
             if (result.success) {
                 echo "[CLEANUP] ✅ Artifactory connectivity test passed"
-                return true
             } else {
                 echo "[CLEANUP] ❌ Artifactory connectivity test failed: ${result.error}"
                 return false
             }
+
+            // Test 2: Repository access
+            def repoUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/repositories/${env.DOCKER_REPO}"
+            def repoResult = makeHttpCall(repoUrl, 'GET', 1)
+
+            if (repoResult.success) {
+                echo "[CLEANUP] ✅ Repository access test passed"
+            } else {
+                echo "[CLEANUP] ⚠ Repository access test failed: ${repoResult.error}"
+                echo "[CLEANUP] This might affect cleanup operations"
+            }
+
+            // Test 3: Storage API access
+            def storageUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}"
+            def storageResult = makeHttpCall(storageUrl, 'GET', 1)
+
+            if (storageResult.success) {
+                echo "[CLEANUP] ✅ Storage API access test passed"
+            } else {
+                echo "[CLEANUP] ⚠ Storage API access test failed: ${storageResult.error}"
+                echo "[CLEANUP] This might affect file existence checks"
+            }
+
+            return true
+
         } catch (Exception e) {
             echo "[CLEANUP] ❌ Artifactory connectivity test exception: ${e.message}"
             return false
@@ -1583,6 +1608,7 @@ def getArtifactoryFileInfo(artifactoryPath, maxRetries = 3) {
 
 // Delete path from Artifactory (file or folder)
 def deleteArtifactoryPath(artifactoryPath, recursive = false, maxRetries = 3) {
+    // Use the correct Artifactory delete API endpoint
     def url = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${artifactoryPath}"
     if (recursive) {
         url += "?recursive=1"
@@ -1592,6 +1618,19 @@ def deleteArtifactoryPath(artifactoryPath, recursive = false, maxRetries = 3) {
     echo "    🌐 DELETE URL: ${url}"
 
     def result = makeHttpCall(url, 'DELETE', maxRetries)
+
+    // If DELETE fails with 404, try alternative approach
+    if (!result.success && result.httpStatus == '404') {
+        echo "    🔄 Trying alternative delete approach..."
+        // Try using the storage API endpoint for deletion
+        def altUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${artifactoryPath}"
+        if (recursive) {
+            altUrl += "?recursive=1"
+        }
+        echo "    🌐 Alternative DELETE URL: ${altUrl}"
+        result = makeHttpCall(altUrl, 'DELETE', maxRetries)
+    }
+
     return result
 }
 
@@ -1655,6 +1694,12 @@ def getActiveBranches() {
             if (env.GIT_BRANCH_NAME && env.GIT_BRANCH_NAME != 'unknown') {
                 activeBranches.add(env.GIT_BRANCH_NAME)
                 echo "    📋 Added current branch from Jenkins env: ${env.GIT_BRANCH_NAME}"
+            }
+
+            // Also try to get branch from Jenkins build variables
+            if (env.BRANCH_NAME && env.BRANCH_NAME != env.GIT_BRANCH_NAME) {
+                activeBranches.add(env.BRANCH_NAME)
+                echo "    📋 Added branch from BRANCH_NAME env: ${env.BRANCH_NAME}"
             }
         } catch (Exception e) {
             echo "    ⚠ Could not get branch from Jenkins env: ${e.message}"
@@ -2203,6 +2248,9 @@ def cleanupTempManifests() {
                             echo "[CLEANUP] 🧪 [DRY RUN] Would delete ${fileInfo.fullPath} (${deleteReason})"
                         } else {
                             echo "[CLEANUP] Attempting to delete ${fileInfo.fullPath} (${deleteReason})..."
+                            echo "[CLEANUP] 🔍 Debug - Full path: ${fileInfo.fullPath}"
+                            echo "[CLEANUP] 🔍 Debug - Filename: ${fileInfo.filename}"
+                            echo "[CLEANUP] 🔍 Debug - Repository: ${env.DOCKER_REPO}"
 
                             // First check if the file exists
                             def existsCheck = checkArtifactoryPathExists(fileInfo.fullPath)
@@ -2224,6 +2272,7 @@ def cleanupTempManifests() {
                                 } else {
                                     echo "[CLEANUP] ❌ Failed to delete ${fileInfo.fullPath}: ${deleteResult.error}"
                                     echo "[CLEANUP] HTTP Status: ${deleteResult.httpStatus}"
+                                    echo "[CLEANUP] Response: ${deleteResult.response}"
                                 }
                             }
                         }
