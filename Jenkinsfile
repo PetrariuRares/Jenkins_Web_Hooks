@@ -346,7 +346,7 @@ pipeline {
         }
 
         // ================================================================================
-        // STAGE 4: Detect Changes
+        // STAGE 4: Detect Changes (FIXED FOR FEATURE BRANCHES)
         // ================================================================================
         stage('Detect Changes') {
             when {
@@ -366,6 +366,13 @@ pipeline {
                     def pythonApps = env.VALIDATED_APPS.split(',')
                     def changedApps = []
                     
+                    // Determine if this is main branch
+                    def isMainBranch = (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master')
+                    echo "[INFO] Branch type: ${isMainBranch ? 'MAIN BRANCH' : 'FEATURE BRANCH'}"
+                    echo "[INFO] Branch name: ${env.GIT_BRANCH_NAME}"
+                    echo "[INFO] Detection strategy: ${isMainBranch ? 'Build if changed OR new version' : 'Build ONLY if changed'}"
+                    echo ""
+                    
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
                         usernameVariable: 'ARTIFACTORY_USER',
@@ -377,19 +384,31 @@ pipeline {
                             def needsBuild = false
                             def reason = ""
                             
+                            echo "[ANALYZING] ${app}..."
+                            
                             // For force build, always rebuild
                             if (params.FORCE_BUILD) {
                                 needsBuild = true
-                                reason = "Force build requested"
+                                reason = "Force build requested by user"
                             } else {
-                                // Check for file changes using improved logic
+                                // Check for file changes using existing function
                                 def changedFiles = checkAppChangedFiles(app)
                                 
                                 // Filter out README-only changes
                                 def significantChanges = changedFiles.findAll { !it.endsWith('README.md') }
                                 def hasSignificantChanges = significantChanges.size() > 0
 
-                                // Determine the image tag and path
+                                // Show what changed
+                                if (hasSignificantChanges) {
+                                    echo "  Files changed in ${app}:"
+                                    significantChanges.each { file ->
+                                        echo "    - ${file}"
+                                    }
+                                } else {
+                                    echo "  No significant changes in ${app}"
+                                }
+
+                                // Determine the image tag
                                 def imageTag = ''
                                 def imageName = ''
 
@@ -407,6 +426,8 @@ pipeline {
                                     imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}:${imageTag}"
                                 }
 
+                                echo "  Image tag: ${imageTag}"
+
                                 // Check if image already exists in Artifactory
                                 def imageExists = bat(
                                     script: "docker pull ${imageName} >nul 2>&1",
@@ -414,44 +435,62 @@ pipeline {
                                 ) == 0
 
                                 if (imageExists) {
+                                    echo "  Image exists: YES"
                                     bat "docker rmi ${imageName} 2>nul || exit 0"
+                                } else {
+                                    echo "  Image exists: NO"
                                 }
 
-                                // Simplified decision logic
-                                if (hasSignificantChanges || !imageExists) {
-                                    needsBuild = true
-                                    reason = hasSignificantChanges ? 
-                                        "Files changed (${significantChanges.size()} files)" : 
-                                        "New version/tag: ${imageTag}"
+                                // ===== FIXED DECISION LOGIC =====
+                                if (isMainBranch) {
+                                    // MAIN BRANCH: Build if files changed OR image doesn't exist (new version)
+                                    if (hasSignificantChanges) {
+                                        needsBuild = true
+                                        reason = "Files changed (${significantChanges.size()} files modified)"
+                                    } else if (!imageExists) {
+                                        needsBuild = true
+                                        reason = "New version ${imageTag} needs to be built"
+                                    } else {
+                                        needsBuild = false
+                                        reason = "No changes and image already exists"
+                                    }
                                 } else {
-                                    needsBuild = false
-                                    reason = "No changes and image exists"
+                                    // FEATURE BRANCH: ONLY build if files actually changed
+                                    // We DON'T care if the image exists or not!
+                                    if (hasSignificantChanges) {
+                                        needsBuild = true
+                                        reason = "Files changed (${significantChanges.size()} files modified)"
+                                    } else {
+                                        needsBuild = false
+                                        reason = "No changes in ${app} - skipping build on feature branch"
+                                    }
                                 }
                             }
                             
+                            // Final decision
                             if (needsBuild) {
-                                echo "[BUILD NEEDED] ${app}: ${reason}"
+                                echo "  ✓ [BUILD NEEDED] ${app}: ${reason}"
                                 changedApps.add(app)
                             } else {
-                                echo "[SKIP] ${app}: ${reason}"
+                                echo "  ✗ [SKIP] ${app}: ${reason}"
                             }
+                            echo ""
                         }
                         
                         bat "docker logout ${env.DOCKER_REGISTRY}"
                     }
                     
+                    // Summary
+                    echo "========================================="
                     if (changedApps.size() > 0) {
                         env.APPS_TO_BUILD = changedApps.join(',')
                         env.HAS_CHANGES = 'true'
-                        echo "========================================="
-                        echo "[BUILD LIST] Applications to build: ${env.APPS_TO_BUILD}"
-                        echo "========================================="
+                        echo "[RESULT] Will build ${changedApps.size()} app(s): ${env.APPS_TO_BUILD}"
                     } else {
                         env.HAS_CHANGES = 'false'
-                        echo "========================================="
                         echo "[RESULT] No applications need building"
-                        echo "========================================="
                     }
+                    echo "========================================="
                 }
             }
         }
@@ -776,15 +815,13 @@ def checkAppChangedFiles(appDir) {
         
         // First build or no previous commit
         if (!env.GIT_PREVIOUS_COMMIT || env.GIT_PREVIOUS_COMMIT == "") {
-            echo "  First build detected for ${appDir}"
+            echo "    Note: First build or no previous commit"
             return ['first-build']
         }
         
-        // Get the last successful commit (Windows)
-        def lastSuccessfulCommit = env.GIT_PREVIOUS_COMMIT
-        
+        // Get changes from previous commit
         def diffOutput = bat(
-            script: "@git diff --name-only ${lastSuccessfulCommit}...${env.GIT_COMMIT_HASH} -- ${appDir}/ 2>nul || echo \"\"",
+            script: "@git diff --name-only HEAD~1...HEAD -- ${appDir}/ 2>nul || echo \"\"",
             returnStdout: true
         ).trim()
         
@@ -792,16 +829,19 @@ def checkAppChangedFiles(appDir) {
             diffOutput.split('\r?\n').each { file ->
                 if (file && file.trim()) {
                     changedFiles.add(file)
-                    echo "    Changed: ${file}"
                 }
             }
         }
         
+        if (changedFiles.isEmpty()) {
+            echo "    No files changed since last commit"
+        }
+        
         return changedFiles
     } catch (Exception e) {
-        echo "  Error detecting changes: ${e.message}"
-        // If we can't determine changes, return non-empty to trigger build
-        return ['unknown']
+        echo "    Warning: Error detecting changes: ${e.message}"
+        // If we can't determine changes, assume changed to be safe
+        return ['unknown-assuming-changed']
     }
 }
 

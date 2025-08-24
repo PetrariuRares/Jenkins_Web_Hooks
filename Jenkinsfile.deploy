@@ -1,5 +1,6 @@
 // File location: /Jenkinsfile.deploy (root of repo)
 // This pipeline is for MANUAL deployment only - no automatic triggers
+// WINDOWS VERSION - Compatible with Windows Jenkins
 
 pipeline {
     agent any
@@ -69,9 +70,9 @@ pipeline {
             steps {
                 checkout scm
                 script {
-                    // Get current branch
-                    env.GIT_BRANCH_NAME = sh(
-                        script: 'git rev-parse --abbrev-ref HEAD',
+                    // Get current branch (Windows)
+                    env.GIT_BRANCH_NAME = bat(
+                        script: '@git rev-parse --abbrev-ref HEAD',
                         returnStdout: true
                     ).trim()
                     
@@ -138,14 +139,14 @@ pipeline {
                     deployConfig.production.each { app, version ->
                         echo "\n  Checking ${app}:${version}..."
                         
-                        // Check if image exists using Docker registry API
+                        // Check if image exists using Docker registry API (Windows curl)
                         def checkUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_LATEST_PATH}/${app}/manifests/${version}"
                         
-                        def exists = sh(
+                        def exists = bat(
                             script: """
-                                curl -s -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
-                                     -X GET "${checkUrl}" \
-                                     -o /dev/null -w "%{http_code}"
+                                @curl -s -u %ARTIFACTORY_CREDS_USR%:%ARTIFACTORY_CREDS_PSW% ^
+                                     -X GET "${checkUrl}" ^
+                                     -o nul -w "%%{http_code}"
                             """,
                             returnStdout: true
                         ).trim()
@@ -186,10 +187,10 @@ pipeline {
                     
                     def deployConfig = readYaml file: 'deployment-versions.yaml'
                     
-                    // Login to Docker registry
-                    sh """
-                        echo ${ARTIFACTORY_CREDS_PSW} | docker login ${env.DOCKER_REGISTRY} \
-                            -u ${ARTIFACTORY_CREDS_USR} --password-stdin
+                    // Login to Docker registry (Windows)
+                    bat """
+                        echo %ARTIFACTORY_CREDS_PSW% | docker login %DOCKER_REGISTRY% ^
+                            -u %ARTIFACTORY_CREDS_USR% --password-stdin
                     """
                     
                     def updateJobs = [:]
@@ -201,20 +202,20 @@ pipeline {
                             def imagePath = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}"
                             
                             // Pull the specific version
-                            sh "docker pull ${imagePath}:${version}"
+                            bat "docker pull ${imagePath}:${version}"
                             
                             // Tag as latest
-                            sh "docker tag ${imagePath}:${version} ${imagePath}:latest"
+                            bat "docker tag ${imagePath}:${version} ${imagePath}:latest"
                             
                             // Push latest tag
-                            sh "docker push ${imagePath}:latest"
+                            bat "docker push ${imagePath}:latest"
                             
                             echo "  ✅ ${app}:latest now points to ${version}"
                             
-                            // Clean up local images
-                            sh """
-                                docker rmi ${imagePath}:${version} 2>/dev/null || true
-                                docker rmi ${imagePath}:latest 2>/dev/null || true
+                            // Clean up local images (Windows)
+                            bat """
+                                docker rmi ${imagePath}:${version} 2>nul || exit 0
+                                docker rmi ${imagePath}:latest 2>nul || exit 0
                             """
                         }
                     }
@@ -222,7 +223,7 @@ pipeline {
                     parallel updateJobs
                     
                     // Logout
-                    sh "docker logout ${env.DOCKER_REGISTRY}"
+                    bat "docker logout %DOCKER_REGISTRY%"
                     
                     echo "\n✅ All 'latest' tags updated successfully"
                 }
@@ -246,39 +247,39 @@ pipeline {
                         
                         // Example deployment - adjust based on your infrastructure
                         
-                        // Option 1: Docker Swarm
+                        // Option 1: Docker Swarm (Windows)
                         /*
-                        sh """
-                            docker service update \
-                                --image ${imagePath} \
-                                ${app}-service || \
-                            docker service create \
-                                --name ${app}-service \
-                                --replicas 2 \
+                        bat """
+                            docker service update ^
+                                --image ${imagePath} ^
+                                ${app}-service || ^
+                            docker service create ^
+                                --name ${app}-service ^
+                                --replicas 2 ^
                                 ${imagePath}
                         """
                         */
                         
-                        // Option 2: Kubernetes
+                        // Option 2: Kubernetes (Windows)
                         /*
-                        sh """
-                            kubectl set image deployment/${app} ${app}=${imagePath} \
+                        bat """
+                            kubectl set image deployment/${app} ${app}=${imagePath} ^
                                 --namespace=production
                         """
                         */
                         
-                        // Option 3: Docker Compose
+                        // Option 3: Docker Compose (Windows)
                         /*
-                        sh """
+                        bat """
                             docker-compose pull ${app}
                             docker-compose up -d ${app}
                         """
                         */
                         
-                        // Option 4: Direct Docker run (for testing)
-                        sh """
-                            docker stop ${app} 2>/dev/null || true
-                            docker rm ${app} 2>/dev/null || true
+                        // Option 4: Direct Docker run (for testing) - Windows
+                        bat """
+                            docker stop ${app} 2>nul || exit 0
+                            docker rm ${app} 2>nul || exit 0
                             docker run -d --name ${app} --restart=unless-stopped ${imagePath}
                         """
                         
@@ -312,12 +313,16 @@ pipeline {
                     deployConfig.production.each { app, version ->
                         echo "\n  Checking ${app}..."
                         
-                        // Adjust health check based on your application
-                        // Example: Check if container is running
-                        def containerStatus = sh(
-                            script: "docker ps --filter name=${app} --format '{{.Status}}' | head -1",
-                            returnStdout: true
-                        ).trim()
+                        // Check if container is running (Windows)
+                        def containerStatus = ''
+                        try {
+                            containerStatus = bat(
+                                script: "@docker ps --filter name=${app} --format \"{{.Status}}\" 2>nul",
+                                returnStdout: true
+                            ).trim()
+                        } catch (Exception e) {
+                            containerStatus = ''
+                        }
                         
                         if (containerStatus && containerStatus.contains('Up')) {
                             echo "    ✅ ${app} - Container running: ${containerStatus}"
@@ -328,12 +333,12 @@ pipeline {
                             failedChecks.add(app)
                         }
                         
-                        // Additional health check via HTTP (if applicable)
+                        // Additional health check via HTTP (if applicable) - Windows
                         /*
-                        def httpStatus = sh(
+                        def httpStatus = bat(
                             script: """
-                                curl -s -o /dev/null -w "%{http_code}" \
-                                     http://localhost:${app_port}/health || echo "000"
+                                @curl -s -o nul -w "%%{http_code}" ^
+                                     http://localhost:8080/health || echo 000
                             """,
                             returnStdout: true
                         ).trim()
@@ -370,6 +375,12 @@ pipeline {
                     
                     def deployConfig = readYaml file: 'deployment-versions.yaml'
                     
+                    // Get git commit (Windows)
+                    def gitCommit = bat(
+                        script: '@git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
+                    
                     // Create deployment record
                     def deploymentInfo = [
                         timestamp: new Date().format("yyyy-MM-dd HH:mm:ss"),
@@ -377,7 +388,7 @@ pipeline {
                         deployed_by: env.BUILD_USER ?: 'Jenkins',
                         branch: env.GIT_BRANCH_NAME,
                         versions: deployConfig.production,
-                        git_commit: sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                        git_commit: gitCommit
                     ]
                     
                     // Write deployment record
@@ -387,10 +398,10 @@ pipeline {
                     // Archive the deployment record
                     archiveArtifacts artifacts: recordFile, fingerprint: true
                     
-                    // Upload to Artifactory metadata
-                    sh """
-                        curl -u ${ARTIFACTORY_CREDS_USR}:${ARTIFACTORY_CREDS_PSW} \
-                             -T ${recordFile} \
+                    // Upload to Artifactory metadata (Windows curl)
+                    bat """
+                        curl -u %ARTIFACTORY_CREDS_USR%:%ARTIFACTORY_CREDS_PSW% ^
+                             -T ${recordFile} ^
                              "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.BUILD_MANIFESTS_PATH}/deployments/deployment-${env.BUILD_NUMBER}.yaml"
                     """
                     
@@ -404,7 +415,7 @@ pipeline {
                     ║ Timestamp: ${deploymentInfo.timestamp}
                     ║ By:        ${deploymentInfo.deployed_by}
                     ║ Branch:    ${env.GIT_BRANCH_NAME}
-                    ║ Commit:    ${deploymentInfo.git_commit.take(8)}
+                    ║ Commit:    ${gitCommit.take(8)}
                     ╠════════════════════════════════════════╣
                     ║ Deployed Versions:
                     """
@@ -460,14 +471,20 @@ pipeline {
         }
         
         always {
-            // Cleanup
-            sh """
-                docker logout ${env.DOCKER_REGISTRY} 2>/dev/null || true
-                docker system prune -f 2>/dev/null || true
-            """
-            
-            // Clean workspace
-            deleteDir()
+            script {
+                // Cleanup (Windows compatible)
+                try {
+                    bat """
+                        docker logout %DOCKER_REGISTRY% 2>nul || exit 0
+                        docker system prune -f 2>nul || exit 0
+                    """
+                } catch (Exception e) {
+                    echo "Cleanup error (non-critical): ${e.message}"
+                }
+                
+                // Clean workspace
+                deleteDir()
+            }
         }
     }
 }
