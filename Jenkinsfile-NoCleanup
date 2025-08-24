@@ -955,7 +955,6 @@ def makeHttpCall(url, method = 'GET', maxRetries = 3, retryDelay = 5) {
                         error: "Resource not found (${httpStatus})"
                     ]
                 }
-            }
             } else if (httpStatus == '401' || httpStatus == '403') {
                 // Authentication/authorization error - don't retry
                 echo "    ❌ HTTP ${method} authentication error: ${httpStatus}"
