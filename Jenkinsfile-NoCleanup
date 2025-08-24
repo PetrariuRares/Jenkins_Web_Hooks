@@ -926,7 +926,7 @@ def makeHttpCall(url, method = 'GET', maxRetries = 3, retryDelay = 5) {
                 response.split('HTTPSTATUS:')[0] : response
 
             // Check if this is a successful response
-            if (httpStatus.startsWith('2') || httpStatus == '404') {
+            if (httpStatus.startsWith('2')) {
                 echo "    ✅ HTTP ${method} success: ${httpStatus}"
                 return [
                     success: true,
@@ -934,6 +934,28 @@ def makeHttpCall(url, method = 'GET', maxRetries = 3, retryDelay = 5) {
                     response: responseBody,
                     attempt: attempt
                 ]
+            } else if (httpStatus == '404') {
+                // 404 for DELETE means file was already deleted or doesn't exist
+                if (method == 'DELETE') {
+                    echo "    ℹ️ HTTP ${method} file not found: ${httpStatus} (already deleted or doesn't exist)"
+                    return [
+                        success: true,
+                        httpStatus: httpStatus,
+                        response: responseBody,
+                        attempt: attempt,
+                        alreadyDeleted: true
+                    ]
+                } else {
+                    echo "    ❌ HTTP ${method} not found: ${httpStatus}"
+                    return [
+                        success: false,
+                        httpStatus: httpStatus,
+                        response: responseBody,
+                        attempt: attempt,
+                        error: "Resource not found (${httpStatus})"
+                    ]
+                }
+            }
             } else if (httpStatus == '401' || httpStatus == '403') {
                 // Authentication/authorization error - don't retry
                 echo "    ❌ HTTP ${method} authentication error: ${httpStatus}"
@@ -1567,8 +1589,25 @@ def deleteArtifactoryPath(artifactoryPath, recursive = false, maxRetries = 3) {
         url += "?recursive=1"
     }
 
+    echo "    🗑️ Attempting to delete: ${artifactoryPath}"
+    echo "    🌐 DELETE URL: ${url}"
+
     def result = makeHttpCall(url, 'DELETE', maxRetries)
     return result
+}
+
+// Check if path exists in Artifactory before deletion
+def checkArtifactoryPathExists(artifactoryPath, maxRetries = 1) {
+    def url = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${artifactoryPath}"
+    def result = makeHttpCall(url, 'GET', maxRetries)
+
+    if (result.success) {
+        return [exists: true, info: result.response]
+    } else if (result.httpStatus == '404') {
+        return [exists: false, info: "Path not found"]
+    } else {
+        return [exists: false, info: "Error checking path: ${result.error}"]
+    }
 }
 
 // Get list of Docker tags for an application
@@ -2110,6 +2149,12 @@ def cleanupTempManifests() {
 
             // Step 3: Get metadata files using AQL
             echo "\n[CLEANUP] Step 3: Processing metadata files using AQL..."
+
+            // Debug: List what's actually in the metadata path
+            if (params.DRY_RUN_CLEANUP) {
+                debugListArtifactoryPath(env.TEMP_BUILDS_PATH)
+            }
+
             def metadataResult = getMetadataFilesAQL(env.TEMP_BUILDS_PATH)
 
             if (!metadataResult.success) {
@@ -2158,14 +2203,29 @@ def cleanupTempManifests() {
                         if (params.DRY_RUN_CLEANUP) {
                             echo "[CLEANUP] 🧪 [DRY RUN] Would delete ${fileInfo.fullPath} (${deleteReason})"
                         } else {
-                            echo "[CLEANUP] Deleting ${fileInfo.fullPath} (${deleteReason})..."
-                            def deleteResult = deleteArtifactoryPath(fileInfo.fullPath)
+                            echo "[CLEANUP] Attempting to delete ${fileInfo.fullPath} (${deleteReason})..."
 
-                            if (deleteResult.success) {
-                                echo "[CLEANUP] ✅ Deleted ${fileInfo.fullPath}"
+                            // First check if the file exists
+                            def existsCheck = checkArtifactoryPathExists(fileInfo.fullPath)
+                            if (!existsCheck.exists) {
+                                echo "[CLEANUP] ℹ️ ${fileInfo.fullPath} doesn't exist (${existsCheck.info})"
+                                // Still count as "deleted" since the goal is achieved
                                 totalDeleted++
                             } else {
-                                echo "[CLEANUP] ❌ Failed to delete ${fileInfo.fullPath}: ${deleteResult.error}"
+                                echo "[CLEANUP] ✅ File exists, proceeding with deletion..."
+                                def deleteResult = deleteArtifactoryPath(fileInfo.fullPath)
+
+                                if (deleteResult.success) {
+                                    if (deleteResult.alreadyDeleted) {
+                                        echo "[CLEANUP] ℹ️ ${fileInfo.fullPath} was already deleted during operation"
+                                    } else {
+                                        echo "[CLEANUP] ✅ Successfully deleted ${fileInfo.fullPath}"
+                                    }
+                                    totalDeleted++
+                                } else {
+                                    echo "[CLEANUP] ❌ Failed to delete ${fileInfo.fullPath}: ${deleteResult.error}"
+                                    echo "[CLEANUP] HTTP Status: ${deleteResult.httpStatus}"
+                                }
                             }
                         }
                     } else {
@@ -2187,6 +2247,27 @@ def cleanupTempManifests() {
             echo "[CLEANUP] ❌ Error during metadata cleanup: ${e.message}"
             throw e
         }
+    }
+}
+
+// Debug function to list what's actually in a path
+def debugListArtifactoryPath(artifactoryPath) {
+    echo "[DEBUG] Listing contents of: ${artifactoryPath}"
+
+    def aqlQuery = """items.find({
+    "repo": "${env.DOCKER_REPO}",
+    "path": {"\$match": "${artifactoryPath}*"}
+}).include("path", "name", "type", "size", "created").limit(20)"""
+
+    def result = executeAQL(aqlQuery)
+
+    if (result.success) {
+        echo "[DEBUG] Found ${result.results.size()} items:"
+        result.results.each { item ->
+            echo "[DEBUG] - ${item.type}: ${item.path}/${item.name} (${item.size} bytes, created: ${item.created})"
+        }
+    } else {
+        echo "[DEBUG] Failed to list contents: ${result.error}"
     }
 }
 
