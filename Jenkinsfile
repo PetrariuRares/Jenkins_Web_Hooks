@@ -32,6 +32,11 @@ pipeline {
             defaultValue: false,
             description: 'Perform cleanup in dry-run mode (show what would be deleted without actually deleting)'
         )
+        booleanParam(
+            name: 'AUTO_CLEANUP_AFTER_BUILD',
+            defaultValue: true,
+            description: 'Automatically run cleanup after successful builds to remove orphaned images'
+        )
     }
 
     triggers {
@@ -397,7 +402,9 @@ pipeline {
                             def reason = ""
                             
                             echo "[ANALYZING] ${app}..."
-                            
+                            echo "  Current commit: ${env.GIT_COMMIT_SHORT}"
+                            echo "  Previous commit: ${env.GIT_PREVIOUS_COMMIT ?: 'none'}"
+
                             // For force build, always rebuild
                             if (params.FORCE_BUILD) {
                                 needsBuild = true
@@ -453,7 +460,7 @@ pipeline {
                                     echo "  Image exists: NO"
                                 }
 
-                                // ===== FIXED DECISION LOGIC =====
+                                // ===== IMPROVED DECISION LOGIC =====
                                 if (isMainBranch) {
                                     // MAIN BRANCH: Build if files changed OR image doesn't exist (new version)
                                     if (hasSignificantChanges) {
@@ -467,11 +474,14 @@ pipeline {
                                         reason = "No changes and image already exists"
                                     }
                                 } else {
-                                    // FEATURE BRANCH: ONLY build if files actually changed
-                                    // We DON'T care if the image exists or not!
-                                    if (hasSignificantChanges) {
+                                    // FEATURE BRANCH: Build if files changed AND image doesn't exist
+                                    // This prevents rebuilding the same commit multiple times
+                                    if (imageExists) {
+                                        needsBuild = false
+                                        reason = "Image already exists for this commit - skipping rebuild"
+                                    } else if (hasSignificantChanges) {
                                         needsBuild = true
-                                        reason = "Files changed (${significantChanges.size()} files modified)"
+                                        reason = "Files changed and image doesn't exist (${significantChanges.size()} files modified)"
                                     } else {
                                         needsBuild = false
                                         reason = "No changes in ${app} - skipping build on feature branch"
@@ -654,6 +664,10 @@ pipeline {
                     expression { env.IS_CLEANUP_RUN == 'true' }
                     expression { params.RUN_CLEANUP == true }
                     expression { params.CLEANUP_BRANCH != '' }
+                    allOf {
+                        expression { params.AUTO_CLEANUP_AFTER_BUILD == true }
+                        expression { env.BUILD_COMPLETE == 'true' }
+                    }
                 }
             }
             steps {
@@ -699,14 +713,18 @@ pipeline {
                             // Clean up specific branch
                             echo "[CLEANUP] Cleaning up specific branch: ${params.CLEANUP_BRANCH}"
                             cleanupSpecificBranch(params.CLEANUP_BRANCH)
+                        } else if (params.AUTO_CLEANUP_AFTER_BUILD && env.BUILD_COMPLETE == 'true') {
+                            // Lightweight cleanup after build - only clean orphaned dev images
+                            echo "[CLEANUP] Running automatic cleanup after build"
+                            cleanupDevImages()
                         } else {
                             // Full cleanup
                             // 1. Cleanup docker-dev repository (branch-aware + time-based)
                             cleanupDevImages()
-                            
+
                             // 2. Cleanup docker-latest repository (keep last N versions per app)
                             cleanupLatestImages()
-                            
+
                             // 3. Cleanup metadata/temporary-builds
                             cleanupTempManifests()
                         }
@@ -833,36 +851,61 @@ pipeline {
 def checkAppChangedFiles(appDir) {
     try {
         def changedFiles = []
-        
-        // First build or no previous commit
-        if (!env.GIT_PREVIOUS_COMMIT || env.GIT_PREVIOUS_COMMIT == "") {
-            echo "    Note: First build or no previous commit"
-            return ['first-build']
-        }
-        
-        // Get changes from previous commit
-        def diffOutput = bat(
-            script: "@git diff --name-only HEAD~1...HEAD -- ${appDir}/ 2>nul || echo \"\"",
-            returnStdout: true
-        ).trim()
-        
-        if (diffOutput) {
-            diffOutput.split('\r?\n').each { file ->
-                if (file && file.trim()) {
-                    changedFiles.add(file)
+
+        // Try multiple methods to detect changes
+        echo "    Detecting changes for ${appDir}..."
+
+        // Method 1: Check if this is a webhook trigger with change information
+        if (currentBuild.changeSets && currentBuild.changeSets.size() > 0) {
+            echo "    Using Jenkins changeset information"
+            currentBuild.changeSets.each { changeSet ->
+                changeSet.items.each { change ->
+                    change.affectedFiles.each { file ->
+                        if (file.path.startsWith("${appDir}/")) {
+                            changedFiles.add(file.path)
+                            echo "      Found changed file: ${file.path}"
+                        }
+                    }
                 }
             }
+            if (changedFiles.size() > 0) {
+                return changedFiles
+            }
         }
-        
-        if (changedFiles.isEmpty()) {
-            echo "    No files changed since last commit"
+
+        // Method 2: Compare with previous commit if available
+        if (env.GIT_PREVIOUS_COMMIT && env.GIT_PREVIOUS_COMMIT != "") {
+            def diffOutput = bat(
+                script: "@git diff --name-only ${env.GIT_PREVIOUS_COMMIT}...HEAD -- ${appDir}/ 2>nul || echo \"\"",
+                returnStdout: true
+            ).trim()
+
+            if (diffOutput) {
+                diffOutput.split('\r?\n').each { file ->
+                    if (file && file.trim()) {
+                        changedFiles.add(file)
+                        echo "      Found changed file: ${file}"
+                    }
+                }
+            }
+
+            if (changedFiles.size() > 0) {
+                return changedFiles
+            } else {
+                echo "    No files changed since previous commit"
+                return []
+            }
         }
-        
-        return changedFiles
+
+        // Method 3: For first builds, return empty array instead of assuming changes
+        // The image existence check will handle whether to build or not
+        echo "    First build or no previous commit - relying on image existence check"
+        return []
+
     } catch (Exception e) {
         echo "    Warning: Error detecting changes: ${e.message}"
-        // If we can't determine changes, assume changed to be safe
-        return ['unknown-assuming-changed']
+        // Return empty array instead of assuming changes - let image existence check decide
+        return []
     }
 }
 
@@ -919,27 +962,56 @@ def cleanupDevImages() {
         passwordVariable: 'ARTIFACTORY_PASS'
     )]) {
         try {
-            // Step 1: Get list of all active Git branches
+            // Step 1: Get list of all active Git branches (improved method)
             echo "\n[CLEANUP] Step 1: Fetching active branches from Git..."
-            bat "git fetch --prune origin 2>nul"
-            
-            def branchOutput = bat(
-                script: '@git branch -r 2>nul',
-                returnStdout: true
-            ).trim()
-            
+
+            // Use multiple methods to ensure we get accurate branch information
+            bat "git remote prune origin 2>nul || exit 0"
+            bat "git fetch --prune origin 2>nul || exit 0"
+
             def activeBranches = []
-            branchOutput.split('\r?\n').each { branch ->
-                if (branch && branch.trim() && !branch.contains('HEAD')) {
-                    // Clean the branch name to match image tag format
-                    def cleanName = branch.trim()
-                        .replace('origin/', '')
-                        .replaceAll('[^a-zA-Z0-9._-]', '-')
-                        .toLowerCase()
-                    activeBranches.add(cleanName)
+
+            // Method 1: Use git ls-remote to get definitive list of remote branches
+            try {
+                def remoteOutput = bat(
+                    script: '@git ls-remote --heads origin 2>nul',
+                    returnStdout: true
+                ).trim()
+
+                echo "[CLEANUP] Using git ls-remote for accurate branch detection"
+                remoteOutput.split('\r?\n').each { line ->
+                    if (line && line.contains('refs/heads/')) {
+                        def branchName = line.split('refs/heads/')[1].trim()
+                        if (branchName) {
+                            // Clean the branch name to match image tag format
+                            def cleanName = branchName
+                                .replaceAll('[^a-zA-Z0-9._-]', '-')
+                                .toLowerCase()
+                            activeBranches.add(cleanName)
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                echo "[CLEANUP] git ls-remote failed: ${e.message}, falling back to git branch -r"
+
+                // Fallback: Use git branch -r
+                def branchOutput = bat(
+                    script: '@git branch -r 2>nul',
+                    returnStdout: true
+                ).trim()
+
+                branchOutput.split('\r?\n').each { branch ->
+                    if (branch && branch.trim() && !branch.contains('HEAD')) {
+                        // Clean the branch name to match image tag format
+                        def cleanName = branch.trim()
+                            .replace('origin/', '')
+                            .replaceAll('[^a-zA-Z0-9._-]', '-')
+                            .toLowerCase()
+                        activeBranches.add(cleanName)
+                    }
                 }
             }
-            
+
             echo "[CLEANUP] Found ${activeBranches.size()} active branches:"
             activeBranches.each { echo "  - ${it}" }
             
