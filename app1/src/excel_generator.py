@@ -1,4 +1,4 @@
-print("This is excel_generator version 1.2.7 Main Branch")
+print("This is excel_generator version 1.2.7 Main")
 
 # #!/usr/bin/env python3
 # """
