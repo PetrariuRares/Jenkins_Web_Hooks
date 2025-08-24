@@ -27,6 +27,26 @@ pipeline {
             defaultValue: false,
             description: 'Send notifications on successful builds (default: failures only)'
         )
+        booleanParam(
+            name: 'DRY_RUN_CLEANUP',
+            defaultValue: false,
+            description: 'Preview cleanup actions without actually deleting anything (for testing)'
+        )
+        string(
+            name: 'CLEANUP_BRANCH',
+            defaultValue: '',
+            description: 'Clean up specific branch only (leave empty for automatic cleanup)'
+        )
+        string(
+            name: 'FORCE_DELETE_APP',
+            defaultValue: '',
+            description: 'Emergency: Force delete entire app from docker-dev (use with caution)'
+        )
+        booleanParam(
+            name: 'SKIP_CLEANUP',
+            defaultValue: false,
+            description: 'Skip automatic cleanup (for debugging purposes only)'
+        )
     }
 
     triggers {
@@ -747,6 +767,112 @@ pipeline {
                 if (params.NOTIFY_ON_SUCCESS) {
                     sendNotification('SUCCESS', successMessage, details)
                 }
+
+                // ================================================================================
+                // AUTOMATIC ARTIFACTORY CLEANUP (runs by default after successful builds)
+                // ================================================================================
+                def cleanupStartTime = System.currentTimeMillis()
+                def cleanupResults = [
+                    success: false,
+                    duration: 0,
+                    devImagesDeleted: 0,
+                    latestVersionsDeleted: 0,
+                    manifestsDeleted: 0,
+                    errors: []
+                ]
+
+                try {
+                    echo "\n========================================="
+                    echo ">>> ARTIFACTORY CLEANUP"
+                    echo "========================================="
+
+                    // Check if cleanup should be skipped
+                    if (params.SKIP_CLEANUP) {
+                        echo "[CLEANUP] ⏭️  SKIPPED - Cleanup disabled via SKIP_CLEANUP parameter"
+                        echo "[CLEANUP] This is intended for debugging purposes only"
+                        echo "[CLEANUP] Re-enable cleanup for production builds"
+                        cleanupResults.success = true
+                        return
+                    }
+
+                    echo "[CLEANUP] Starting automatic cleanup after successful build"
+                    echo "[CLEANUP] Dry run mode: ${params.DRY_RUN_CLEANUP}"
+                    echo "[CLEANUP] Configuration:"
+                    echo "[CLEANUP]   - Keep latest ${env.LATEST_VERSIONS_TO_KEEP} versions in docker-latest"
+                    echo "[CLEANUP]   - Remove dev builds older than ${env.DEV_RETENTION_DAYS} days"
+                    echo "[CLEANUP]   - Docker registry: ${env.DOCKER_REGISTRY}"
+
+                    if (params.FORCE_DELETE_APP != '') {
+                        // Emergency: Force delete entire app folder
+                        echo "[CLEANUP] EMERGENCY: Force deleting entire app: ${params.FORCE_DELETE_APP}"
+                        forceDeleteApp(params.FORCE_DELETE_APP)
+                        cleanupResults.success = true
+                    } else if (params.CLEANUP_BRANCH != '') {
+                        // Clean up specific branch only
+                        echo "[CLEANUP] Cleaning up specific branch: ${params.CLEANUP_BRANCH}"
+                        cleanupSpecificBranch(params.CLEANUP_BRANCH)
+                        cleanupResults.success = true
+                    } else {
+                        // Default automatic cleanup - runs by default on every successful build
+                        echo "[CLEANUP] Running automatic cleanup (default behavior)"
+                        echo "[CLEANUP] This will clean docker-dev (orphaned branches) and docker-latest (old versions)"
+
+                        // 1. Always clean up docker-dev repository (orphaned branches)
+                        cleanupDevImages()
+
+                        // 2. Always clean up docker-latest repository (keep last N versions per app)
+                        cleanupLatestImages()
+
+                        // 3. Always clean up metadata/temporary-builds
+                        cleanupTempManifests()
+
+                        cleanupResults.success = true
+                    }
+
+                    def cleanupEndTime = System.currentTimeMillis()
+                    cleanupResults.duration = (cleanupEndTime - cleanupStartTime) / 1000
+
+                    echo "\n========================================="
+                    echo ">>> CLEANUP SUMMARY"
+                    echo "========================================="
+                    echo "[CLEANUP] ✅ Cleanup completed successfully"
+                    echo "[CLEANUP] Duration: ${cleanupResults.duration} seconds"
+                    if (params.DRY_RUN_CLEANUP) {
+                        echo "[CLEANUP] 🧪 DRY RUN MODE - No actual deletions performed"
+                        echo "[CLEANUP] Review the logs above to see what would be cleaned up"
+                    } else {
+                        echo "[CLEANUP] Cleanup operations completed"
+                        echo "[CLEANUP] Check individual function logs for detailed results"
+                    }
+                    echo "========================================="
+
+                    // Update build description to include cleanup info
+                    if (env.HAS_CHANGES == 'true') {
+                        def cleanupStatus = params.DRY_RUN_CLEANUP ? " | Cleanup: DRY RUN" : " | Cleanup: ✅"
+                        currentBuild.description = "${env.DEPLOY_PATH} | ${env.GIT_BRANCH_NAME} | ${env.APPS_TO_BUILD}${cleanupStatus}"
+                    }
+
+                } catch (Exception e) {
+                    def cleanupEndTime = System.currentTimeMillis()
+                    cleanupResults.duration = (cleanupEndTime - cleanupStartTime) / 1000
+                    cleanupResults.errors.add(e.message)
+
+                    echo "\n========================================="
+                    echo ">>> CLEANUP ERROR"
+                    echo "========================================="
+                    echo "[CLEANUP ERROR] ❌ Cleanup failed but build was successful"
+                    echo "[CLEANUP ERROR] Error: ${e.message}"
+                    echo "[CLEANUP ERROR] Duration: ${cleanupResults.duration} seconds"
+                    echo "[CLEANUP ERROR] This error does not affect the main build result"
+                    echo "========================================="
+
+                    // Update build description to show cleanup error
+                    if (env.HAS_CHANGES == 'true') {
+                        currentBuild.description = "${env.DEPLOY_PATH} | ${env.GIT_BRANCH_NAME} | ${env.APPS_TO_BUILD} | Cleanup: ❌"
+                    }
+
+                    // Don't fail the build due to cleanup errors
+                }
             }
         }
         failure {
@@ -803,6 +929,23 @@ def makeHttpCall(url, method = 'GET', maxRetries = 3, retryDelay = 5) {
                     response: responseBody,
                     attempt: attempt
                 ]
+            } else if (httpStatus == '401' || httpStatus == '403') {
+                // Authentication/authorization error - don't retry
+                echo "    ❌ HTTP ${method} authentication error: ${httpStatus}"
+                return [
+                    success: false,
+                    httpStatus: httpStatus,
+                    response: responseBody,
+                    attempt: attempt,
+                    error: "Authentication failed (${httpStatus}). Check Artifactory credentials."
+                ]
+            } else if (httpStatus == '429' && attempt < maxRetries) {
+                // Rate limit - retry with longer delay
+                def rateLimitDelay = retryDelay * 2
+                echo "    ⚠ HTTP ${method} rate limited: ${httpStatus} - retrying in ${rateLimitDelay}s"
+                sleep(rateLimitDelay)
+                lastError = "HTTP ${httpStatus}: Rate limited"
+                continue
             } else if (httpStatus.startsWith('5') && attempt < maxRetries) {
                 // Server error - retry
                 echo "    ⚠ HTTP ${method} server error: ${httpStatus} - retrying in ${retryDelay}s"
@@ -812,12 +955,21 @@ def makeHttpCall(url, method = 'GET', maxRetries = 3, retryDelay = 5) {
             } else {
                 // Client error or final attempt - don't retry
                 echo "    ❌ HTTP ${method} failed: ${httpStatus}"
+                def errorMsg = "HTTP ${httpStatus}"
+                if (httpStatus == '400') {
+                    errorMsg += ": Bad request - check API parameters"
+                } else if (httpStatus == '404') {
+                    errorMsg += ": Resource not found"
+                } else if (httpStatus.startsWith('5')) {
+                    errorMsg += ": Server error - Artifactory may be temporarily unavailable"
+                }
+
                 return [
                     success: false,
                     httpStatus: httpStatus,
                     response: responseBody,
                     attempt: attempt,
-                    error: "HTTP ${httpStatus}: ${responseBody}"
+                    error: "${errorMsg}: ${responseBody}"
                 ]
             }
         } catch (Exception e) {
@@ -1007,4 +1159,1000 @@ def createBuildManifest(appName, version) {
     }
 
     echo "[MANIFEST] Uploaded ${manifestPath}/${appName}/${version}.json"
+}
+
+// Recovery function for handling partial cleanup failures
+def handleCleanupError(operation, error, continueOnError = true) {
+    echo "[CLEANUP ERROR] ❌ ${operation} failed: ${error}"
+
+    // Log error details for troubleshooting
+    if (error.contains('401') || error.contains('403')) {
+        echo "[CLEANUP ERROR] 🔐 Authentication issue detected"
+        echo "[CLEANUP ERROR] Verify Artifactory credentials are valid and have sufficient permissions"
+        echo "[CLEANUP ERROR] Required permissions: DELETE, READ on repository ${env.DOCKER_REPO}"
+    } else if (error.contains('429')) {
+        echo "[CLEANUP ERROR] 🚦 Rate limiting detected"
+        echo "[CLEANUP ERROR] Artifactory is rate limiting requests - consider reducing cleanup frequency"
+    } else if (error.contains('5')) {
+        echo "[CLEANUP ERROR] 🌐 Server error detected"
+        echo "[CLEANUP ERROR] Artifactory server may be temporarily unavailable"
+        echo "[CLEANUP ERROR] This is usually temporary - cleanup will retry on next build"
+    } else if (error.contains('timeout') || error.contains('connection')) {
+        echo "[CLEANUP ERROR] 🔌 Network connectivity issue"
+        echo "[CLEANUP ERROR] Check network connection to ${env.DOCKER_REGISTRY}"
+    }
+
+    if (!continueOnError) {
+        throw new Exception("Critical cleanup error: ${error}")
+    }
+
+    echo "[CLEANUP ERROR] ⏭️  Continuing with remaining cleanup operations..."
+    return false
+}
+
+// ================================================================================
+// CLEANUP VALIDATION AND TESTING FUNCTIONS
+// ================================================================================
+
+// Validate cleanup configuration before running
+def validateCleanupConfig() {
+    echo "[CLEANUP] Validating cleanup configuration..."
+
+    def errors = []
+
+    // Check required environment variables
+    if (!env.DOCKER_REGISTRY) {
+        errors.add("DOCKER_REGISTRY not configured")
+    }
+    if (!env.DOCKER_REPO) {
+        errors.add("DOCKER_REPO not configured")
+    }
+    if (!env.DOCKER_LATEST_PATH) {
+        errors.add("DOCKER_LATEST_PATH not configured")
+    }
+    if (!env.DOCKER_DEV_PATH) {
+        errors.add("DOCKER_DEV_PATH not configured")
+    }
+    if (!env.TEMP_BUILDS_PATH) {
+        errors.add("TEMP_BUILDS_PATH not configured")
+    }
+    if (!env.BUILD_MANIFESTS_PATH) {
+        errors.add("BUILD_MANIFESTS_PATH not configured")
+    }
+
+    // Check numeric configurations
+    try {
+        def versionsToKeep = Integer.parseInt(env.LATEST_VERSIONS_TO_KEEP ?: '0')
+        if (versionsToKeep <= 0) {
+            errors.add("LATEST_VERSIONS_TO_KEEP must be a positive integer")
+        }
+    } catch (Exception e) {
+        errors.add("LATEST_VERSIONS_TO_KEEP must be a valid number")
+    }
+
+    try {
+        def retentionDays = Integer.parseInt(env.DEV_RETENTION_DAYS ?: '0')
+        if (retentionDays <= 0) {
+            errors.add("DEV_RETENTION_DAYS must be a positive integer")
+        }
+    } catch (Exception e) {
+        errors.add("DEV_RETENTION_DAYS must be a valid number")
+    }
+
+    if (errors.size() > 0) {
+        echo "[CLEANUP] ❌ Configuration validation failed:"
+        errors.each { error ->
+            echo "[CLEANUP] - ${error}"
+        }
+        return false
+    }
+
+    echo "[CLEANUP] ✅ Configuration validation passed"
+    echo "[CLEANUP] - Registry: ${env.DOCKER_REGISTRY}"
+    echo "[CLEANUP] - Repository: ${env.DOCKER_REPO}"
+    echo "[CLEANUP] - Latest path: ${env.DOCKER_LATEST_PATH}"
+    echo "[CLEANUP] - Dev path: ${env.DOCKER_DEV_PATH}"
+    echo "[CLEANUP] - Keep versions: ${env.LATEST_VERSIONS_TO_KEEP}"
+    echo "[CLEANUP] - Retention days: ${env.DEV_RETENTION_DAYS}"
+
+    return true
+}
+
+// Test Artifactory connectivity
+def testArtifactoryConnectivity() {
+    echo "[CLEANUP] Testing Artifactory connectivity..."
+
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        try {
+            def testUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/system/ping"
+            def result = makeHttpCall(testUrl, 'GET', 1)
+
+            if (result.success) {
+                echo "[CLEANUP] ✅ Artifactory connectivity test passed"
+                return true
+            } else {
+                echo "[CLEANUP] ❌ Artifactory connectivity test failed: ${result.error}"
+                return false
+            }
+        } catch (Exception e) {
+            echo "[CLEANUP] ❌ Artifactory connectivity test exception: ${e.message}"
+            return false
+        }
+    }
+}
+
+// Comprehensive cleanup test (dry-run mode recommended)
+def runCleanupTest() {
+    echo "[CLEANUP] Running comprehensive cleanup test..."
+    echo "[CLEANUP] This will test all cleanup functions in dry-run mode"
+
+    def testResults = [
+        configValid: false,
+        connectivityOk: false,
+        branchDetectionOk: false,
+        devCleanupOk: false,
+        latestCleanupOk: false,
+        metadataCleanupOk: false
+    ]
+
+    try {
+        // Test 1: Configuration validation
+        testResults.configValid = validateCleanupConfig()
+
+        // Test 2: Connectivity test
+        testResults.connectivityOk = testArtifactoryConnectivity()
+
+        // Test 3: Branch detection
+        echo "\n[CLEANUP] Testing Git branch detection..."
+        def branchResult = getActiveBranches()
+        testResults.branchDetectionOk = branchResult.success
+        if (branchResult.success) {
+            echo "[CLEANUP] ✅ Branch detection test passed: ${branchResult.branches.size()} branches found"
+        } else {
+            echo "[CLEANUP] ❌ Branch detection test failed: ${branchResult.error}"
+        }
+
+        // Test 4-6: Cleanup functions (only if previous tests pass)
+        if (testResults.configValid && testResults.connectivityOk) {
+            // Force dry-run mode for testing
+            def originalDryRun = params.DRY_RUN_CLEANUP
+            params.DRY_RUN_CLEANUP = true
+
+            try {
+                echo "\n[CLEANUP] Testing docker-dev cleanup (dry-run)..."
+                cleanupDevImages()
+                testResults.devCleanupOk = true
+                echo "[CLEANUP] ✅ Docker-dev cleanup test passed"
+            } catch (Exception e) {
+                echo "[CLEANUP] ❌ Docker-dev cleanup test failed: ${e.message}"
+            }
+
+            try {
+                echo "\n[CLEANUP] Testing docker-latest cleanup (dry-run)..."
+                cleanupLatestImages()
+                testResults.latestCleanupOk = true
+                echo "[CLEANUP] ✅ Docker-latest cleanup test passed"
+            } catch (Exception e) {
+                echo "[CLEANUP] ❌ Docker-latest cleanup test failed: ${e.message}"
+            }
+
+            try {
+                echo "\n[CLEANUP] Testing metadata cleanup (dry-run)..."
+                cleanupTempManifests()
+                testResults.metadataCleanupOk = true
+                echo "[CLEANUP] ✅ Metadata cleanup test passed"
+            } catch (Exception e) {
+                echo "[CLEANUP] ❌ Metadata cleanup test failed: ${e.message}"
+            }
+
+            // Restore original dry-run setting
+            params.DRY_RUN_CLEANUP = originalDryRun
+        }
+
+        // Test summary
+        echo "\n[CLEANUP] Test Results Summary:"
+        echo "[CLEANUP] - Configuration Valid: ${testResults.configValid ? '✅' : '❌'}"
+        echo "[CLEANUP] - Connectivity OK: ${testResults.connectivityOk ? '✅' : '❌'}"
+        echo "[CLEANUP] - Branch Detection OK: ${testResults.branchDetectionOk ? '✅' : '❌'}"
+        echo "[CLEANUP] - Dev Cleanup OK: ${testResults.devCleanupOk ? '✅' : '❌'}"
+        echo "[CLEANUP] - Latest Cleanup OK: ${testResults.latestCleanupOk ? '✅' : '❌'}"
+        echo "[CLEANUP] - Metadata Cleanup OK: ${testResults.metadataCleanupOk ? '✅' : '❌'}"
+
+        def passedTests = testResults.values().count { it == true }
+        def totalTests = testResults.size()
+
+        echo "[CLEANUP] Overall Test Result: ${passedTests}/${totalTests} tests passed"
+
+        return passedTests == totalTests
+
+    } catch (Exception e) {
+        echo "[CLEANUP] ❌ Cleanup test suite failed: ${e.message}"
+        return false
+    }
+}
+
+// ================================================================================
+// ENHANCED ARTIFACTORY API HELPER FUNCTIONS
+// ================================================================================
+
+// Get list of folders/files from Artifactory path
+def getArtifactoryFolders(artifactoryPath, maxRetries = 3) {
+    def url = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${artifactoryPath}"
+    def result = makeHttpCall(url, 'GET', maxRetries)
+
+    if (result.success) {
+        try {
+            def jsonResponse = readJSON text: result.response
+            def folders = []
+
+            if (jsonResponse.children) {
+                jsonResponse.children.each { child ->
+                    if (child.folder) {
+                        folders.add(child.uri.replaceAll('^/', ''))
+                    }
+                }
+            }
+
+            return [success: true, folders: folders]
+        } catch (Exception e) {
+            return [success: false, error: "Failed to parse JSON response: ${e.message}"]
+        }
+    } else {
+        return [success: false, error: result.error]
+    }
+}
+
+// Get file information from Artifactory
+def getArtifactoryFileInfo(artifactoryPath, maxRetries = 3) {
+    def url = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${artifactoryPath}"
+    def result = makeHttpCall(url, 'GET', maxRetries)
+
+    if (result.success) {
+        try {
+            def jsonResponse = readJSON text: result.response
+            return [
+                success: true,
+                created: jsonResponse.created ?: '',
+                lastModified: jsonResponse.lastModified ?: '',
+                size: jsonResponse.size ?: 0
+            ]
+        } catch (Exception e) {
+            return [success: false, error: "Failed to parse file info: ${e.message}"]
+        }
+    } else {
+        return [success: false, error: result.error]
+    }
+}
+
+// Delete path from Artifactory (file or folder)
+def deleteArtifactoryPath(artifactoryPath, recursive = false, maxRetries = 3) {
+    def url = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${artifactoryPath}"
+    if (recursive) {
+        url += "?recursive=1"
+    }
+
+    def result = makeHttpCall(url, 'DELETE', maxRetries)
+    return result
+}
+
+// Get list of Docker tags for an application
+def getDockerTags(appName, repositoryPath, maxRetries = 3) {
+    def url = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${repositoryPath}/${appName}"
+    def result = makeHttpCall(url, 'GET', maxRetries)
+
+    if (result.success) {
+        try {
+            def jsonResponse = readJSON text: result.response
+            def tags = []
+
+            if (jsonResponse.children) {
+                jsonResponse.children.each { child ->
+                    if (child.folder) {
+                        def tagName = child.uri.replaceAll('^/', '')
+                        // Skip manifest and sha256 folders
+                        if (!tagName.startsWith('sha256:') && tagName != 'manifests' && tagName != '_uploads') {
+                            tags.add(tagName)
+                        }
+                    }
+                }
+            }
+
+            return [success: true, tags: tags]
+        } catch (Exception e) {
+            return [success: false, error: "Failed to parse tags: ${e.message}"]
+        }
+    } else {
+        return [success: false, error: result.error]
+    }
+}
+
+// Get list of active Git branches (both local and remote)
+def getActiveBranches() {
+    try {
+        echo "    🔍 Detecting active Git branches..."
+
+        def activeBranches = [] as Set
+
+        // Method 1: Get remote branches (most reliable)
+        try {
+            def remoteBranches = bat(
+                script: '@git branch -r --format="%(refname:short)" 2>nul || echo ""',
+                returnStdout: true
+            ).trim()
+
+            if (remoteBranches) {
+                remoteBranches.split('\r?\n').each { branch ->
+                    if (branch && branch.trim()) {
+                        def cleanBranch = branch.trim()
+                        // Remove origin/ prefix if present
+                        if (cleanBranch.startsWith('origin/')) {
+                            cleanBranch = cleanBranch.replaceAll('^origin/', '')
+                        }
+                        // Skip HEAD references
+                        if (!cleanBranch.contains('HEAD') && cleanBranch != '') {
+                            activeBranches.add(cleanBranch)
+                        }
+                    }
+                }
+                echo "    📋 Found ${activeBranches.size()} remote branches"
+            }
+        } catch (Exception e) {
+            echo "    ⚠ Could not get remote branches: ${e.message}"
+        }
+
+        // Method 2: Get local branches as backup
+        try {
+            def localBranches = bat(
+                script: '@git branch --format="%(refname:short)" 2>nul || echo ""',
+                returnStdout: true
+            ).trim()
+
+            if (localBranches) {
+                localBranches.split('\r?\n').each { branch ->
+                    if (branch && branch.trim()) {
+                        def cleanBranch = branch.trim().replaceAll('^\\* ', '')
+                        if (cleanBranch != '' && !cleanBranch.contains('HEAD')) {
+                            activeBranches.add(cleanBranch)
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            echo "    ⚠ Could not get local branches: ${e.message}"
+        }
+
+        // Convert Set to List and sort
+        def branchList = activeBranches.toList().sort()
+
+        echo "    ✅ Active branches detected: ${branchList.join(', ')}"
+        return [success: true, branches: branchList]
+
+    } catch (Exception e) {
+        echo "    ❌ Error detecting Git branches: ${e.message}"
+        return [success: false, error: e.message, branches: []]
+    }
+}
+
+// ================================================================================
+// CLEANUP FUNCTIONS
+// ================================================================================
+
+// Cleanup docker-latest repository (keep latest N versions per app)
+def cleanupLatestImages() {
+    echo "[CLEANUP] Starting docker-latest cleanup..."
+    echo "[CLEANUP] Strategy: Keep latest ${env.LATEST_VERSIONS_TO_KEEP} versions per app"
+    echo "[CLEANUP] Repository: ${env.DOCKER_LATEST_PATH}"
+
+    if (params.DRY_RUN_CLEANUP) {
+        echo "[CLEANUP] 🧪 DRY RUN MODE - No actual deletions will be performed"
+    }
+
+    def totalDeleted = 0
+    def totalApps = 0
+
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        try {
+            // Step 1: Get list of applications in docker-latest
+            echo "\n[CLEANUP] Step 1: Getting list of applications in ${env.DOCKER_LATEST_PATH}..."
+            def appsResult = getArtifactoryFolders(env.DOCKER_LATEST_PATH)
+
+            if (!appsResult.success) {
+                echo "[CLEANUP] ❌ Could not get applications list: ${appsResult.error}"
+                return
+            }
+
+            def apps = appsResult.folders
+            totalApps = apps.size()
+            echo "[CLEANUP] Found ${totalApps} applications: ${apps.join(', ')}"
+
+            if (totalApps == 0) {
+                echo "[CLEANUP] No applications found in ${env.DOCKER_LATEST_PATH}"
+                return
+            }
+
+            // Step 2: Process each application
+            apps.each { app ->
+                echo "\n[CLEANUP] Processing app: ${app}"
+
+                // Get all version tags for this app
+                def tagsResult = getDockerTags(app, env.DOCKER_LATEST_PATH)
+
+                if (!tagsResult.success) {
+                    echo "[CLEANUP] ⚠ Could not get tags for ${app}: ${tagsResult.error}"
+                    return
+                }
+
+                def allTags = tagsResult.tags
+                echo "[CLEANUP] Found ${allTags.size()} versions: ${allTags.join(', ')}"
+
+                if (allTags.size() <= Integer.parseInt(env.LATEST_VERSIONS_TO_KEEP)) {
+                    echo "[CLEANUP] ✅ ${app}: Only ${allTags.size()} versions, keeping all"
+                    return
+                }
+
+                // Sort versions (semantic version aware)
+                def sortedTags = sortVersionTags(allTags)
+                def versionsToKeep = Integer.parseInt(env.LATEST_VERSIONS_TO_KEEP)
+                def versionsToDelete = sortedTags.drop(versionsToKeep)
+
+                echo "[CLEANUP] Keeping latest ${versionsToKeep} versions: ${sortedTags.take(versionsToKeep).join(', ')}"
+                echo "[CLEANUP] Will delete ${versionsToDelete.size()} old versions: ${versionsToDelete.join(', ')}"
+
+                // Delete old versions
+                versionsToDelete.each { version ->
+                    if (params.DRY_RUN_CLEANUP) {
+                        echo "[CLEANUP] 🧪 [DRY RUN] Would delete ${app}:${version}"
+                    } else {
+                        echo "[CLEANUP] Deleting ${app}:${version}..."
+                        def deleteResult = deleteArtifactoryPath("${env.DOCKER_LATEST_PATH}/${app}/${version}", true)
+
+                        if (deleteResult.success) {
+                            echo "[CLEANUP] ✅ Deleted ${app}:${version}"
+                            totalDeleted++
+
+                            // Also delete corresponding build manifest
+                            def manifestPath = "${env.BUILD_MANIFESTS_PATH}/${app}/${version}.json"
+                            def manifestDeleteResult = deleteArtifactoryPath(manifestPath)
+                            if (manifestDeleteResult.success) {
+                                echo "[CLEANUP] ✅ Deleted manifest: ${manifestPath}"
+                            } else {
+                                echo "[CLEANUP] ⚠ Could not delete manifest ${manifestPath}: ${manifestDeleteResult.error}"
+                            }
+                        } else {
+                            echo "[CLEANUP] ❌ Failed to delete ${app}:${version}: ${deleteResult.error}"
+                        }
+                    }
+                }
+            }
+
+            // Summary
+            echo "\n[CLEANUP] Docker-latest cleanup summary:"
+            echo "[CLEANUP] Applications processed: ${totalApps}"
+            if (params.DRY_RUN_CLEANUP) {
+                echo "[CLEANUP] 🧪 DRY RUN - No actual deletions performed"
+            } else {
+                echo "[CLEANUP] Versions deleted: ${totalDeleted}"
+            }
+
+        } catch (Exception e) {
+            echo "[CLEANUP] ❌ Error during docker-latest cleanup: ${e.message}"
+            throw e
+        }
+    }
+}
+
+// Sort version tags (semantic version aware, latest first)
+def sortVersionTags(tags) {
+    try {
+        return tags.sort { a, b ->
+            // Try semantic version comparison first
+            def aVersion = parseSemanticVersion(a)
+            def bVersion = parseSemanticVersion(b)
+
+            if (aVersion && bVersion) {
+                // Compare major.minor.patch
+                if (aVersion.major != bVersion.major) {
+                    return bVersion.major - aVersion.major
+                }
+                if (aVersion.minor != bVersion.minor) {
+                    return bVersion.minor - aVersion.minor
+                }
+                if (aVersion.patch != bVersion.patch) {
+                    return bVersion.patch - aVersion.patch
+                }
+                return 0
+            } else {
+                // Fallback to string comparison (reverse for latest first)
+                return b.compareTo(a)
+            }
+        }
+    } catch (Exception e) {
+        echo "[CLEANUP] Warning: Could not sort versions semantically, using string sort: ${e.message}"
+        return tags.sort().reverse()
+    }
+}
+
+// Parse semantic version (X.Y.Z format)
+def parseSemanticVersion(version) {
+    try {
+        def matcher = version =~ /^(\d+)\.(\d+)\.(\d+)$/
+        if (matcher.matches()) {
+            return [
+                major: Integer.parseInt(matcher[0][1]),
+                minor: Integer.parseInt(matcher[0][2]),
+                patch: Integer.parseInt(matcher[0][3])
+            ]
+        }
+        return null
+    } catch (Exception e) {
+        return null
+    }
+}
+
+// Cleanup docker-dev repository (remove builds from deleted/merged branches)
+def cleanupDevImages() {
+    echo "[CLEANUP] Starting docker-dev cleanup..."
+    echo "[CLEANUP] Strategy: Remove images from deleted/merged branches + images older than ${env.DEV_RETENTION_DAYS} days"
+    echo "[CLEANUP] Repository: ${env.DOCKER_DEV_PATH}"
+
+    if (params.DRY_RUN_CLEANUP) {
+        echo "[CLEANUP] 🧪 DRY RUN MODE - No actual deletions will be performed"
+    }
+
+    def totalDeleted = 0
+    def totalApps = 0
+    def orphanedBranches = [] as Set
+
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        try {
+            // Step 1: Get list of active Git branches
+            echo "\n[CLEANUP] Step 1: Getting active Git branches..."
+            def branchResult = getActiveBranches()
+
+            if (!branchResult.success) {
+                echo "[CLEANUP] ⚠ Could not get Git branches: ${branchResult.error}"
+                echo "[CLEANUP] Continuing with time-based cleanup only..."
+            }
+
+            def activeBranches = branchResult.branches ?: []
+            echo "[CLEANUP] Active branches (${activeBranches.size()}): ${activeBranches.join(', ')}"
+
+            // Step 2: Get all branch builds from metadata/temporary-builds
+            echo "\n[CLEANUP] Step 2: Getting historical branch builds from metadata..."
+            def historicalBranches = [] as Set
+
+            // Get all apps from temporary-builds metadata
+            def metadataResult = getArtifactoryFolders(env.TEMP_BUILDS_PATH)
+            if (metadataResult.success) {
+                metadataResult.folders.each { app ->
+                    echo "[CLEANUP] Checking metadata for app: ${app}"
+
+                    // Get all manifest files for this app
+                    def appMetadataResult = getArtifactoryFolders("${env.TEMP_BUILDS_PATH}/${app}")
+                    if (appMetadataResult.success) {
+                        appMetadataResult.folders.each { manifestFile ->
+                            // Extract branch name from manifest filename
+                            // Format: branch-commit-manifest.json or branch-commit.json
+                            def branchName = extractBranchFromManifest(manifestFile)
+                            if (branchName) {
+                                historicalBranches.add(branchName)
+                            }
+                        }
+                    }
+                }
+            }
+
+            echo "[CLEANUP] Historical branches found in metadata (${historicalBranches.size()}): ${historicalBranches.join(', ')}"
+
+            // Step 3: Identify orphaned branches (exist in Artifactory but not in Git)
+            orphanedBranches = historicalBranches.findAll { branch ->
+                !activeBranches.contains(branch)
+            }
+
+            echo "\n[CLEANUP] Step 3: Orphaned branches identified (${orphanedBranches.size()}): ${orphanedBranches.join(', ')}"
+
+            if (orphanedBranches.size() == 0) {
+                echo "[CLEANUP] ✅ No orphaned branches found - all builds are from active branches"
+            }
+
+            // Step 4: Get applications in docker-dev and clean up orphaned branch builds
+            echo "\n[CLEANUP] Step 4: Processing applications in ${env.DOCKER_DEV_PATH}..."
+            def appsResult = getArtifactoryFolders(env.DOCKER_DEV_PATH)
+
+            if (!appsResult.success) {
+                echo "[CLEANUP] ❌ Could not get applications list: ${appsResult.error}"
+                return
+            }
+
+            def apps = appsResult.folders
+            totalApps = apps.size()
+            echo "[CLEANUP] Found ${totalApps} applications: ${apps.join(', ')}"
+
+            if (totalApps == 0) {
+                echo "[CLEANUP] No applications found in ${env.DOCKER_DEV_PATH}"
+                return
+            }
+
+            // Process each application
+            apps.each { app ->
+                echo "\n[CLEANUP] Processing app: ${app}"
+
+                // Get all tags for this app
+                def tagsResult = getDockerTags(app, env.DOCKER_DEV_PATH)
+
+                if (!tagsResult.success) {
+                    echo "[CLEANUP] ⚠ Could not get tags for ${app}: ${tagsResult.error}"
+                    return
+                }
+
+                def allTags = tagsResult.tags
+                echo "[CLEANUP] Found ${allTags.size()} dev builds for ${app}"
+
+                // Identify tags from orphaned branches
+                def tagsToDelete = []
+
+                allTags.each { tag ->
+                    def tagBranch = extractBranchFromTag(tag)
+                    if (tagBranch && orphanedBranches.contains(tagBranch)) {
+                        tagsToDelete.add(tag)
+                    }
+                }
+
+                echo "[CLEANUP] Tags from orphaned branches (${tagsToDelete.size()}): ${tagsToDelete.join(', ')}"
+
+                // Delete orphaned branch builds
+                tagsToDelete.each { tag ->
+                    if (params.DRY_RUN_CLEANUP) {
+                        echo "[CLEANUP] 🧪 [DRY RUN] Would delete ${app}:${tag} (orphaned branch)"
+                    } else {
+                        echo "[CLEANUP] Deleting ${app}:${tag} (orphaned branch)..."
+                        def deleteResult = deleteArtifactoryPath("${env.DOCKER_DEV_PATH}/${app}/${tag}", true)
+
+                        if (deleteResult.success) {
+                            echo "[CLEANUP] ✅ Deleted ${app}:${tag}"
+                            totalDeleted++
+                        } else {
+                            echo "[CLEANUP] ❌ Failed to delete ${app}:${tag}: ${deleteResult.error}"
+                        }
+                    }
+                }
+            }
+
+            // Summary
+            echo "\n[CLEANUP] Docker-dev cleanup summary:"
+            echo "[CLEANUP] Applications processed: ${totalApps}"
+            echo "[CLEANUP] Orphaned branches found: ${orphanedBranches.size()}"
+            if (params.DRY_RUN_CLEANUP) {
+                echo "[CLEANUP] 🧪 DRY RUN - No actual deletions performed"
+            } else {
+                echo "[CLEANUP] Images deleted: ${totalDeleted}"
+            }
+
+        } catch (Exception e) {
+            echo "[CLEANUP] ❌ Error during docker-dev cleanup: ${e.message}"
+            throw e
+        }
+    }
+}
+
+// Extract branch name from manifest filename
+def extractBranchFromManifest(manifestFile) {
+    try {
+        // Remove .json extension
+        def baseName = manifestFile.replaceAll('\\.json$', '')
+
+        // Remove -manifest suffix if present
+        baseName = baseName.replaceAll('-manifest$', '')
+
+        // Extract branch part (everything before the last dash and 8-character commit hash)
+        def matcher = baseName =~ /^(.+)-[a-f0-9]{8}$/
+        if (matcher.matches()) {
+            return matcher[0][1]
+        }
+
+        // Fallback: return the whole basename if pattern doesn't match
+        return baseName
+    } catch (Exception e) {
+        echo "[CLEANUP] Warning: Could not extract branch from manifest ${manifestFile}: ${e.message}"
+        return null
+    }
+}
+
+// Extract branch name from Docker tag
+def extractBranchFromTag(tag) {
+    try {
+        // Docker dev tags format: branch-commit (e.g., feature-login-a1b2c3d4)
+        def matcher = tag =~ /^(.+)-[a-f0-9]{8}$/
+        if (matcher.matches()) {
+            return matcher[0][1]
+        }
+
+        // If no commit hash pattern, return the tag as-is
+        return tag
+    } catch (Exception e) {
+        echo "[CLEANUP] Warning: Could not extract branch from tag ${tag}: ${e.message}"
+        return null
+    }
+}
+
+// Cleanup temporary build manifests
+def cleanupTempManifests() {
+    echo "[CLEANUP] Starting metadata cleanup..."
+    echo "[CLEANUP] Strategy: Remove manifests for deleted branches + manifests older than ${env.DEV_RETENTION_DAYS} days"
+    echo "[CLEANUP] Metadata path: ${env.TEMP_BUILDS_PATH}"
+
+    if (params.DRY_RUN_CLEANUP) {
+        echo "[CLEANUP] 🧪 DRY RUN MODE - No actual deletions will be performed"
+    }
+
+    def totalDeleted = 0
+    def totalApps = 0
+
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        try {
+            // Step 1: Get active Git branches
+            echo "\n[CLEANUP] Step 1: Getting active Git branches for metadata cleanup..."
+            def branchResult = getActiveBranches()
+            def activeBranches = branchResult.branches ?: []
+            echo "[CLEANUP] Active branches: ${activeBranches.join(', ')}"
+
+            // Step 2: Get cutoff date for time-based cleanup
+            def cutoffDate = ''
+            try {
+                cutoffDate = bat(
+                    script: """
+                        @powershell -Command "(Get-Date).AddDays(-${env.DEV_RETENTION_DAYS}).ToString('yyyy-MM-ddTHH:mm:ss')"
+                    """,
+                    returnStdout: true
+                ).trim()
+                echo "[CLEANUP] Will delete manifests created before: ${cutoffDate}"
+            } catch (Exception e) {
+                echo "[CLEANUP] Could not calculate cutoff date: ${e.message}"
+                echo "[CLEANUP] Continuing with branch-based cleanup only..."
+            }
+
+            // Step 3: Get applications in metadata/temporary-builds
+            echo "\n[CLEANUP] Step 3: Processing metadata applications..."
+            def appsResult = getArtifactoryFolders(env.TEMP_BUILDS_PATH)
+
+            if (!appsResult.success) {
+                echo "[CLEANUP] ❌ Could not get metadata applications: ${appsResult.error}"
+                return
+            }
+
+            def apps = appsResult.folders
+            totalApps = apps.size()
+            echo "[CLEANUP] Found ${totalApps} applications with metadata: ${apps.join(', ')}"
+
+            if (totalApps == 0) {
+                echo "[CLEANUP] No metadata found in ${env.TEMP_BUILDS_PATH}"
+                return
+            }
+
+            // Step 4: Process each application's metadata
+            apps.each { app ->
+                echo "\n[CLEANUP] Processing metadata for app: ${app}"
+
+                // Get all manifest files for this app
+                def manifestsResult = getArtifactoryFolders("${env.TEMP_BUILDS_PATH}/${app}")
+
+                if (!manifestsResult.success) {
+                    echo "[CLEANUP] ⚠ Could not get manifests for ${app}: ${manifestsResult.error}"
+                    return
+                }
+
+                def manifests = manifestsResult.folders
+                echo "[CLEANUP] Found ${manifests.size()} manifest files for ${app}"
+
+                // Process each manifest file
+                manifests.each { manifestFile ->
+                    def shouldDelete = false
+                    def deleteReason = ""
+
+                    // Check if manifest is from an orphaned branch
+                    def branchName = extractBranchFromManifest(manifestFile)
+                    if (branchName && !activeBranches.contains(branchName)) {
+                        shouldDelete = true
+                        deleteReason = "orphaned branch: ${branchName}"
+                    }
+
+                    // Check if manifest is too old (if cutoff date is available)
+                    if (!shouldDelete && cutoffDate) {
+                        def fileInfoResult = getArtifactoryFileInfo("${env.TEMP_BUILDS_PATH}/${app}/${manifestFile}")
+                        if (fileInfoResult.success && fileInfoResult.created) {
+                            if (fileInfoResult.created < cutoffDate) {
+                                shouldDelete = true
+                                deleteReason = "older than ${env.DEV_RETENTION_DAYS} days (created: ${fileInfoResult.created})"
+                            }
+                        }
+                    }
+
+                    // Delete if needed
+                    if (shouldDelete) {
+                        if (params.DRY_RUN_CLEANUP) {
+                            echo "[CLEANUP] 🧪 [DRY RUN] Would delete ${app}/${manifestFile} (${deleteReason})"
+                        } else {
+                            echo "[CLEANUP] Deleting ${app}/${manifestFile} (${deleteReason})..."
+                            def deleteResult = deleteArtifactoryPath("${env.TEMP_BUILDS_PATH}/${app}/${manifestFile}")
+
+                            if (deleteResult.success) {
+                                echo "[CLEANUP] ✅ Deleted ${app}/${manifestFile}"
+                                totalDeleted++
+                            } else {
+                                echo "[CLEANUP] ❌ Failed to delete ${app}/${manifestFile}: ${deleteResult.error}"
+                            }
+                        }
+                    } else {
+                        echo "[CLEANUP] ✅ Keeping ${app}/${manifestFile} (active branch or recent)"
+                    }
+                }
+            }
+
+            // Summary
+            echo "\n[CLEANUP] Metadata cleanup summary:"
+            echo "[CLEANUP] Applications processed: ${totalApps}"
+            if (params.DRY_RUN_CLEANUP) {
+                echo "[CLEANUP] 🧪 DRY RUN - No actual deletions performed"
+            } else {
+                echo "[CLEANUP] Manifest files deleted: ${totalDeleted}"
+            }
+
+        } catch (Exception e) {
+            echo "[CLEANUP] ❌ Error during metadata cleanup: ${e.message}"
+            throw e
+        }
+    }
+}
+
+// Additional cleanup functions for specific scenarios
+def cleanupSpecificBranch(branchName) {
+    echo "[CLEANUP] Cleaning up specific branch: ${branchName}"
+    echo "[CLEANUP] This will remove all builds and metadata for branch: ${branchName}"
+
+    if (params.DRY_RUN_CLEANUP) {
+        echo "[CLEANUP] 🧪 DRY RUN MODE - No actual deletions will be performed"
+    }
+
+    def cleanBranchName = branchName
+        .replaceAll('[^a-zA-Z0-9._-]', '-')
+        .toLowerCase()
+
+    def totalDeleted = 0
+
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        try {
+            // Clean up docker-dev images for this branch
+            echo "\n[CLEANUP] Step 1: Cleaning docker-dev images for branch ${branchName}..."
+            def appsResult = getArtifactoryFolders(env.DOCKER_DEV_PATH)
+
+            if (appsResult.success) {
+                appsResult.folders.each { app ->
+                    def tagsResult = getDockerTags(app, env.DOCKER_DEV_PATH)
+                    if (tagsResult.success) {
+                        def branchTags = tagsResult.tags.findAll { tag ->
+                            def tagBranch = extractBranchFromTag(tag)
+                            return tagBranch == cleanBranchName
+                        }
+
+                        branchTags.each { tag ->
+                            if (params.DRY_RUN_CLEANUP) {
+                                echo "[CLEANUP] 🧪 [DRY RUN] Would delete ${app}:${tag}"
+                            } else {
+                                def deleteResult = deleteArtifactoryPath("${env.DOCKER_DEV_PATH}/${app}/${tag}", true)
+                                if (deleteResult.success) {
+                                    echo "[CLEANUP] ✅ Deleted ${app}:${tag}"
+                                    totalDeleted++
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Clean up metadata for this branch
+            echo "\n[CLEANUP] Step 2: Cleaning metadata for branch ${branchName}..."
+            def metadataResult = getArtifactoryFolders(env.TEMP_BUILDS_PATH)
+
+            if (metadataResult.success) {
+                metadataResult.folders.each { app ->
+                    def manifestsResult = getArtifactoryFolders("${env.TEMP_BUILDS_PATH}/${app}")
+                    if (manifestsResult.success) {
+                        def branchManifests = manifestsResult.folders.findAll { manifest ->
+                            def manifestBranch = extractBranchFromManifest(manifest)
+                            return manifestBranch == cleanBranchName
+                        }
+
+                        branchManifests.each { manifest ->
+                            if (params.DRY_RUN_CLEANUP) {
+                                echo "[CLEANUP] 🧪 [DRY RUN] Would delete metadata ${app}/${manifest}"
+                            } else {
+                                def deleteResult = deleteArtifactoryPath("${env.TEMP_BUILDS_PATH}/${app}/${manifest}")
+                                if (deleteResult.success) {
+                                    echo "[CLEANUP] ✅ Deleted metadata ${app}/${manifest}"
+                                    totalDeleted++
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            echo "\n[CLEANUP] Branch cleanup summary:"
+            echo "[CLEANUP] Branch: ${branchName}"
+            if (params.DRY_RUN_CLEANUP) {
+                echo "[CLEANUP] 🧪 DRY RUN - No actual deletions performed"
+            } else {
+                echo "[CLEANUP] Items deleted: ${totalDeleted}"
+            }
+
+        } catch (Exception e) {
+            echo "[CLEANUP] ❌ Error during branch cleanup: ${e.message}"
+            throw e
+        }
+    }
+}
+
+// Force delete entire app (emergency function)
+def forceDeleteApp(appName) {
+    echo "[CLEANUP] EMERGENCY: Force deleting entire app: ${appName}"
+    echo "[CLEANUP] ⚠️  WARNING: This will delete ALL versions and metadata for ${appName}"
+
+    if (params.DRY_RUN_CLEANUP) {
+        echo "[CLEANUP] 🧪 DRY RUN MODE - No actual deletions will be performed"
+        echo "[CLEANUP] 🧪 [DRY RUN] Would delete entire app folder: ${env.DOCKER_DEV_PATH}/${appName}"
+        echo "[CLEANUP] 🧪 [DRY RUN] Would delete all metadata: ${env.TEMP_BUILDS_PATH}/${appName}"
+        return
+    }
+
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        try {
+            // Delete entire app folder from docker-dev
+            echo "[CLEANUP] Deleting app folder: ${env.DOCKER_DEV_PATH}/${appName}"
+            def deleteResult = deleteArtifactoryPath("${env.DOCKER_DEV_PATH}/${appName}", true)
+
+            if (deleteResult.success) {
+                echo "[CLEANUP] ✅ Deleted app folder: ${env.DOCKER_DEV_PATH}/${appName}"
+            } else {
+                echo "[CLEANUP] ❌ Failed to delete app folder: ${deleteResult.error}"
+            }
+
+            // Delete all metadata for this app
+            echo "[CLEANUP] Deleting app metadata: ${env.TEMP_BUILDS_PATH}/${appName}"
+            def metadataDeleteResult = deleteArtifactoryPath("${env.TEMP_BUILDS_PATH}/${appName}", true)
+
+            if (metadataDeleteResult.success) {
+                echo "[CLEANUP] ✅ Deleted app metadata: ${env.TEMP_BUILDS_PATH}/${appName}"
+            } else {
+                echo "[CLEANUP] ❌ Failed to delete app metadata: ${metadataDeleteResult.error}"
+            }
+
+        } catch (Exception e) {
+            echo "[CLEANUP] ❌ Error during force app deletion: ${e.message}"
+            throw e
+        }
+    }
 }
