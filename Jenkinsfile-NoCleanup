@@ -906,9 +906,14 @@ def makeHttpCall(url, method = 'GET', maxRetries = 3, retryDelay = 5) {
         try {
             echo "    🌐 HTTP ${method} attempt ${attempt}/${maxRetries}: ${url}"
 
-            def curlCommand = method == 'DELETE' ?
-                "@curl -s -w \"HTTPSTATUS:%{http_code}\" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% -X ${method} \"${url}\"" :
-                "@curl -s -w \"HTTPSTATUS:%{http_code}\" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \"${url}\""
+            def curlCommand = ""
+            if (method == 'DELETE') {
+                curlCommand = "@curl -s -w \"HTTPSTATUS:%%{http_code}\" -u \"%ARTIFACTORY_USER%:%ARTIFACTORY_PASS%\" -X ${method} \"${url}\""
+            } else if (method == 'POST') {
+                curlCommand = "@curl -s -w \"HTTPSTATUS:%%{http_code}\" -u \"%ARTIFACTORY_USER%:%ARTIFACTORY_PASS%\" -X POST -H \"Content-Type: text/plain\" --data-binary \"@-\" \"${url}\""
+            } else {
+                curlCommand = "@curl -s -w \"HTTPSTATUS:%%{http_code}\" -u \"%ARTIFACTORY_USER%:%ARTIFACTORY_PASS%\" \"${url}\""
+            }
 
             def response = bat(
                 script: curlCommand,
@@ -1188,6 +1193,135 @@ def handleCleanupError(operation, error, continueOnError = true) {
 
     echo "[CLEANUP ERROR] ⏭️  Continuing with remaining cleanup operations..."
     return false
+}
+
+// ================================================================================
+// ARTIFACTORY QUERY LANGUAGE (AQL) FUNCTIONS
+// ================================================================================
+
+// Execute AQL (Artifactory Query Language) query
+def executeAQL(aqlQuery, maxRetries = 3) {
+    def url = "https://${env.DOCKER_REGISTRY}/artifactory/api/search/aql"
+
+    try {
+        echo "    🔍 Executing AQL query..."
+        echo "    Query: ${aqlQuery.take(100)}${aqlQuery.length() > 100 ? '...' : ''}"
+
+        // Write AQL query to temporary file for curl
+        def tempFile = "aql_query_${System.currentTimeMillis()}.txt"
+        writeFile file: tempFile, text: aqlQuery
+
+        def curlCommand = "@curl -s -w \"HTTPSTATUS:%%{http_code}\" -u \"%ARTIFACTORY_USER%:%ARTIFACTORY_PASS%\" -X POST -H \"Content-Type: text/plain\" --data-binary \"@${tempFile}\" \"${url}\""
+
+        def response = bat(
+            script: curlCommand,
+            returnStdout: true
+        ).trim()
+
+        // Clean up temp file
+        bat "del /Q ${tempFile} 2>nul || exit 0"
+
+        def httpStatus = response.contains('HTTPSTATUS:') ?
+            response.split('HTTPSTATUS:')[1] : '000'
+        def responseBody = response.contains('HTTPSTATUS:') ?
+            response.split('HTTPSTATUS:')[0] : response
+
+        if (httpStatus.startsWith('2')) {
+            def jsonResponse = readJSON text: responseBody
+            return [
+                success: true,
+                results: jsonResponse.results ?: [],
+                range: jsonResponse.range ?: [:]
+            ]
+        } else {
+            return [
+                success: false,
+                error: "AQL query failed with HTTP ${httpStatus}: ${responseBody}"
+            ]
+        }
+
+    } catch (Exception e) {
+        return [
+            success: false,
+            error: "AQL query exception: ${e.message}"
+        ]
+    }
+}
+
+// Get Docker images using AQL (more efficient than REST API)
+def getDockerImagesAQL(repositoryPath, appName = null) {
+    def aqlQuery = """
+        items.find({
+            "repo": "${env.DOCKER_REPO}",
+            "path": {"\\$match": "${repositoryPath}${appName ? '/' + appName : '/*'}"},
+            "name": {"\\$match": "manifest.json"}
+        }).include("path", "name", "created", "size")
+    """
+
+    def result = executeAQL(aqlQuery)
+
+    if (result.success) {
+        def images = [:]
+        result.results.each { item ->
+            // Extract app and tag from path: docker-dev/myapp/v1.0.0/manifests/latest/manifest.json
+            def pathParts = item.path.split('/')
+            if (pathParts.length >= 3) {
+                def app = pathParts[1]
+                def tag = pathParts[2]
+
+                if (!images[app]) {
+                    images[app] = []
+                }
+                images[app].add([
+                    tag: tag,
+                    created: item.created,
+                    size: item.size
+                ])
+            }
+        }
+
+        return [success: true, images: images]
+    } else {
+        return result
+    }
+}
+
+// Get metadata files using AQL
+def getMetadataFilesAQL(metadataPath) {
+    def aqlQuery = """
+        items.find({
+            "repo": "${env.DOCKER_REPO}",
+            "path": {"\\$match": "${metadataPath}/*"},
+            "name": {"\\$match": "*.json"}
+        }).include("path", "name", "created", "size")
+    """
+
+    def result = executeAQL(aqlQuery)
+
+    if (result.success) {
+        def metadata = [:]
+        result.results.each { item ->
+            // Extract app from path: metadata/temporary-builds/myapp/branch-commit.json
+            def pathParts = item.path.split('/')
+            if (pathParts.length >= 3) {
+                def app = pathParts[2]
+
+                if (!metadata[app]) {
+                    metadata[app] = []
+                }
+                metadata[app].add([
+                    filename: item.name,
+                    created: item.created,
+                    size: item.size,
+                    fullPath: "${item.path}/${item.name}"
+                ])
+            }
+        }
+
+        return [success: true, metadata: metadata]
+    } else {
+        return result
+    }
 }
 
 // ================================================================================
@@ -1480,7 +1614,7 @@ def getActiveBranches() {
         // Method 1: Get remote branches (most reliable)
         try {
             def remoteBranches = bat(
-                script: '@git branch -r --format="%(refname:short)" 2>nul || echo ""',
+                script: '@git branch -r 2>nul || echo ""',
                 returnStdout: true
             ).trim()
 
@@ -1493,7 +1627,7 @@ def getActiveBranches() {
                             cleanBranch = cleanBranch.replaceAll('^origin/', '')
                         }
                         // Skip HEAD references
-                        if (!cleanBranch.contains('HEAD') && cleanBranch != '') {
+                        if (!cleanBranch.contains('HEAD') && cleanBranch != '' && !cleanBranch.contains('->')) {
                             activeBranches.add(cleanBranch)
                         }
                     }
@@ -1507,7 +1641,7 @@ def getActiveBranches() {
         // Method 2: Get local branches as backup
         try {
             def localBranches = bat(
-                script: '@git branch --format="%(refname:short)" 2>nul || echo ""',
+                script: '@git branch 2>nul || echo ""',
                 returnStdout: true
             ).trim()
 
@@ -1523,6 +1657,30 @@ def getActiveBranches() {
             }
         } catch (Exception e) {
             echo "    ⚠ Could not get local branches: ${e.message}"
+        }
+
+        // Method 3: Fallback - get current branch at minimum
+        if (activeBranches.size() == 0) {
+            try {
+                def currentBranch = bat(
+                    script: '@git rev-parse --abbrev-ref HEAD 2>nul || echo ""',
+                    returnStdout: true
+                ).trim()
+
+                if (currentBranch && currentBranch != 'HEAD' && currentBranch != '') {
+                    activeBranches.add(currentBranch)
+                    echo "    📋 Added current branch as fallback: ${currentBranch}"
+                }
+            } catch (Exception e) {
+                echo "    ⚠ Could not get current branch: ${e.message}"
+            }
+        }
+
+        // Method 4: Last resort - add main/master if nothing else works
+        if (activeBranches.size() == 0) {
+            echo "    ⚠ No branches detected, adding main/master as fallback"
+            activeBranches.add('main')
+            activeBranches.add('master')
         }
 
         // Convert Set to List and sort
@@ -1560,16 +1718,16 @@ def cleanupLatestImages() {
         passwordVariable: 'ARTIFACTORY_PASS'
     )]) {
         try {
-            // Step 1: Get list of applications in docker-latest
-            echo "\n[CLEANUP] Step 1: Getting list of applications in ${env.DOCKER_LATEST_PATH}..."
-            def appsResult = getArtifactoryFolders(env.DOCKER_LATEST_PATH)
+            // Step 1: Get Docker images using AQL (more efficient)
+            echo "\n[CLEANUP] Step 1: Getting Docker images from ${env.DOCKER_LATEST_PATH} using AQL..."
+            def imagesResult = getDockerImagesAQL(env.DOCKER_LATEST_PATH)
 
-            if (!appsResult.success) {
-                echo "[CLEANUP] ❌ Could not get applications list: ${appsResult.error}"
+            if (!imagesResult.success) {
+                echo "[CLEANUP] ❌ Could not get Docker images: ${imagesResult.error}"
                 return
             }
 
-            def apps = appsResult.folders
+            def apps = imagesResult.images.keySet()
             totalApps = apps.size()
             echo "[CLEANUP] Found ${totalApps} applications: ${apps.join(', ')}"
 
@@ -1582,15 +1740,8 @@ def cleanupLatestImages() {
             apps.each { app ->
                 echo "\n[CLEANUP] Processing app: ${app}"
 
-                // Get all version tags for this app
-                def tagsResult = getDockerTags(app, env.DOCKER_LATEST_PATH)
-
-                if (!tagsResult.success) {
-                    echo "[CLEANUP] ⚠ Could not get tags for ${app}: ${tagsResult.error}"
-                    return
-                }
-
-                def allTags = tagsResult.tags
+                def appImages = imagesResult.images[app]
+                def allTags = appImages.collect { it.tag }
                 echo "[CLEANUP] Found ${allTags.size()} versions: ${allTags.join(', ')}"
 
                 if (allTags.size() <= Integer.parseInt(env.LATEST_VERSIONS_TO_KEEP)) {
@@ -1729,29 +1880,25 @@ def cleanupDevImages() {
             def activeBranches = branchResult.branches ?: []
             echo "[CLEANUP] Active branches (${activeBranches.size()}): ${activeBranches.join(', ')}"
 
-            // Step 2: Get all branch builds from metadata/temporary-builds
-            echo "\n[CLEANUP] Step 2: Getting historical branch builds from metadata..."
+            // Step 2: Get all branch builds from metadata using AQL
+            echo "\n[CLEANUP] Step 2: Getting historical branch builds from metadata using AQL..."
             def historicalBranches = [] as Set
 
-            // Get all apps from temporary-builds metadata
-            def metadataResult = getArtifactoryFolders(env.TEMP_BUILDS_PATH)
+            def metadataResult = getMetadataFilesAQL(env.TEMP_BUILDS_PATH)
             if (metadataResult.success) {
-                metadataResult.folders.each { app ->
-                    echo "[CLEANUP] Checking metadata for app: ${app}"
+                metadataResult.metadata.each { app, files ->
+                    echo "[CLEANUP] Checking metadata for app: ${app} (${files.size()} files)"
 
-                    // Get all manifest files for this app
-                    def appMetadataResult = getArtifactoryFolders("${env.TEMP_BUILDS_PATH}/${app}")
-                    if (appMetadataResult.success) {
-                        appMetadataResult.folders.each { manifestFile ->
-                            // Extract branch name from manifest filename
-                            // Format: branch-commit-manifest.json or branch-commit.json
-                            def branchName = extractBranchFromManifest(manifestFile)
-                            if (branchName) {
-                                historicalBranches.add(branchName)
-                            }
+                    files.each { fileInfo ->
+                        // Extract branch name from manifest filename
+                        def branchName = extractBranchFromManifest(fileInfo.filename)
+                        if (branchName) {
+                            historicalBranches.add(branchName)
                         }
                     }
                 }
+            } else {
+                echo "[CLEANUP] ⚠ Could not get metadata files: ${metadataResult.error}"
             }
 
             echo "[CLEANUP] Historical branches found in metadata (${historicalBranches.size()}): ${historicalBranches.join(', ')}"
@@ -1767,16 +1914,16 @@ def cleanupDevImages() {
                 echo "[CLEANUP] ✅ No orphaned branches found - all builds are from active branches"
             }
 
-            // Step 4: Get applications in docker-dev and clean up orphaned branch builds
-            echo "\n[CLEANUP] Step 4: Processing applications in ${env.DOCKER_DEV_PATH}..."
-            def appsResult = getArtifactoryFolders(env.DOCKER_DEV_PATH)
+            // Step 4: Get Docker dev images using AQL and clean up orphaned branch builds
+            echo "\n[CLEANUP] Step 4: Processing Docker dev images using AQL..."
+            def devImagesResult = getDockerImagesAQL(env.DOCKER_DEV_PATH)
 
-            if (!appsResult.success) {
-                echo "[CLEANUP] ❌ Could not get applications list: ${appsResult.error}"
+            if (!devImagesResult.success) {
+                echo "[CLEANUP] ❌ Could not get Docker dev images: ${devImagesResult.error}"
                 return
             }
 
-            def apps = appsResult.folders
+            def apps = devImagesResult.images.keySet()
             totalApps = apps.size()
             echo "[CLEANUP] Found ${totalApps} applications: ${apps.join(', ')}"
 
@@ -1789,15 +1936,8 @@ def cleanupDevImages() {
             apps.each { app ->
                 echo "\n[CLEANUP] Processing app: ${app}"
 
-                // Get all tags for this app
-                def tagsResult = getDockerTags(app, env.DOCKER_DEV_PATH)
-
-                if (!tagsResult.success) {
-                    echo "[CLEANUP] ⚠ Could not get tags for ${app}: ${tagsResult.error}"
-                    return
-                }
-
-                def allTags = tagsResult.tags
+                def appImages = devImagesResult.images[app]
+                def allTags = appImages.collect { it.tag }
                 echo "[CLEANUP] Found ${allTags.size()} dev builds for ${app}"
 
                 // Identify tags from orphaned branches
@@ -1927,16 +2067,16 @@ def cleanupTempManifests() {
                 echo "[CLEANUP] Continuing with branch-based cleanup only..."
             }
 
-            // Step 3: Get applications in metadata/temporary-builds
-            echo "\n[CLEANUP] Step 3: Processing metadata applications..."
-            def appsResult = getArtifactoryFolders(env.TEMP_BUILDS_PATH)
+            // Step 3: Get metadata files using AQL
+            echo "\n[CLEANUP] Step 3: Processing metadata files using AQL..."
+            def metadataResult = getMetadataFilesAQL(env.TEMP_BUILDS_PATH)
 
-            if (!appsResult.success) {
-                echo "[CLEANUP] ❌ Could not get metadata applications: ${appsResult.error}"
+            if (!metadataResult.success) {
+                echo "[CLEANUP] ❌ Could not get metadata files: ${metadataResult.error}"
                 return
             }
 
-            def apps = appsResult.folders
+            def apps = metadataResult.metadata.keySet()
             totalApps = apps.size()
             echo "[CLEANUP] Found ${totalApps} applications with metadata: ${apps.join(', ')}"
 
@@ -1949,57 +2089,46 @@ def cleanupTempManifests() {
             apps.each { app ->
                 echo "\n[CLEANUP] Processing metadata for app: ${app}"
 
-                // Get all manifest files for this app
-                def manifestsResult = getArtifactoryFolders("${env.TEMP_BUILDS_PATH}/${app}")
-
-                if (!manifestsResult.success) {
-                    echo "[CLEANUP] ⚠ Could not get manifests for ${app}: ${manifestsResult.error}"
-                    return
-                }
-
-                def manifests = manifestsResult.folders
-                echo "[CLEANUP] Found ${manifests.size()} manifest files for ${app}"
+                def appMetadata = metadataResult.metadata[app]
+                echo "[CLEANUP] Found ${appMetadata.size()} manifest files for ${app}"
 
                 // Process each manifest file
-                manifests.each { manifestFile ->
+                appMetadata.each { fileInfo ->
                     def shouldDelete = false
                     def deleteReason = ""
 
                     // Check if manifest is from an orphaned branch
-                    def branchName = extractBranchFromManifest(manifestFile)
+                    def branchName = extractBranchFromManifest(fileInfo.filename)
                     if (branchName && !activeBranches.contains(branchName)) {
                         shouldDelete = true
                         deleteReason = "orphaned branch: ${branchName}"
                     }
 
                     // Check if manifest is too old (if cutoff date is available)
-                    if (!shouldDelete && cutoffDate) {
-                        def fileInfoResult = getArtifactoryFileInfo("${env.TEMP_BUILDS_PATH}/${app}/${manifestFile}")
-                        if (fileInfoResult.success && fileInfoResult.created) {
-                            if (fileInfoResult.created < cutoffDate) {
-                                shouldDelete = true
-                                deleteReason = "older than ${env.DEV_RETENTION_DAYS} days (created: ${fileInfoResult.created})"
-                            }
+                    if (!shouldDelete && cutoffDate && fileInfo.created) {
+                        if (fileInfo.created < cutoffDate) {
+                            shouldDelete = true
+                            deleteReason = "older than ${env.DEV_RETENTION_DAYS} days (created: ${fileInfo.created})"
                         }
                     }
 
                     // Delete if needed
                     if (shouldDelete) {
                         if (params.DRY_RUN_CLEANUP) {
-                            echo "[CLEANUP] 🧪 [DRY RUN] Would delete ${app}/${manifestFile} (${deleteReason})"
+                            echo "[CLEANUP] 🧪 [DRY RUN] Would delete ${fileInfo.fullPath} (${deleteReason})"
                         } else {
-                            echo "[CLEANUP] Deleting ${app}/${manifestFile} (${deleteReason})..."
-                            def deleteResult = deleteArtifactoryPath("${env.TEMP_BUILDS_PATH}/${app}/${manifestFile}")
+                            echo "[CLEANUP] Deleting ${fileInfo.fullPath} (${deleteReason})..."
+                            def deleteResult = deleteArtifactoryPath(fileInfo.fullPath)
 
                             if (deleteResult.success) {
-                                echo "[CLEANUP] ✅ Deleted ${app}/${manifestFile}"
+                                echo "[CLEANUP] ✅ Deleted ${fileInfo.fullPath}"
                                 totalDeleted++
                             } else {
-                                echo "[CLEANUP] ❌ Failed to delete ${app}/${manifestFile}: ${deleteResult.error}"
+                                echo "[CLEANUP] ❌ Failed to delete ${fileInfo.fullPath}: ${deleteResult.error}"
                             }
                         }
                     } else {
-                        echo "[CLEANUP] ✅ Keeping ${app}/${manifestFile} (active branch or recent)"
+                        echo "[CLEANUP] ✅ Keeping ${fileInfo.filename} (active branch or recent)"
                     }
                 }
             }
