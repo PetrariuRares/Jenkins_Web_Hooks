@@ -1250,13 +1250,12 @@ def executeAQL(aqlQuery, maxRetries = 3) {
 
 // Get Docker images using AQL (more efficient than REST API)
 def getDockerImagesAQL(repositoryPath, appName = null) {
-    def aqlQuery = """
-        items.find({
-            "repo": "${env.DOCKER_REPO}",
-            "path": {"\\$match": "${repositoryPath}${appName ? '/' + appName : '/*'}"},
-            "name": {"\\$match": "manifest.json"}
-        }).include("path", "name", "created", "size")
-    """
+    def pathPattern = repositoryPath + (appName ? '/' + appName : '/*')
+    def aqlQuery = """items.find({
+    "repo": "${env.DOCKER_REPO}",
+    "path": {"\$match": "${pathPattern}"},
+    "name": {"\$match": "manifest.json"}
+}).include("path", "name", "created", "size")"""
 
     def result = executeAQL(aqlQuery)
 
@@ -1288,13 +1287,12 @@ def getDockerImagesAQL(repositoryPath, appName = null) {
 
 // Get metadata files using AQL
 def getMetadataFilesAQL(metadataPath) {
-    def aqlQuery = """
-        items.find({
-            "repo": "${env.DOCKER_REPO}",
-            "path": {"\\$match": "${metadataPath}/*"},
-            "name": {"\\$match": "*.json"}
-        }).include("path", "name", "created", "size")
-    """
+    def pathPattern = metadataPath + "/*"
+    def aqlQuery = """items.find({
+    "repo": "${env.DOCKER_REPO}",
+    "path": {"\$match": "${pathPattern}"},
+    "name": {"\$match": "*.json"}
+}).include("path", "name", "created", "size")"""
 
     def result = executeAQL(aqlQuery)
 
@@ -1608,79 +1606,108 @@ def getDockerTags(appName, repositoryPath, maxRetries = 3) {
 def getActiveBranches() {
     try {
         echo "    🔍 Detecting active Git branches..."
+        echo "    Debug: WORKSPACE = ${env.WORKSPACE}"
+        echo "    Debug: GIT_BRANCH_NAME = ${env.GIT_BRANCH_NAME}"
+        echo "    Debug: BUILD_NUMBER = ${env.BUILD_NUMBER}"
 
         def activeBranches = [] as Set
 
-        // Method 1: Get remote branches (most reliable)
+        // Method 1: Use Jenkins environment variables first
         try {
-            def remoteBranches = bat(
-                script: '@git branch -r 2>nul || echo ""',
-                returnStdout: true
-            ).trim()
-
-            if (remoteBranches) {
-                remoteBranches.split('\r?\n').each { branch ->
-                    if (branch && branch.trim()) {
-                        def cleanBranch = branch.trim()
-                        // Remove origin/ prefix if present
-                        if (cleanBranch.startsWith('origin/')) {
-                            cleanBranch = cleanBranch.replaceAll('^origin/', '')
-                        }
-                        // Skip HEAD references
-                        if (!cleanBranch.contains('HEAD') && cleanBranch != '' && !cleanBranch.contains('->')) {
-                            activeBranches.add(cleanBranch)
-                        }
-                    }
-                }
-                echo "    📋 Found ${activeBranches.size()} remote branches"
+            if (env.GIT_BRANCH_NAME && env.GIT_BRANCH_NAME != 'unknown') {
+                activeBranches.add(env.GIT_BRANCH_NAME)
+                echo "    📋 Added current branch from Jenkins env: ${env.GIT_BRANCH_NAME}"
             }
         } catch (Exception e) {
-            echo "    ⚠ Could not get remote branches: ${e.message}"
+            echo "    ⚠ Could not get branch from Jenkins env: ${e.message}"
         }
 
-        // Method 2: Get local branches as backup
+        // Method 2: Try Git commands with better error handling
         try {
-            def localBranches = bat(
-                script: '@git branch 2>nul || echo ""',
-                returnStdout: true
-            ).trim()
+            echo "    🔍 Attempting Git branch detection..."
+            echo "    Working directory: ${env.WORKSPACE}"
 
-            if (localBranches) {
-                localBranches.split('\r?\n').each { branch ->
-                    if (branch && branch.trim()) {
-                        def cleanBranch = branch.trim().replaceAll('^\\* ', '')
-                        if (cleanBranch != '' && !cleanBranch.contains('HEAD')) {
-                            activeBranches.add(cleanBranch)
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            echo "    ⚠ Could not get local branches: ${e.message}"
-        }
+            // Check if we're in a Git repository
+            def gitCheck = bat(
+                script: '@git status --porcelain 2>nul',
+                returnStatus: true
+            )
 
-        // Method 3: Fallback - get current branch at minimum
-        if (activeBranches.size() == 0) {
-            try {
-                def currentBranch = bat(
-                    script: '@git rev-parse --abbrev-ref HEAD 2>nul || echo ""',
+            if (gitCheck == 0) {
+                echo "    ✅ Git repository detected"
+
+                // Get remote branches
+                def remoteBranches = bat(
+                    script: '@git branch -r 2>nul',
                     returnStdout: true
                 ).trim()
 
-                if (currentBranch && currentBranch != 'HEAD' && currentBranch != '') {
-                    activeBranches.add(currentBranch)
-                    echo "    📋 Added current branch as fallback: ${currentBranch}"
+                if (remoteBranches && remoteBranches != '') {
+                    remoteBranches.split('\r?\n').each { branch ->
+                        if (branch && branch.trim()) {
+                            def cleanBranch = branch.trim()
+                            // Remove origin/ prefix if present
+                            if (cleanBranch.startsWith('origin/')) {
+                                cleanBranch = cleanBranch.replaceAll('^origin/', '')
+                            }
+                            // Skip HEAD references
+                            if (!cleanBranch.contains('HEAD') && cleanBranch != '' && !cleanBranch.contains('->')) {
+                                activeBranches.add(cleanBranch)
+                            }
+                        }
+                    }
+                    echo "    📋 Found ${activeBranches.size()} remote branches via Git"
+                }
+
+                // Get current branch as backup
+                if (activeBranches.size() == 0) {
+                    def currentBranch = bat(
+                        script: '@git rev-parse --abbrev-ref HEAD 2>nul',
+                        returnStdout: true
+                    ).trim()
+
+                    if (currentBranch && currentBranch != 'HEAD' && currentBranch != '') {
+                        activeBranches.add(currentBranch)
+                        echo "    📋 Added current branch: ${currentBranch}"
+                    }
+                }
+            } else {
+                echo "    ⚠ Not in a Git repository or Git not available"
+            }
+        } catch (Exception e) {
+            echo "    ⚠ Git command failed: ${e.message}"
+        }
+
+        // Method 3: Use SCM information if available
+        if (activeBranches.size() == 0) {
+            try {
+                if (scm && scm.branches) {
+                    scm.branches.each { branch ->
+                        def branchName = branch.name
+                        if (branchName.startsWith('*/')) {
+                            branchName = branchName.substring(2)
+                        }
+                        if (branchName && branchName != '') {
+                            activeBranches.add(branchName)
+                        }
+                    }
+                    echo "    📋 Found ${activeBranches.size()} branches from SCM config"
                 }
             } catch (Exception e) {
-                echo "    ⚠ Could not get current branch: ${e.message}"
+                echo "    ⚠ Could not get branches from SCM: ${e.message}"
             }
         }
 
-        // Method 4: Last resort - add main/master if nothing else works
+        // Method 4: Last resort - add main/master and current branch if nothing else works
         if (activeBranches.size() == 0) {
-            echo "    ⚠ No branches detected, adding main/master as fallback"
+            echo "    ⚠ No branches detected, adding fallback branches"
             activeBranches.add('main')
             activeBranches.add('master')
+
+            // Also add the current branch name from Jenkins if available
+            if (env.GIT_BRANCH_NAME && env.GIT_BRANCH_NAME != 'unknown') {
+                activeBranches.add(env.GIT_BRANCH_NAME)
+            }
         }
 
         // Convert Set to List and sort
@@ -2051,6 +2078,20 @@ def cleanupTempManifests() {
             def branchResult = getActiveBranches()
             def activeBranches = branchResult.branches ?: []
             echo "[CLEANUP] Active branches: ${activeBranches.join(', ')}"
+
+            // If no branches detected and this is dry run, add some test branches for demonstration
+            if (activeBranches.size() <= 2 && params.DRY_RUN_CLEANUP) {
+                echo "[CLEANUP] 🧪 DRY RUN: Adding test branches for demonstration"
+                activeBranches.addAll(['feature-test', 'bugfix-demo', 'develop'])
+                echo "[CLEANUP] 🧪 DRY RUN: Extended branches list: ${activeBranches.join(', ')}"
+            }
+
+            // If no branches detected and this is dry run, add some test branches for demonstration
+            if (activeBranches.size() <= 2 && params.DRY_RUN_CLEANUP) {
+                echo "[CLEANUP] 🧪 DRY RUN: Adding test branches for demonstration"
+                activeBranches.addAll(['feature-test', 'bugfix-demo', 'develop'])
+                echo "[CLEANUP] 🧪 DRY RUN: Extended branches list: ${activeBranches.join(', ')}"
+            }
 
             // Step 2: Get cutoff date for time-based cleanup
             def cutoffDate = ''
