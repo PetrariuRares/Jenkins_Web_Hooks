@@ -716,6 +716,7 @@ pipeline {
                         } else if (params.AUTO_CLEANUP_AFTER_BUILD && env.BUILD_COMPLETE == 'true') {
                             // Lightweight cleanup after build - only clean orphaned dev images
                             echo "[CLEANUP] Running automatic cleanup after build"
+                            echo "[CLEANUP] This will remove images from branches that no longer exist"
                             cleanupDevImages()
                         } else {
                             // Full cleanup
@@ -1017,8 +1018,10 @@ def cleanupDevImages() {
             
             // Step 2: Get list of all app folders in docker-dev from Artifactory
             echo "\n[CLEANUP] Step 2: Fetching docker-dev structure from Artifactory..."
-            
+
             def appsUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}"
+            echo "[CLEANUP] API URL: ${appsUrl}"
+
             def appsResponse = bat(
                 script: """
                     @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${appsUrl}" 2>nul
@@ -1028,16 +1031,36 @@ def cleanupDevImages() {
             
             // Parse apps from JSON response
             def apps = []
-            def appParser = new groovy.json.JsonSlurperClassic()
             try {
-                def appsJson = appParser.parseText(appsResponse)
-                appsJson.children.each { child ->
-                    if (child.folder && !child.uri.startsWith('/.')) {
-                        apps.add(child.uri.substring(1))  // Remove leading '/'
+                echo "[CLEANUP] API Response length: ${appsResponse.length()}"
+                echo "[CLEANUP] API Response preview: ${appsResponse.take(200)}..."
+
+                if (appsResponse && appsResponse.trim() && appsResponse.contains('{')) {
+                    def appParser = new groovy.json.JsonSlurper()
+                    def appsJson = appParser.parseText(appsResponse)
+
+                    if (appsJson.children) {
+                        appsJson.children.each { child ->
+                            if (child.folder && !child.uri.startsWith('/.')) {
+                                apps.add(child.uri.substring(1))  // Remove leading '/'
+                            }
+                        }
+                    }
+                } else {
+                    echo "[CLEANUP] Invalid or empty API response, trying fallback parsing"
+                    // Fallback to simple parsing
+                    if (appsResponse.contains('"uri"')) {
+                        appsResponse.split('"uri"\\s*:\\s*"')[1..-1].each { part ->
+                            def appName = part.split('"')[0].replaceAll('/', '')
+                            if (appName && !appName.contains('.')) {
+                                apps.add(appName)
+                            }
+                        }
                     }
                 }
             } catch (Exception e) {
-                echo "[CLEANUP] Error parsing apps: ${e.message}"
+                echo "[CLEANUP] Error parsing apps JSON: ${e.message}"
+                echo "[CLEANUP] Raw response: ${appsResponse}"
                 // Fallback to simple parsing
                 if (appsResponse.contains('"uri"')) {
                     appsResponse.split('"uri"\\s*:\\s*"')[1..-1].each { part ->
@@ -1066,7 +1089,19 @@ def cleanupDevImages() {
                 ).trim()
                 echo "[CLEANUP] Will also delete images created before: ${cutoffDate}"
             } catch (Exception e) {
-                echo "[CLEANUP] Could not calculate cutoff date: ${e.message}"
+                echo "[CLEANUP] Could not calculate cutoff date using PowerShell: ${e.message}"
+                echo "[CLEANUP] Trying alternative date calculation..."
+                try {
+                    // Fallback: use current timestamp minus retention days in seconds
+                    def currentTime = System.currentTimeMillis()
+                    def retentionMillis = Integer.parseInt(env.DEV_RETENTION_DAYS) * 24 * 60 * 60 * 1000
+                    def cutoffTime = new Date(currentTime - retentionMillis)
+                    cutoffDate = cutoffTime.format('yyyy-MM-ddTHH:mm:ss')
+                    echo "[CLEANUP] Using fallback cutoff date: ${cutoffDate}"
+                } catch (Exception e2) {
+                    echo "[CLEANUP] All date calculation methods failed: ${e2.message}"
+                    cutoffDate = '' // Will skip time-based cleanup
+                }
             }
             
             // Step 3: Process each app
@@ -1084,14 +1119,32 @@ def cleanupDevImages() {
                 
                 // Parse tags
                 def tags = []
-                def tagParser = new groovy.json.JsonSlurperClassic()
                 try {
-                    def tagsJson = tagParser.parseText(tagsResponse)
-                    if (tagsJson.tags) {
-                        tags = tagsJson.tags
+                    echo "  Tags API Response length: ${tagsResponse.length()}"
+                    echo "  Tags API Response preview: ${tagsResponse.take(200)}..."
+
+                    if (tagsResponse && tagsResponse.trim() && tagsResponse.contains('{')) {
+                        def tagParser = new groovy.json.JsonSlurper()
+                        def tagsJson = tagParser.parseText(tagsResponse)
+                        if (tagsJson.tags) {
+                            tags = tagsJson.tags
+                        }
+                    } else {
+                        echo "  Invalid tags response, trying fallback parsing"
+                        // Fallback parsing
+                        if (tagsResponse.contains('"tags"')) {
+                            def tagsSection = tagsResponse.split('"tags"\\s*:\\s*\\[')[1].split('\\]')[0]
+                            tagsSection.split(',').each { tag ->
+                                def cleanTag = tag.replaceAll('["\r\n\\s]', '')
+                                if (cleanTag) {
+                                    tags.add(cleanTag)
+                                }
+                            }
+                        }
                     }
                 } catch (Exception e) {
-                    echo "  Error parsing tags: ${e.message}"
+                    echo "  Error parsing tags JSON: ${e.message}"
+                    echo "  Raw tags response: ${tagsResponse}"
                     // Fallback parsing
                     if (tagsResponse.contains('"tags"')) {
                         def tagsSection = tagsResponse.split('"tags"\\s*:\\s*\\[')[1].split('\\]')[0]
@@ -1114,19 +1167,35 @@ def cleanupDevImages() {
                     def shouldDelete = false
                     def reason = ""
                     
-                    // Check 1: Branch existence
+                    // Check 1: Branch existence (improved matching)
                     def branchFound = false
+                    def tagLower = tag.toLowerCase()
+
+                    echo "    Checking tag: ${tag}"
+
                     activeBranches.each { branch ->
-                        if (tag.toLowerCase().startsWith(branch + '-') || tag.toLowerCase() == branch) {
+                        def branchLower = branch.toLowerCase()
+                        // Check multiple patterns:
+                        // 1. tag starts with "branch-" (feature branch pattern)
+                        // 2. tag equals branch name exactly
+                        // 3. tag starts with branch name followed by dash and commit hash
+                        if (tagLower.startsWith(branchLower + '-') ||
+                            tagLower == branchLower ||
+                            (tagLower.contains('-') && tagLower.split('-')[0] == branchLower)) {
                             branchFound = true
+                            echo "      ✓ Branch found: ${branch}"
                         }
                     }
-                    
+
                     if (!branchFound) {
-                        // Don't delete if it's from main/master
-                        if (!tag.startsWith('main-') && !tag.startsWith('master-')) {
+                        // Don't delete if it's from main/master branches
+                        if (!tagLower.startsWith('main-') && !tagLower.startsWith('master-') &&
+                            !tagLower.equals('main') && !tagLower.equals('master')) {
                             shouldDelete = true
                             reason = "branch no longer exists"
+                            echo "      ✗ Branch not found - will delete"
+                        } else {
+                            echo "      ✓ Main/master branch - keeping"
                         }
                     }
                     
@@ -1238,16 +1307,21 @@ def cleanupSpecificBranch(branchName) {
         ).trim()
         
         def apps = []
-        def parser = new groovy.json.JsonSlurperClassic()
         try {
-            def appsJson = parser.parseText(appsResponse)
-            appsJson.children.each { child ->
-                if (child.folder) {
-                    apps.add(child.uri.substring(1))
+            if (appsResponse && appsResponse.trim() && appsResponse.contains('{')) {
+                def parser = new groovy.json.JsonSlurper()
+                def appsJson = parser.parseText(appsResponse)
+                if (appsJson.children) {
+                    appsJson.children.each { child ->
+                        if (child.folder) {
+                            apps.add(child.uri.substring(1))
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
-            echo "[CLEANUP] Error parsing apps: ${e.message}"
+            echo "[CLEANUP] Error parsing apps for specific branch cleanup: ${e.message}"
+            echo "[CLEANUP] Raw response: ${appsResponse}"
         }
         
         def totalDeleted = 0
@@ -1266,10 +1340,14 @@ def cleanupSpecificBranch(branchName) {
             
             def tags = []
             try {
-                def tagsJson = parser.parseText(tagsResponse)
-                tags = tagsJson.tags ?: []
+                if (tagsResponse && tagsResponse.trim() && tagsResponse.contains('{')) {
+                    def parser = new groovy.json.JsonSlurper()
+                    def tagsJson = parser.parseText(tagsResponse)
+                    tags = tagsJson.tags ?: []
+                }
             } catch (Exception e) {
-                echo "  Error parsing tags: ${e.message}"
+                echo "  Error parsing tags for branch cleanup: ${e.message}"
+                echo "  Raw tags response: ${tagsResponse}"
             }
             
             // Delete matching tags
@@ -1316,25 +1394,30 @@ def cleanupBranchMetadata(branchName) {
             returnStdout: true
         ).trim()
         
-        def parser = new groovy.json.JsonSlurperClassic()
         try {
-            def metadataJson = parser.parseText(metadataResponse)
-            metadataJson.children.each { child ->
-                if (child.uri.contains(branchName)) {
-                    if (params.DRY_RUN_CLEANUP) {
-                        echo "  [DRY RUN] Would delete metadata: ${child.uri}"
-                    } else {
-                        echo "  Deleting metadata: ${child.uri}"
-                        def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}${child.uri}"
-                        bat """
-                            @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                 -X DELETE "${deleteUrl}" 2>nul
-                        """
+            if (metadataResponse && metadataResponse.trim() && metadataResponse.contains('{')) {
+                def parser = new groovy.json.JsonSlurper()
+                def metadataJson = parser.parseText(metadataResponse)
+                if (metadataJson.children) {
+                    metadataJson.children.each { child ->
+                        if (child.uri.contains(branchName)) {
+                            if (params.DRY_RUN_CLEANUP) {
+                                echo "  [DRY RUN] Would delete metadata: ${child.uri}"
+                            } else {
+                                echo "  Deleting metadata: ${child.uri}"
+                                def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}${child.uri}"
+                                bat """
+                                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                         -X DELETE "${deleteUrl}" 2>nul
+                                """
+                            }
+                        }
                     }
                 }
             }
         } catch (Exception e) {
             echo "[CLEANUP] Error cleaning metadata: ${e.message}"
+            echo "[CLEANUP] Raw metadata response: ${metadataResponse}"
         }
     }
 }
@@ -1373,16 +1456,21 @@ def cleanupLatestImages() {
         ).trim()
         
         def apps = []
-        def parser = new groovy.json.JsonSlurperClassic()
         try {
-            def appsJson = parser.parseText(appsResponse)
-            appsJson.children.each { child ->
-                if (child.folder) {
-                    apps.add(child.uri.substring(1))
+            if (appsResponse && appsResponse.trim() && appsResponse.contains('{')) {
+                def parser = new groovy.json.JsonSlurper()
+                def appsJson = parser.parseText(appsResponse)
+                if (appsJson.children) {
+                    appsJson.children.each { child ->
+                        if (child.folder) {
+                            apps.add(child.uri.substring(1))
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
-            echo "[CLEANUP] Error parsing apps: ${e.message}"
+            echo "[CLEANUP] Error parsing apps for latest cleanup: ${e.message}"
+            echo "[CLEANUP] Raw response: ${appsResponse}"
         }
         
         echo "[CLEANUP] Found ${apps.size()} apps in docker-latest"
@@ -1401,10 +1489,14 @@ def cleanupLatestImages() {
             
             def versions = []
             try {
-                def versionsJson = parser.parseText(versionsResponse)
-                versions = versionsJson.tags ?: []
+                if (versionsResponse && versionsResponse.trim() && versionsResponse.contains('{')) {
+                    def parser = new groovy.json.JsonSlurper()
+                    def versionsJson = parser.parseText(versionsResponse)
+                    versions = versionsJson.tags ?: []
+                }
             } catch (Exception e) {
-                echo "  Error parsing versions: ${e.message}"
+                echo "  Error parsing versions for latest cleanup: ${e.message}"
+                echo "  Raw versions response: ${versionsResponse}"
             }
             
             // Filter out 'latest' tag and sort versions
@@ -1495,45 +1587,50 @@ def cleanupTempManifests() {
                 returnStdout: true
             ).trim()
             
-            def parser = new groovy.json.JsonSlurperClassic()
             def deleted = 0
-            
+
             try {
-                def manifestsJson = parser.parseText(manifestsResponse)
-                manifestsJson.children.each { child ->
-                    if (!child.folder) {
-                        // Get file metadata
-                        def fileUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}${child.uri}"
-                        def fileResponse = bat(
-                            script: """
-                                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${fileUrl}" 2>nul
-                            """,
-                            returnStdout: true
-                        ).trim()
-                        
-                        if (fileResponse.contains('"created"')) {
-                            def created = fileResponse.split('"created"\\s*:\\s*"')[1].split('"')[0]
-                            if (created < cutoffDate) {
-                                if (params.DRY_RUN_CLEANUP) {
-                                    echo "  [DRY RUN] Would delete manifest: ${child.uri}"
-                                    deleted++
-                                } else {
-                                    echo "  Deleting old manifest: ${child.uri}"
-                                    def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}${child.uri}"
-                                    bat """
-                                        @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                             -X DELETE "${deleteUrl}" 2>nul
-                                    """
-                                    deleted++
+                if (manifestsResponse && manifestsResponse.trim() && manifestsResponse.contains('{')) {
+                    def parser = new groovy.json.JsonSlurper()
+                    def manifestsJson = parser.parseText(manifestsResponse)
+                    if (manifestsJson.children) {
+                        manifestsJson.children.each { child ->
+                            if (!child.folder) {
+                                // Get file metadata
+                                def fileUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}${child.uri}"
+                                def fileResponse = bat(
+                                    script: """
+                                        @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${fileUrl}" 2>nul
+                                    """,
+                                    returnStdout: true
+                                ).trim()
+
+                                if (fileResponse.contains('"created"')) {
+                                    def created = fileResponse.split('"created"\\s*:\\s*"')[1].split('"')[0]
+                                    if (created < cutoffDate) {
+                                        if (params.DRY_RUN_CLEANUP) {
+                                            echo "  [DRY RUN] Would delete manifest: ${child.uri}"
+                                            deleted++
+                                        } else {
+                                            echo "  Deleting old manifest: ${child.uri}"
+                                            def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}${child.uri}"
+                                            bat """
+                                                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                                     -X DELETE "${deleteUrl}" 2>nul
+                                            """
+                                            deleted++
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                
+
                 echo "[CLEANUP] Deleted ${deleted} old manifests"
             } catch (Exception e) {
                 echo "[CLEANUP] Error cleaning manifests: ${e.message}"
+                echo "[CLEANUP] Raw manifests response: ${manifestsResponse}"
             }
         } catch (Exception e) {
             echo "[CLEANUP] Error calculating cutoff date: ${e.message}"
