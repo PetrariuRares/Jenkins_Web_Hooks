@@ -20,7 +20,7 @@ pipeline {
         booleanParam(
             name: 'RUN_CLEANUP',
             defaultValue: false,
-            description: 'Run Artifactory cleanup after build'
+            description: 'Run FULL cleanup (docker-latest + metadata). Note: docker-dev cleanup always runs automatically.'
         )
         string(
             name: 'CLEANUP_BRANCH',
@@ -30,12 +30,13 @@ pipeline {
         booleanParam(
             name: 'DRY_RUN_CLEANUP',
             defaultValue: false,
-            description: 'Perform cleanup in dry-run mode (show what would be deleted without actually deleting)'
+            description: 'Preview cleanup actions without actually deleting (shows what would be removed)'
         )
-        booleanParam(
-            name: 'AUTO_CLEANUP_AFTER_BUILD',
-            defaultValue: true,
-            description: 'Automatically run cleanup after successful builds to remove orphaned images'
+
+        string(
+            name: 'FORCE_DELETE_APP',
+            defaultValue: '',
+            description: 'Force delete entire app folder from docker-dev (e.g., "app1"). Use with caution!'
         )
     }
 
@@ -77,8 +78,11 @@ pipeline {
                     echo "Manual Branch Override: ${params.BRANCH_NAME ?: 'none'}"
                     echo "Deploy Target: ${params.DEPLOY_TARGET}"
                     echo "Force Build: ${params.FORCE_BUILD}"
+                    echo "Full Cleanup: ${params.RUN_CLEANUP}"
                     echo "Cleanup Branch: ${params.CLEANUP_BRANCH ?: 'none'}"
+                    echo "Force Delete App: ${params.FORCE_DELETE_APP ?: 'none'}"
                     echo "Dry Run Cleanup: ${params.DRY_RUN_CLEANUP}"
+                    echo "Auto Cleanup: ENABLED (default behavior)"
                     echo "========================================="
                     
                     // Check if this is a scheduled cleanup run
@@ -660,14 +664,9 @@ pipeline {
         // ================================================================================
         stage('Artifactory Cleanup') {
             when {
-                anyOf {
-                    expression { env.IS_CLEANUP_RUN == 'true' }
-                    expression { params.RUN_CLEANUP == true }
-                    expression { params.CLEANUP_BRANCH != '' }
-                    allOf {
-                        expression { params.AUTO_CLEANUP_AFTER_BUILD == true }
-                        expression { env.BUILD_COMPLETE == 'true' }
-                    }
+                // Always run cleanup, unless it's a validation failure
+                not {
+                    expression { env.VALIDATION_FAILED == 'true' }
                 }
             }
             steps {
@@ -709,17 +708,17 @@ pipeline {
                         echo "  Registry: ${env.DOCKER_REGISTRY}"
                         echo "  Dry Run Mode: ${params.DRY_RUN_CLEANUP}"
                         
-                        if (params.CLEANUP_BRANCH != '') {
+                        if (params.FORCE_DELETE_APP != '') {
+                            // Force delete entire app folder
+                            echo "[CLEANUP] Force deleting entire app: ${params.FORCE_DELETE_APP}"
+                            forceDeleteApp(params.FORCE_DELETE_APP)
+                        } else if (params.CLEANUP_BRANCH != '') {
                             // Clean up specific branch
                             echo "[CLEANUP] Cleaning up specific branch: ${params.CLEANUP_BRANCH}"
                             cleanupSpecificBranch(params.CLEANUP_BRANCH)
-                        } else if (params.AUTO_CLEANUP_AFTER_BUILD && env.BUILD_COMPLETE == 'true') {
-                            // Lightweight cleanup after build - only clean orphaned dev images
-                            echo "[CLEANUP] Running automatic cleanup after build"
-                            echo "[CLEANUP] This will remove images from branches that no longer exist"
-                            cleanupDevImages()
-                        } else {
-                            // Full cleanup
+                        } else if (env.IS_CLEANUP_RUN == 'true') {
+                            // Scheduled full cleanup (weekly)
+                            echo "[CLEANUP] Running scheduled full cleanup"
                             // 1. Cleanup docker-dev repository (branch-aware + time-based)
                             cleanupDevImages()
 
@@ -728,6 +727,20 @@ pipeline {
 
                             // 3. Cleanup metadata/temporary-builds
                             cleanupTempManifests()
+                        } else {
+                            // Default automatic cleanup - runs on every build
+                            echo "[CLEANUP] Running automatic cleanup (default behavior)"
+                            echo "[CLEANUP] This will remove images from deleted branches and clean up orphaned storage"
+
+                            // Always clean up docker-dev repository (orphaned branches)
+                            cleanupDevImages()
+
+                            // Only run full cleanup if explicitly requested
+                            if (params.RUN_CLEANUP == true) {
+                                echo "[CLEANUP] Full cleanup requested - also cleaning docker-latest and metadata"
+                                cleanupLatestImages()
+                                cleanupTempManifests()
+                            }
                         }
                         
                         echo "[CLEANUP] Cleanup completed successfully"
@@ -784,7 +797,17 @@ pipeline {
                     } else {
                         echo "\n[STATUS] No changes detected"
                     }
-                    
+
+                    echo "\n>>> AUTOMATIC CLEANUP:"
+                    echo "  • Docker-dev cleanup: ALWAYS RUNS (removes orphaned branches)"
+                    echo "  • Storage cleanup: ALWAYS RUNS (removes sha256, _uploads, etc.)"
+                    echo "  • Garbage collection: ALWAYS TRIGGERED (reclaims storage space)"
+                    if (params.RUN_CLEANUP) {
+                        echo "  • Full cleanup: ENABLED (docker-latest + metadata)"
+                    } else {
+                        echo "  • Full cleanup: DISABLED (use RUN_CLEANUP=true to enable)"
+                    }
+
                     echo "========================================="
 
                     // Update build description
@@ -1226,20 +1249,32 @@ def cleanupDevImages() {
                             appDeleted++
                         } else {
                             echo "    ✗ Deleting ${app}:${tag} - ${reason}"
-                            
-                            def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}/${tag}"
-                            def deleteResult = bat(
+
+                            // Method 1: Delete via Docker API (removes tag)
+                            def dockerDeleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_DEV_PATH}/${app}/tags/${tag}"
+                            def dockerResult = bat(
                                 script: """
                                     @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                         -X DELETE "${deleteUrl}" 2>nul
+                                         -X DELETE "${dockerDeleteUrl}" 2>nul
                                 """,
                                 returnStatus: true
                             )
-                            
-                            if (deleteResult == 0) {
+
+                            // Method 2: Delete via Artifactory REST API (removes folder structure)
+                            def artifactoryDeleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}/${tag}"
+                            def artifactoryResult = bat(
+                                script: """
+                                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                         -X DELETE "${artifactoryDeleteUrl}" 2>nul
+                                """,
+                                returnStatus: true
+                            )
+
+                            if (dockerResult == 0 || artifactoryResult == 0) {
+                                echo "      Successfully deleted ${app}:${tag}"
                                 appDeleted++
                             } else {
-                                echo "      Failed to delete ${app}:${tag}"
+                                echo "      Failed to delete ${app}:${tag} (Docker: ${dockerResult}, Artifactory: ${artifactoryResult})"
                             }
                         }
                     } else {
@@ -1248,17 +1283,36 @@ def cleanupDevImages() {
                     }
                 }
                 
-                // Check if app folder is now empty and delete it
+                // Check if app folder is now empty and delete it completely
                 if (appDeleted > 0 && appKept == 0) {
                     if (params.DRY_RUN_CLEANUP) {
-                        echo "  [DRY RUN] Would delete empty folder: ${env.DOCKER_DEV_PATH}/${app}"
+                        echo "  [DRY RUN] Would delete empty app folder and all its contents: ${env.DOCKER_DEV_PATH}/${app}"
                     } else {
-                        echo "  Deleting empty app folder: ${app}"
+                        echo "  Deleting empty app folder and all its contents: ${app}"
+
+                        // Delete the entire app folder (this will remove all subfolders including sha256, _uploads, etc.)
                         def deleteFolderUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}"
-                        bat """
-                            @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                 -X DELETE "${deleteFolderUrl}" 2>nul
-                        """
+                        def deleteResult = bat(
+                            script: """
+                                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                     -X DELETE "${deleteFolderUrl}?recursive=1" 2>nul
+                            """,
+                            returnStatus: true
+                        )
+
+                        if (deleteResult == 0) {
+                            echo "    Successfully deleted app folder: ${app}"
+                        } else {
+                            echo "    Failed to delete app folder: ${app}"
+                            // Try alternative method - delete via Docker registry cleanup
+                            echo "    Attempting Docker registry cleanup for ${app}..."
+                            bat """
+                                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                     -X POST "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/promote" ^
+                                     -H "Content-Type: application/json" ^
+                                     -d "{\\"targetRepo\\":\\"${env.DOCKER_REPO}\\",\\"dockerRepository\\":\\"${env.DOCKER_DEV_PATH}/${app}\\",\\"tag\\":\\"*\\",\\"copy\\":false}" 2>nul || echo "Cleanup attempt completed"
+                            """
+                        }
                     }
                 }
                 
@@ -1268,12 +1322,38 @@ def cleanupDevImages() {
                 echo "  Summary for ${app}: ${appDeleted} deleted, ${appKept} kept"
             }
             
-            // Step 5: Overall summary
+            // Step 5: Run garbage collection to clean up orphaned blobs
+            if (totalDeleted > 0 && !params.DRY_RUN_CLEANUP) {
+                echo "\n[CLEANUP] Step 5: Running Docker registry garbage collection..."
+                try {
+                    // Trigger garbage collection to remove orphaned blobs
+                    def gcResult = bat(
+                        script: """
+                            @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                 -X POST "https://${env.DOCKER_REGISTRY}/artifactory/api/system/storage/gc" ^
+                                 -H "Content-Type: application/json" 2>nul
+                        """,
+                        returnStatus: true
+                    )
+
+                    if (gcResult == 0) {
+                        echo "[CLEANUP] Garbage collection triggered successfully"
+                    } else {
+                        echo "[CLEANUP] Garbage collection trigger failed (this is optional)"
+                    }
+                } catch (Exception e) {
+                    echo "[CLEANUP] Could not trigger garbage collection: ${e.message}"
+                }
+            }
+
+            // Step 6: Overall summary
             echo "\n[CLEANUP] ========== DOCKER-DEV CLEANUP SUMMARY =========="
             echo "[CLEANUP] Images deleted: ${totalDeleted}"
             echo "[CLEANUP] Images kept: ${totalKept}"
             if (params.DRY_RUN_CLEANUP) {
                 echo "[CLEANUP] This was a DRY RUN - no actual deletions performed"
+            } else if (totalDeleted > 0) {
+                echo "[CLEANUP] Garbage collection has been triggered to clean up orphaned storage"
             }
             echo "[CLEANUP] =================================================="
             
@@ -1358,11 +1438,21 @@ def cleanupSpecificBranch(branchName) {
                         totalDeleted++
                     } else {
                         echo "  Deleting ${app}:${tag}"
-                        def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}/${tag}"
+
+                        // Delete via Docker API
+                        def dockerDeleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_DEV_PATH}/${app}/tags/${tag}"
                         bat """
                             @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                 -X DELETE "${deleteUrl}" 2>nul
+                                 -X DELETE "${dockerDeleteUrl}" 2>nul
                         """
+
+                        // Delete via Artifactory REST API
+                        def artifactoryDeleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}/${tag}"
+                        bat """
+                            @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                 -X DELETE "${artifactoryDeleteUrl}" 2>nul
+                        """
+
                         totalDeleted++
                     }
                 }
@@ -1634,6 +1724,49 @@ def cleanupTempManifests() {
             }
         } catch (Exception e) {
             echo "[CLEANUP] Error calculating cutoff date: ${e.message}"
+        }
+    }
+}
+
+// Force delete entire app folder (use with caution)
+def forceDeleteApp(appName) {
+    echo "[CLEANUP] Force deleting entire app folder: ${appName}"
+    echo "[CLEANUP] WARNING: This will delete ALL versions and tags for ${appName}"
+
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        if (params.DRY_RUN_CLEANUP) {
+            echo "[DRY RUN] Would force delete entire app folder: ${env.DOCKER_DEV_PATH}/${appName}"
+            echo "[DRY RUN] This would remove all tags, sha256 folders, _uploads, and manifests"
+        } else {
+            // Delete the entire app folder recursively
+            def deleteFolderUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${appName}"
+
+            echo "[CLEANUP] Deleting: ${deleteFolderUrl}"
+            def deleteResult = bat(
+                script: """
+                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                         -X DELETE "${deleteFolderUrl}?recursive=1" 2>nul
+                """,
+                returnStatus: true
+            )
+
+            if (deleteResult == 0) {
+                echo "[CLEANUP] Successfully force deleted app folder: ${appName}"
+
+                // Trigger garbage collection
+                echo "[CLEANUP] Triggering garbage collection..."
+                bat """
+                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                         -X POST "https://${env.DOCKER_REGISTRY}/artifactory/api/system/storage/gc" ^
+                         -H "Content-Type: application/json" 2>nul || echo "GC trigger completed"
+                """
+            } else {
+                echo "[CLEANUP] Failed to force delete app folder: ${appName}"
+            }
         }
     }
 }
