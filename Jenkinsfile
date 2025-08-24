@@ -22,6 +22,16 @@ pipeline {
             defaultValue: false,
             description: 'Run Artifactory cleanup after build'
         )
+        string(
+            name: 'CLEANUP_BRANCH',
+            defaultValue: '',
+            description: 'Specific branch to clean up (e.g., after merging). Leave empty for full cleanup.'
+        )
+        booleanParam(
+            name: 'DRY_RUN_CLEANUP',
+            defaultValue: false,
+            description: 'Perform cleanup in dry-run mode (show what would be deleted without actually deleting)'
+        )
     }
 
     triggers {
@@ -62,6 +72,8 @@ pipeline {
                     echo "Manual Branch Override: ${params.BRANCH_NAME ?: 'none'}"
                     echo "Deploy Target: ${params.DEPLOY_TARGET}"
                     echo "Force Build: ${params.FORCE_BUILD}"
+                    echo "Cleanup Branch: ${params.CLEANUP_BRANCH ?: 'none'}"
+                    echo "Dry Run Cleanup: ${params.DRY_RUN_CLEANUP}"
                     echo "========================================="
                     
                     // Check if this is a scheduled cleanup run
@@ -641,6 +653,7 @@ pipeline {
                 anyOf {
                     expression { env.IS_CLEANUP_RUN == 'true' }
                     expression { params.RUN_CLEANUP == true }
+                    expression { params.CLEANUP_BRANCH != '' }
                 }
             }
             steps {
@@ -680,15 +693,23 @@ pipeline {
                         echo "  Dev retention: ${env.DEV_RETENTION_DAYS} days"
                         echo "  Latest versions to keep: ${env.LATEST_VERSIONS_TO_KEEP}"
                         echo "  Registry: ${env.DOCKER_REGISTRY}"
+                        echo "  Dry Run Mode: ${params.DRY_RUN_CLEANUP}"
                         
-                        // 1. Cleanup docker-dev repository
-                        cleanupDevImages()
-                        
-                        // 2. Cleanup docker-latest repository (keep last N versions per app)
-                        cleanupLatestImages()
-                        
-                        // 3. Cleanup metadata/temporary-builds
-                        cleanupTempManifests()
+                        if (params.CLEANUP_BRANCH != '') {
+                            // Clean up specific branch
+                            echo "[CLEANUP] Cleaning up specific branch: ${params.CLEANUP_BRANCH}"
+                            cleanupSpecificBranch(params.CLEANUP_BRANCH)
+                        } else {
+                            // Full cleanup
+                            // 1. Cleanup docker-dev repository (branch-aware + time-based)
+                            cleanupDevImages()
+                            
+                            // 2. Cleanup docker-latest repository (keep last N versions per app)
+                            cleanupLatestImages()
+                            
+                            // 3. Cleanup metadata/temporary-builds
+                            cleanupTempManifests()
+                        }
                         
                         echo "[CLEANUP] Cleanup completed successfully"
                     }
@@ -883,25 +904,370 @@ def createBuildManifest(appName, version) {
     echo "[MANIFEST] Uploaded ${manifestPath}/${appName}/${version}.json"
 }
 
-// Cleanup docker-dev images older than 14 days (Windows)
+// ================================================================================
+// ENHANCED CLEANUP FUNCTIONS
+// ================================================================================
+
+// Main cleanup function for docker-dev images (branch-aware + time-based)
 def cleanupDevImages() {
-    echo "[CLEANUP] Cleaning docker-dev images older than ${env.DEV_RETENTION_DAYS} days..."
+    echo "[CLEANUP] Starting enhanced docker-dev cleanup..."
+    echo "[CLEANUP] Strategy: Remove images from deleted/merged branches + images older than ${env.DEV_RETENTION_DAYS} days"
     
-    // Note: Complex date calculations and AQL queries may need adjustment for Windows
-    echo "[CLEANUP] Dev cleanup - implementation needs Windows-compatible date handling"
-    
-    // Simplified cleanup for Windows - you may need to adjust this
     withCredentials([usernamePassword(
         credentialsId: 'artifactory-credentials',
         usernameVariable: 'ARTIFACTORY_USER',
         passwordVariable: 'ARTIFACTORY_PASS'
     )]) {
-        // This is a simplified version - you may need to implement proper date handling for Windows
-        echo "[CLEANUP] Skipping complex dev cleanup on Windows - implement manual cleanup if needed"
+        try {
+            // Step 1: Get list of all active Git branches
+            echo "\n[CLEANUP] Step 1: Fetching active branches from Git..."
+            bat "git fetch --prune origin 2>nul"
+            
+            def branchOutput = bat(
+                script: '@git branch -r 2>nul',
+                returnStdout: true
+            ).trim()
+            
+            def activeBranches = []
+            branchOutput.split('\r?\n').each { branch ->
+                if (branch && branch.trim() && !branch.contains('HEAD')) {
+                    // Clean the branch name to match image tag format
+                    def cleanName = branch.trim()
+                        .replace('origin/', '')
+                        .replaceAll('[^a-zA-Z0-9._-]', '-')
+                        .toLowerCase()
+                    activeBranches.add(cleanName)
+                }
+            }
+            
+            echo "[CLEANUP] Found ${activeBranches.size()} active branches:"
+            activeBranches.each { echo "  - ${it}" }
+            
+            // Step 2: Get list of all app folders in docker-dev from Artifactory
+            echo "\n[CLEANUP] Step 2: Fetching docker-dev structure from Artifactory..."
+            
+            def appsUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}"
+            def appsResponse = bat(
+                script: """
+                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${appsUrl}" 2>nul
+                """,
+                returnStdout: true
+            ).trim()
+            
+            // Parse apps from JSON response
+            def apps = []
+            def appParser = new groovy.json.JsonSlurperClassic()
+            try {
+                def appsJson = appParser.parseText(appsResponse)
+                appsJson.children.each { child ->
+                    if (child.folder && !child.uri.startsWith('/.')) {
+                        apps.add(child.uri.substring(1))  // Remove leading '/'
+                    }
+                }
+            } catch (Exception e) {
+                echo "[CLEANUP] Error parsing apps: ${e.message}"
+                // Fallback to simple parsing
+                if (appsResponse.contains('"uri"')) {
+                    appsResponse.split('"uri"\\s*:\\s*"')[1..-1].each { part ->
+                        def appName = part.split('"')[0].replaceAll('/', '')
+                        if (appName && !appName.contains('.')) {
+                            apps.add(appName)
+                        }
+                    }
+                }
+            }
+            
+            echo "[CLEANUP] Found ${apps.size()} apps in docker-dev: ${apps.join(', ')}"
+            
+            def totalDeleted = 0
+            def totalKept = 0
+            def totalSizeFreed = 0
+            
+            // Get current date for time-based cleanup
+            def cutoffDate = ''
+            try {
+                cutoffDate = bat(
+                    script: """
+                        @powershell -Command "(Get-Date).AddDays(-${env.DEV_RETENTION_DAYS}).ToString('yyyy-MM-ddTHH:mm:ss')"
+                    """,
+                    returnStdout: true
+                ).trim()
+                echo "[CLEANUP] Will also delete images created before: ${cutoffDate}"
+            } catch (Exception e) {
+                echo "[CLEANUP] Could not calculate cutoff date: ${e.message}"
+            }
+            
+            // Step 3: Process each app
+            apps.each { app ->
+                echo "\n[CLEANUP] Processing ${app}..."
+                
+                // Get all tags/images for this app
+                def tagsUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_DEV_PATH}/${app}/tags/list"
+                def tagsResponse = bat(
+                    script: """
+                        @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${tagsUrl}" 2>nul
+                    """,
+                    returnStdout: true
+                ).trim()
+                
+                // Parse tags
+                def tags = []
+                def tagParser = new groovy.json.JsonSlurperClassic()
+                try {
+                    def tagsJson = tagParser.parseText(tagsResponse)
+                    if (tagsJson.tags) {
+                        tags = tagsJson.tags
+                    }
+                } catch (Exception e) {
+                    echo "  Error parsing tags: ${e.message}"
+                    // Fallback parsing
+                    if (tagsResponse.contains('"tags"')) {
+                        def tagsSection = tagsResponse.split('"tags"\\s*:\\s*\\[')[1].split('\\]')[0]
+                        tagsSection.split(',').each { tag ->
+                            def cleanTag = tag.replaceAll('["\r\n\\s]', '')
+                            if (cleanTag) {
+                                tags.add(cleanTag)
+                            }
+                        }
+                    }
+                }
+                
+                echo "  Found ${tags.size()} tags/images"
+                
+                def appDeleted = 0
+                def appKept = 0
+                
+                // Step 4: Decide which tags to delete
+                tags.each { tag ->
+                    def shouldDelete = false
+                    def reason = ""
+                    
+                    // Check 1: Branch existence
+                    def branchFound = false
+                    activeBranches.each { branch ->
+                        if (tag.toLowerCase().startsWith(branch + '-') || tag.toLowerCase() == branch) {
+                            branchFound = true
+                        }
+                    }
+                    
+                    if (!branchFound) {
+                        // Don't delete if it's from main/master
+                        if (!tag.startsWith('main-') && !tag.startsWith('master-')) {
+                            shouldDelete = true
+                            reason = "branch no longer exists"
+                        }
+                    }
+                    
+                    // Check 2: Age (if we have cutoff date and not already marked for deletion)
+                    if (!shouldDelete && cutoffDate) {
+                        // Get image metadata to check creation date
+                        def metadataUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}/${tag}"
+                        def metadataResponse = bat(
+                            script: """
+                                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${metadataUrl}" 2>nul
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (metadataResponse.contains('"created"')) {
+                            def created = metadataResponse.split('"created"\\s*:\\s*"')[1].split('"')[0]
+                            if (created < cutoffDate) {
+                                shouldDelete = true
+                                reason = "older than ${env.DEV_RETENTION_DAYS} days"
+                            }
+                        }
+                    }
+                    
+                    // Execute deletion or keep
+                    if (shouldDelete) {
+                        if (params.DRY_RUN_CLEANUP) {
+                            echo "    [DRY RUN] Would delete ${app}:${tag} - ${reason}"
+                            appDeleted++
+                        } else {
+                            echo "    ✗ Deleting ${app}:${tag} - ${reason}"
+                            
+                            def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}/${tag}"
+                            def deleteResult = bat(
+                                script: """
+                                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                         -X DELETE "${deleteUrl}" 2>nul
+                                """,
+                                returnStatus: true
+                            )
+                            
+                            if (deleteResult == 0) {
+                                appDeleted++
+                            } else {
+                                echo "      Failed to delete ${app}:${tag}"
+                            }
+                        }
+                    } else {
+                        echo "    ✓ Keeping ${app}:${tag} - branch still active"
+                        appKept++
+                    }
+                }
+                
+                // Check if app folder is now empty and delete it
+                if (appDeleted > 0 && appKept == 0) {
+                    if (params.DRY_RUN_CLEANUP) {
+                        echo "  [DRY RUN] Would delete empty folder: ${env.DOCKER_DEV_PATH}/${app}"
+                    } else {
+                        echo "  Deleting empty app folder: ${app}"
+                        def deleteFolderUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}"
+                        bat """
+                            @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                 -X DELETE "${deleteFolderUrl}" 2>nul
+                        """
+                    }
+                }
+                
+                totalDeleted += appDeleted
+                totalKept += appKept
+                
+                echo "  Summary for ${app}: ${appDeleted} deleted, ${appKept} kept"
+            }
+            
+            // Step 5: Overall summary
+            echo "\n[CLEANUP] ========== DOCKER-DEV CLEANUP SUMMARY =========="
+            echo "[CLEANUP] Images deleted: ${totalDeleted}"
+            echo "[CLEANUP] Images kept: ${totalKept}"
+            if (params.DRY_RUN_CLEANUP) {
+                echo "[CLEANUP] This was a DRY RUN - no actual deletions performed"
+            }
+            echo "[CLEANUP] =================================================="
+            
+        } catch (Exception e) {
+            echo "[CLEANUP] Error during docker-dev cleanup: ${e.message}"
+            echo "[CLEANUP] Stack trace: ${e.printStackTrace()}"
+        }
     }
 }
 
-// Cleanup docker-latest images keeping only last N versions (Windows)
+// Cleanup specific branch
+def cleanupSpecificBranch(branchName) {
+    echo "[CLEANUP] Cleaning up specific branch: ${branchName}"
+    
+    def cleanBranchName = branchName
+        .replaceAll('[^a-zA-Z0-9._-]', '-')
+        .toLowerCase()
+    
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        // Get list of apps
+        def appsUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}"
+        def appsResponse = bat(
+            script: """
+                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${appsUrl}" 2>nul
+            """,
+            returnStdout: true
+        ).trim()
+        
+        def apps = []
+        def parser = new groovy.json.JsonSlurperClassic()
+        try {
+            def appsJson = parser.parseText(appsResponse)
+            appsJson.children.each { child ->
+                if (child.folder) {
+                    apps.add(child.uri.substring(1))
+                }
+            }
+        } catch (Exception e) {
+            echo "[CLEANUP] Error parsing apps: ${e.message}"
+        }
+        
+        def totalDeleted = 0
+        
+        apps.each { app ->
+            echo "\n[CLEANUP] Checking ${app} for branch ${cleanBranchName}..."
+            
+            // Get tags for this app
+            def tagsUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_DEV_PATH}/${app}/tags/list"
+            def tagsResponse = bat(
+                script: """
+                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${tagsUrl}" 2>nul
+                """,
+                returnStdout: true
+            ).trim()
+            
+            def tags = []
+            try {
+                def tagsJson = parser.parseText(tagsResponse)
+                tags = tagsJson.tags ?: []
+            } catch (Exception e) {
+                echo "  Error parsing tags: ${e.message}"
+            }
+            
+            // Delete matching tags
+            tags.each { tag ->
+                if (tag.toLowerCase().startsWith(cleanBranchName + '-')) {
+                    if (params.DRY_RUN_CLEANUP) {
+                        echo "  [DRY RUN] Would delete ${app}:${tag}"
+                        totalDeleted++
+                    } else {
+                        echo "  Deleting ${app}:${tag}"
+                        def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}/${tag}"
+                        bat """
+                            @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                 -X DELETE "${deleteUrl}" 2>nul
+                        """
+                        totalDeleted++
+                    }
+                }
+            }
+        }
+        
+        echo "\n[CLEANUP] Deleted ${totalDeleted} images for branch: ${branchName}"
+        
+        // Also cleanup metadata for this branch
+        cleanupBranchMetadata(cleanBranchName)
+    }
+}
+
+// Cleanup metadata for a specific branch
+def cleanupBranchMetadata(branchName) {
+    echo "[CLEANUP] Cleaning metadata for branch: ${branchName}"
+    
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        // Clean up temporary-builds metadata
+        def metadataUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}"
+        def metadataResponse = bat(
+            script: """
+                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${metadataUrl}" 2>nul
+            """,
+            returnStdout: true
+        ).trim()
+        
+        def parser = new groovy.json.JsonSlurperClassic()
+        try {
+            def metadataJson = parser.parseText(metadataResponse)
+            metadataJson.children.each { child ->
+                if (child.uri.contains(branchName)) {
+                    if (params.DRY_RUN_CLEANUP) {
+                        echo "  [DRY RUN] Would delete metadata: ${child.uri}"
+                    } else {
+                        echo "  Deleting metadata: ${child.uri}"
+                        def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}${child.uri}"
+                        bat """
+                            @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                 -X DELETE "${deleteUrl}" 2>nul
+                        """
+                    }
+                }
+            }
+        } catch (Exception e) {
+            echo "[CLEANUP] Error cleaning metadata: ${e.message}"
+        }
+    }
+}
+
+// Enhanced cleanup for docker-latest images
 def cleanupLatestImages() {
     echo "[CLEANUP] Cleaning docker-latest images (keeping last ${env.LATEST_VERSIONS_TO_KEEP} versions)..."
     
@@ -920,14 +1286,185 @@ def cleanupLatestImages() {
         echo "  Warning: deployment-versions.yaml not found, no versions will be protected"
     }
     
-    // Note: Complex cleanup logic may need adjustment for Windows
-    echo "[CLEANUP] Latest cleanup - implementation needs adjustment for Windows environment"
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        // Get list of apps in docker-latest
+        def appsUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}"
+        def appsResponse = bat(
+            script: """
+                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${appsUrl}" 2>nul
+            """,
+            returnStdout: true
+        ).trim()
+        
+        def apps = []
+        def parser = new groovy.json.JsonSlurperClassic()
+        try {
+            def appsJson = parser.parseText(appsResponse)
+            appsJson.children.each { child ->
+                if (child.folder) {
+                    apps.add(child.uri.substring(1))
+                }
+            }
+        } catch (Exception e) {
+            echo "[CLEANUP] Error parsing apps: ${e.message}"
+        }
+        
+        echo "[CLEANUP] Found ${apps.size()} apps in docker-latest"
+        
+        apps.each { app ->
+            echo "\n[CLEANUP] Processing ${app}..."
+            
+            // Get all versions for this app
+            def versionsUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_LATEST_PATH}/${app}/tags/list"
+            def versionsResponse = bat(
+                script: """
+                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${versionsUrl}" 2>nul
+                """,
+                returnStdout: true
+            ).trim()
+            
+            def versions = []
+            try {
+                def versionsJson = parser.parseText(versionsResponse)
+                versions = versionsJson.tags ?: []
+            } catch (Exception e) {
+                echo "  Error parsing versions: ${e.message}"
+            }
+            
+            // Filter out 'latest' tag and sort versions
+            def semanticVersions = versions.findAll { 
+                it != 'latest' && it.matches('^\\d+\\.\\d+\\.\\d+$') 
+            }
+            
+            // Sort versions (newest first)
+            semanticVersions = semanticVersions.sort { a, b ->
+                def aParts = a.split('\\.').collect { Integer.parseInt(it) }
+                def bParts = b.split('\\.').collect { Integer.parseInt(it) }
+                
+                for (int i = 0; i < 3; i++) {
+                    if (aParts[i] != bParts[i]) {
+                        return bParts[i] - aParts[i]  // Descending order
+                    }
+                }
+                return 0
+            }
+            
+            echo "  Found ${semanticVersions.size()} versions"
+            
+            // Determine which versions to keep/delete
+            def versionsToKeep = []
+            def versionsToDelete = []
+            
+            semanticVersions.eachWithIndex { version, index ->
+                def isProtected = protectedVersions[app]?.contains(version)
+                def isRecent = index < Integer.parseInt(env.LATEST_VERSIONS_TO_KEEP)
+                
+                if (isProtected || isRecent) {
+                    versionsToKeep.add(version)
+                    echo "    ✓ Keep: ${version}${isProtected ? ' (protected)' : ''}"
+                } else {
+                    versionsToDelete.add(version)
+                    echo "    ✗ Delete: ${version}"
+                }
+            }
+            
+            // Delete old versions
+            versionsToDelete.each { version ->
+                if (params.DRY_RUN_CLEANUP) {
+                    echo "    [DRY RUN] Would delete ${app}:${version}"
+                } else {
+                    def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}/${version}"
+                    bat """
+                        @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                             -X DELETE "${deleteUrl}" 2>nul
+                    """
+                }
+            }
+            
+            if (versionsToDelete.size() > 0) {
+                echo "  Deleted ${versionsToDelete.size()} old versions"
+            } else {
+                echo "  No versions to delete"
+            }
+        }
+    }
 }
 
-// Cleanup temporary build manifests older than 14 days (Windows)
+// Cleanup temporary build manifests
 def cleanupTempManifests() {
     echo "[CLEANUP] Cleaning temporary build manifests older than ${env.DEV_RETENTION_DAYS} days..."
     
-    // Note: Complex date calculations may need adjustment for Windows
-    echo "[CLEANUP] Manifest cleanup - implementation needs Windows-compatible date handling"
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        try {
+            // Get cutoff date
+            def cutoffDate = bat(
+                script: """
+                    @powershell -Command "(Get-Date).AddDays(-${env.DEV_RETENTION_DAYS}).ToString('yyyy-MM-ddTHH:mm:ss')"
+                """,
+                returnStdout: true
+            ).trim()
+            
+            echo "[CLEANUP] Will delete manifests created before: ${cutoffDate}"
+            
+            // Get all manifests
+            def manifestsUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}"
+            def manifestsResponse = bat(
+                script: """
+                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${manifestsUrl}" 2>nul
+                """,
+                returnStdout: true
+            ).trim()
+            
+            def parser = new groovy.json.JsonSlurperClassic()
+            def deleted = 0
+            
+            try {
+                def manifestsJson = parser.parseText(manifestsResponse)
+                manifestsJson.children.each { child ->
+                    if (!child.folder) {
+                        // Get file metadata
+                        def fileUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}${child.uri}"
+                        def fileResponse = bat(
+                            script: """
+                                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% "${fileUrl}" 2>nul
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        if (fileResponse.contains('"created"')) {
+                            def created = fileResponse.split('"created"\\s*:\\s*"')[1].split('"')[0]
+                            if (created < cutoffDate) {
+                                if (params.DRY_RUN_CLEANUP) {
+                                    echo "  [DRY RUN] Would delete manifest: ${child.uri}"
+                                    deleted++
+                                } else {
+                                    echo "  Deleting old manifest: ${child.uri}"
+                                    def deleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.TEMP_BUILDS_PATH}${child.uri}"
+                                    bat """
+                                        @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                             -X DELETE "${deleteUrl}" 2>nul
+                                    """
+                                    deleted++
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                echo "[CLEANUP] Deleted ${deleted} old manifests"
+            } catch (Exception e) {
+                echo "[CLEANUP] Error cleaning manifests: ${e.message}"
+            }
+        } catch (Exception e) {
+            echo "[CLEANUP] Error calculating cutoff date: ${e.message}"
+        }
+    }
 }
