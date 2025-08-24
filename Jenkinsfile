@@ -38,6 +38,16 @@ pipeline {
             defaultValue: '',
             description: 'Force delete entire app folder from docker-dev (e.g., "app1"). Use with caution!'
         )
+        string(
+            name: 'SLACK_WEBHOOK_URL',
+            defaultValue: '',
+            description: 'Slack webhook URL for notifications (optional)'
+        )
+        booleanParam(
+            name: 'NOTIFY_ON_SUCCESS',
+            defaultValue: false,
+            description: 'Send notifications on successful builds (default: failures only)'
+        )
     }
 
     triggers {
@@ -414,21 +424,31 @@ pipeline {
                                 needsBuild = true
                                 reason = "Force build requested by user"
                             } else {
-                                // Check for file changes using existing function
-                                def changedFiles = checkAppChangedFiles(app)
-                                
+                                // Check for file changes using enhanced function
+                                def changeResult = checkAppChangedFiles(app)
+                                def changedFiles = changeResult.files ?: []
+                                def detectionMethod = changeResult.method ?: "unknown"
+                                def isFirstBuild = changeResult.firstBuild ?: false
+
+                                echo "  Detection method: ${detectionMethod}"
+                                if (changeResult.error) {
+                                    echo "  Detection error: ${changeResult.error}"
+                                }
+
                                 // Filter out README-only changes
                                 def significantChanges = changedFiles.findAll { !it.endsWith('README.md') }
                                 def hasSignificantChanges = significantChanges.size() > 0
 
                                 // Show what changed
                                 if (hasSignificantChanges) {
-                                    echo "  Files changed in ${app}:"
+                                    echo "  📝 Files changed in ${app} (${significantChanges.size()} significant):"
                                     significantChanges.each { file ->
                                         echo "    - ${file}"
                                     }
+                                } else if (changedFiles.size() > 0) {
+                                    echo "  📝 Only README changes in ${app} (${changedFiles.size()} total files)"
                                 } else {
-                                    echo "  No significant changes in ${app}"
+                                    echo "  ✅ No changes detected in ${app}"
                                 }
 
                                 // Determine the image tag
@@ -859,10 +879,37 @@ pipeline {
             }
         }
         success {
-            echo "[SUCCESS] Pipeline executed successfully!"
+            script {
+                echo "[SUCCESS] Pipeline executed successfully!"
+
+                def successMessage = "Build completed successfully"
+                def details = ""
+
+                if (env.HAS_CHANGES == 'true') {
+                    def apps = env.APPS_TO_BUILD?.split(',') ?: []
+                    details = "Built ${apps.size()} app(s): ${apps.join(', ')}"
+                } else {
+                    details = "No changes detected - cleanup performed"
+                }
+
+                if (params.NOTIFY_ON_SUCCESS) {
+                    sendNotification('SUCCESS', successMessage, details)
+                }
+            }
         }
         failure {
-            echo "[FAILURE] Pipeline failed!"
+            script {
+                echo "[FAILURE] Pipeline failed!"
+
+                def failureReason = "Build failed"
+                if (env.VALIDATION_FAILED == 'true') {
+                    failureReason = "Application validation failed"
+                } else if (env.NO_APPS == 'true') {
+                    failureReason = "No applications found"
+                }
+
+                sendNotification('FAILURE', failureReason, "Check build logs for details")
+            }
         }
     }
 }
@@ -871,36 +918,172 @@ pipeline {
 // HELPER FUNCTIONS
 // ================================================================================
 
-// Improved change detection function for Windows
+// Robust HTTP call with retry logic and proper error handling
+def makeHttpCall(url, method = 'GET', maxRetries = 3, retryDelay = 5) {
+    def attempt = 0
+    def lastError = null
+
+    while (attempt < maxRetries) {
+        attempt++
+        try {
+            echo "    🌐 HTTP ${method} attempt ${attempt}/${maxRetries}: ${url}"
+
+            def curlCommand = method == 'DELETE' ?
+                "@curl -s -w \"HTTPSTATUS:%{http_code}\" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% -X ${method} \"${url}\"" :
+                "@curl -s -w \"HTTPSTATUS:%{http_code}\" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \"${url}\""
+
+            def response = bat(
+                script: curlCommand,
+                returnStdout: true
+            ).trim()
+
+            def httpStatus = response.contains('HTTPSTATUS:') ?
+                response.split('HTTPSTATUS:')[1] : '000'
+            def responseBody = response.contains('HTTPSTATUS:') ?
+                response.split('HTTPSTATUS:')[0] : response
+
+            // Check if this is a successful response
+            if (httpStatus.startsWith('2') || httpStatus == '404') {
+                echo "    ✅ HTTP ${method} success: ${httpStatus}"
+                return [
+                    success: true,
+                    httpStatus: httpStatus,
+                    response: responseBody,
+                    attempt: attempt
+                ]
+            } else if (httpStatus.startsWith('5') && attempt < maxRetries) {
+                // Server error - retry
+                echo "    ⚠ HTTP ${method} server error: ${httpStatus} - retrying in ${retryDelay}s"
+                sleep(retryDelay)
+                lastError = "HTTP ${httpStatus}: ${responseBody}"
+                continue
+            } else {
+                // Client error or final attempt - don't retry
+                echo "    ❌ HTTP ${method} failed: ${httpStatus}"
+                return [
+                    success: false,
+                    httpStatus: httpStatus,
+                    response: responseBody,
+                    attempt: attempt,
+                    error: "HTTP ${httpStatus}: ${responseBody}"
+                ]
+            }
+        } catch (Exception e) {
+            lastError = e.message
+            echo "    ❌ HTTP ${method} exception on attempt ${attempt}: ${e.message}"
+
+            if (attempt < maxRetries) {
+                echo "    ⏳ Retrying in ${retryDelay} seconds..."
+                sleep(retryDelay)
+            }
+        }
+    }
+
+    // All attempts failed
+    return [
+        success: false,
+        httpStatus: '000',
+        response: '',
+        attempt: attempt,
+        error: "All ${maxRetries} attempts failed. Last error: ${lastError}"
+    ]
+}
+
+// Send notifications (Slack, email, etc.)
+def sendNotification(status, message, details = '') {
+    try {
+        def color = status == 'SUCCESS' ? 'good' : (status == 'FAILURE' ? 'danger' : 'warning')
+        def emoji = status == 'SUCCESS' ? '✅' : (status == 'FAILURE' ? '❌' : '⚠️')
+
+        def buildUrl = "${env.JENKINS_URL}job/${env.JOB_NAME}/${BUILD_NUMBER}/"
+        def gitInfo = "${env.GIT_BRANCH_NAME} (${env.GIT_COMMIT_SHORT})"
+
+        def slackMessage = """
+${emoji} *Jenkins Build ${status}*
+*Job:* ${env.JOB_NAME} #${BUILD_NUMBER}
+*Branch:* ${gitInfo}
+*Message:* ${message}
+${details ? "*Details:* ${details}" : ""}
+*Build URL:* ${buildUrl}
+        """.trim()
+
+        // Send Slack notification if webhook URL is provided
+        if (params.SLACK_WEBHOOK_URL && params.SLACK_WEBHOOK_URL.trim()) {
+            echo "📢 Sending Slack notification: ${status}"
+
+            def payload = groovy.json.JsonOutput.toJson([
+                text: slackMessage,
+                color: color,
+                username: "Jenkins CI/CD",
+                icon_emoji: ":jenkins:"
+            ])
+
+            bat """
+                @curl -s -X POST -H "Content-type: application/json" ^
+                     --data "${payload.replace('"', '\\"')}" ^
+                     "${params.SLACK_WEBHOOK_URL}" || echo "Slack notification failed"
+            """
+        }
+
+        // Log notification for debugging
+        echo "📢 Notification sent: ${status} - ${message}"
+
+    } catch (Exception e) {
+        echo "⚠️ Failed to send notification: ${e.message}"
+    }
+}
+
+// Enhanced change detection function with multiple strategies
 def checkAppChangedFiles(appDir) {
     try {
         def changedFiles = []
+        def changeDetectionMethod = "unknown"
 
-        // Try multiple methods to detect changes
-        echo "    Detecting changes for ${appDir}..."
+        echo "    🔍 Detecting changes for ${appDir}..."
 
-        // Method 1: Check if this is a webhook trigger with change information
+        // Method 1: Jenkins changeset information (most reliable for webhooks)
         if (currentBuild.changeSets && currentBuild.changeSets.size() > 0) {
-            echo "    Using Jenkins changeset information"
+            echo "    📋 Using Jenkins changeset information"
+            changeDetectionMethod = "jenkins-changeset"
+
             currentBuild.changeSets.each { changeSet ->
                 changeSet.items.each { change ->
                     change.affectedFiles.each { file ->
                         if (file.path.startsWith("${appDir}/")) {
                             changedFiles.add(file.path)
-                            echo "      Found changed file: ${file.path}"
+                            echo "      📄 Changed: ${file.path} (${file.editType})"
                         }
                     }
                 }
             }
+
             if (changedFiles.size() > 0) {
-                return changedFiles
+                echo "    ✅ Found ${changedFiles.size()} changed files via Jenkins changeset"
+                return [files: changedFiles, method: changeDetectionMethod]
             }
         }
 
-        // Method 2: Compare with previous commit if available
-        if (env.GIT_PREVIOUS_COMMIT && env.GIT_PREVIOUS_COMMIT != "") {
+        // Method 2: Git diff with improved commit detection
+        def compareCommit = env.GIT_PREVIOUS_COMMIT
+        if (!compareCommit || compareCommit == "") {
+            // Try to get the previous commit from the same branch
+            try {
+                compareCommit = bat(
+                    script: "@git rev-parse HEAD~1 2>nul || echo \"\"",
+                    returnStdout: true
+                ).trim()
+                echo "    📍 Using HEAD~1 as comparison: ${compareCommit}"
+            } catch (Exception e) {
+                echo "    ⚠ Could not determine previous commit: ${e.message}"
+            }
+        }
+
+        if (compareCommit && compareCommit != "") {
+            echo "    🔄 Comparing ${compareCommit}...HEAD for ${appDir}/"
+            changeDetectionMethod = "git-diff"
+
             def diffOutput = bat(
-                script: "@git diff --name-only ${env.GIT_PREVIOUS_COMMIT}...HEAD -- ${appDir}/ 2>nul || echo \"\"",
+                script: "@git diff --name-only ${compareCommit}...HEAD -- ${appDir}/ 2>nul || echo \"\"",
                 returnStdout: true
             ).trim()
 
@@ -908,28 +1091,31 @@ def checkAppChangedFiles(appDir) {
                 diffOutput.split('\r?\n').each { file ->
                     if (file && file.trim()) {
                         changedFiles.add(file)
-                        echo "      Found changed file: ${file}"
+                        echo "      📄 Changed: ${file}"
                     }
                 }
             }
 
             if (changedFiles.size() > 0) {
-                return changedFiles
+                echo "    ✅ Found ${changedFiles.size()} changed files via git diff"
+                return [files: changedFiles, method: changeDetectionMethod]
             } else {
-                echo "    No files changed since previous commit"
-                return []
+                echo "    ✅ No files changed since ${compareCommit}"
+                return [files: [], method: changeDetectionMethod]
             }
         }
 
-        // Method 3: For first builds, return empty array instead of assuming changes
-        // The image existence check will handle whether to build or not
-        echo "    First build or no previous commit - relying on image existence check"
-        return []
+        // Method 3: Check if this is a completely new app (no previous builds)
+        echo "    🆕 First build or no previous commit - checking if app exists in registry"
+        changeDetectionMethod = "first-build"
+
+        // Return empty files but indicate this is a first build
+        return [files: [], method: changeDetectionMethod, firstBuild: true]
 
     } catch (Exception e) {
-        echo "    Warning: Error detecting changes: ${e.message}"
-        // Return empty array instead of assuming changes - let image existence check decide
-        return []
+        echo "    ❌ Error detecting changes: ${e.message}"
+        // Return safe default - empty files, let image existence check decide
+        return [files: [], method: "error", error: e.message]
     }
 }
 
@@ -1250,31 +1436,67 @@ def cleanupDevImages() {
                         } else {
                             echo "    ✗ Deleting ${app}:${tag} - ${reason}"
 
+                            def deletionSuccess = false
+                            def dockerSuccess = false
+                            def artifactorySuccess = false
+
                             // Method 1: Delete via Docker API (removes tag)
                             def dockerDeleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_DEV_PATH}/${app}/tags/${tag}"
-                            def dockerResult = bat(
+                            echo "      Attempting Docker API deletion: ${dockerDeleteUrl}"
+
+                            def dockerResponse = bat(
                                 script: """
-                                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                         -X DELETE "${dockerDeleteUrl}" 2>nul
+                                    @curl -s -w "HTTPSTATUS:%%{http_code}" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                         -X DELETE "${dockerDeleteUrl}"
                                 """,
-                                returnStatus: true
-                            )
+                                returnStdout: true
+                            ).trim()
+
+                            def dockerHttpStatus = dockerResponse.contains('HTTPSTATUS:') ?
+                                dockerResponse.split('HTTPSTATUS:')[1] : '000'
+
+                            if (dockerHttpStatus == '200' || dockerHttpStatus == '204' || dockerHttpStatus == '404') {
+                                dockerSuccess = true
+                                echo "      Docker API deletion: SUCCESS (HTTP ${dockerHttpStatus})"
+                            } else {
+                                echo "      Docker API deletion: FAILED (HTTP ${dockerHttpStatus})"
+                                echo "      Response: ${dockerResponse}"
+                            }
 
                             // Method 2: Delete via Artifactory REST API (removes folder structure)
                             def artifactoryDeleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}/${tag}"
-                            def artifactoryResult = bat(
-                                script: """
-                                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                         -X DELETE "${artifactoryDeleteUrl}" 2>nul
-                                """,
-                                returnStatus: true
-                            )
+                            echo "      Attempting Artifactory deletion: ${artifactoryDeleteUrl}"
 
-                            if (dockerResult == 0 || artifactoryResult == 0) {
-                                echo "      Successfully deleted ${app}:${tag}"
-                                appDeleted++
+                            def artifactoryResponse = bat(
+                                script: """
+                                    @curl -s -w "HTTPSTATUS:%%{http_code}" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                         -X DELETE "${artifactoryDeleteUrl}"
+                                """,
+                                returnStdout: true
+                            ).trim()
+
+                            def artifactoryHttpStatus = artifactoryResponse.contains('HTTPSTATUS:') ?
+                                artifactoryResponse.split('HTTPSTATUS:')[1] : '000'
+
+                            if (artifactoryHttpStatus == '200' || artifactoryHttpStatus == '204' || artifactoryHttpStatus == '404') {
+                                artifactorySuccess = true
+                                echo "      Artifactory deletion: SUCCESS (HTTP ${artifactoryHttpStatus})"
                             } else {
-                                echo "      Failed to delete ${app}:${tag} (Docker: ${dockerResult}, Artifactory: ${artifactoryResult})"
+                                echo "      Artifactory deletion: FAILED (HTTP ${artifactoryHttpStatus})"
+                                echo "      Response: ${artifactoryResponse}"
+                            }
+
+                            // Both methods should succeed for complete deletion
+                            if (dockerSuccess && artifactorySuccess) {
+                                echo "      ✓ COMPLETE DELETION SUCCESS: ${app}:${tag}"
+                                appDeleted++
+                                deletionSuccess = true
+                            } else if (dockerSuccess || artifactorySuccess) {
+                                echo "      ⚠ PARTIAL DELETION: ${app}:${tag} (Docker: ${dockerSuccess}, Artifactory: ${artifactorySuccess})"
+                                appDeleted++ // Still count as deleted since at least one method worked
+                                deletionSuccess = true
+                            } else {
+                                echo "      ✗ DELETION FAILED: ${app}:${tag} - both methods failed"
                             }
                         }
                     } else {
@@ -1292,26 +1514,37 @@ def cleanupDevImages() {
 
                         // Delete the entire app folder (this will remove all subfolders including sha256, _uploads, etc.)
                         def deleteFolderUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}"
-                        def deleteResult = bat(
-                            script: """
-                                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                     -X DELETE "${deleteFolderUrl}?recursive=1" 2>nul
-                            """,
-                            returnStatus: true
-                        )
+                        echo "    Attempting folder deletion: ${deleteFolderUrl}"
 
-                        if (deleteResult == 0) {
-                            echo "    Successfully deleted app folder: ${app}"
+                        def folderResponse = bat(
+                            script: """
+                                @curl -s -w "HTTPSTATUS:%%{http_code}" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                     -X DELETE "${deleteFolderUrl}?recursive=1"
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        def folderHttpStatus = folderResponse.contains('HTTPSTATUS:') ?
+                            folderResponse.split('HTTPSTATUS:')[1] : '000'
+
+                        if (folderHttpStatus == '200' || folderHttpStatus == '204') {
+                            echo "    ✓ Successfully deleted app folder: ${app} (HTTP ${folderHttpStatus})"
+                        } else if (folderHttpStatus == '404') {
+                            echo "    ✓ App folder already deleted: ${app} (HTTP ${folderHttpStatus})"
                         } else {
-                            echo "    Failed to delete app folder: ${app}"
-                            // Try alternative method - delete via Docker registry cleanup
-                            echo "    Attempting Docker registry cleanup for ${app}..."
-                            bat """
-                                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                     -X POST "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/promote" ^
-                                     -H "Content-Type: application/json" ^
-                                     -d "{\\"targetRepo\\":\\"${env.DOCKER_REPO}\\",\\"dockerRepository\\":\\"${env.DOCKER_DEV_PATH}/${app}\\",\\"tag\\":\\"*\\",\\"copy\\":false}" 2>nul || echo "Cleanup attempt completed"
-                            """
+                            echo "    ✗ Failed to delete app folder: ${app} (HTTP ${folderHttpStatus})"
+                            echo "    Response: ${folderResponse}"
+
+                            // Try to get more information about what's in the folder
+                            echo "    Checking folder contents..."
+                            def checkResponse = bat(
+                                script: """
+                                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                         "https://${env.DOCKER_REGISTRY}/artifactory/api/storage/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}"
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            echo "    Folder contents: ${checkResponse.take(200)}..."
                         }
                     }
                 }
@@ -1439,21 +1672,46 @@ def cleanupSpecificBranch(branchName) {
                     } else {
                         echo "  Deleting ${app}:${tag}"
 
+                        def dockerSuccess = false
+                        def artifactorySuccess = false
+
                         // Delete via Docker API
                         def dockerDeleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_DEV_PATH}/${app}/tags/${tag}"
-                        bat """
-                            @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                 -X DELETE "${dockerDeleteUrl}" 2>nul
-                        """
+                        def dockerResponse = bat(
+                            script: """
+                                @curl -s -w "HTTPSTATUS:%%{http_code}" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                     -X DELETE "${dockerDeleteUrl}"
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        def dockerHttpStatus = dockerResponse.contains('HTTPSTATUS:') ?
+                            dockerResponse.split('HTTPSTATUS:')[1] : '000'
+                        dockerSuccess = (dockerHttpStatus == '200' || dockerHttpStatus == '204' || dockerHttpStatus == '404')
 
                         // Delete via Artifactory REST API
                         def artifactoryDeleteUrl = "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}/${tag}"
-                        bat """
-                            @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
-                                 -X DELETE "${artifactoryDeleteUrl}" 2>nul
-                        """
+                        def artifactoryResponse = bat(
+                            script: """
+                                @curl -s -w "HTTPSTATUS:%%{http_code}" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                     -X DELETE "${artifactoryDeleteUrl}"
+                            """,
+                            returnStdout: true
+                        ).trim()
 
-                        totalDeleted++
+                        def artifactoryHttpStatus = artifactoryResponse.contains('HTTPSTATUS:') ?
+                            artifactoryResponse.split('HTTPSTATUS:')[1] : '000'
+                        artifactorySuccess = (artifactoryHttpStatus == '200' || artifactoryHttpStatus == '204' || artifactoryHttpStatus == '404')
+
+                        if (dockerSuccess && artifactorySuccess) {
+                            echo "    ✓ Successfully deleted ${app}:${tag}"
+                            totalDeleted++
+                        } else {
+                            echo "    ⚠ Partial deletion ${app}:${tag} (Docker: ${dockerSuccess}, Artifactory: ${artifactorySuccess})"
+                            if (dockerSuccess || artifactorySuccess) {
+                                totalDeleted++ // Count partial success
+                            }
+                        }
                     }
                 }
             }

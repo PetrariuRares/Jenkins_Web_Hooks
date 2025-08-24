@@ -1,0 +1,1010 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'BRANCH_NAME',
+            defaultValue: '',
+            description: 'Branch to build (leave empty for automatic detection from webhook)'
+        )
+        choice(
+            name: 'DEPLOY_TARGET',
+            choices: ['auto', 'docker-latest', 'docker-dev'],
+            description: 'Where to deploy (auto = based on branch)'
+        )
+        booleanParam(
+            name: 'FORCE_BUILD',
+            defaultValue: false,
+            description: 'Force rebuild even if no changes detected'
+        )
+        string(
+            name: 'SLACK_WEBHOOK_URL',
+            defaultValue: '',
+            description: 'Slack webhook URL for notifications (optional)'
+        )
+        booleanParam(
+            name: 'NOTIFY_ON_SUCCESS',
+            defaultValue: false,
+            description: 'Send notifications on successful builds (default: failures only)'
+        )
+    }
+
+    triggers {
+        githubPush()
+    }
+
+    environment {
+        // Artifactory credentials
+        ARTIFACTORY_CREDS = credentials('artifactory-credentials')
+
+        // Build metadata
+        BUILD_NUMBER = "${BUILD_NUMBER}"
+        TIMESTAMP = "${new Date().format('yyyyMMdd-HHmmss')}"
+        JENKINS_URL = "${env.JENKINS_URL ?: 'http://jenkins.local'}"
+        JOB_NAME = "${env.JOB_NAME}"
+        
+        // Pipeline status flags
+        NO_APPS = 'false'
+        VALIDATION_FAILED = 'false'
+        
+        // Config values will be loaded from deployment-versions.yaml
+        CONFIG_LOADED = 'false'
+    }
+
+    stages {
+        // ================================================================================
+        // STAGE 1: Initialize Pipeline
+        // ================================================================================
+        stage('Initialize') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo ">>> BUILD INITIALIZATION"
+                    echo "========================================="
+                    echo "Build Number: ${BUILD_NUMBER}"
+                    echo "Manual Branch Override: ${params.BRANCH_NAME ?: 'none'}"
+                    echo "Deploy Target: ${params.DEPLOY_TARGET}"
+                    echo "Force Build: ${params.FORCE_BUILD}"
+                    echo "========================================="
+                    
+                    // Load configuration from deployment-versions.yaml if it exists
+                    if (fileExists('deployment-versions.yaml')) {
+                        def deployConfig = readYaml file: 'deployment-versions.yaml'
+                        
+                        // Load all config values into environment
+                        env.DOCKER_REGISTRY = deployConfig.config.docker_registry
+                        env.DOCKER_REPO = deployConfig.config.docker_repo
+                        env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
+                        env.DOCKER_DEV_PATH = deployConfig.config.docker_dev_path
+                        env.METADATA_PATH = deployConfig.config.metadata_path
+                        env.BUILD_MANIFESTS_PATH = deployConfig.config.build_manifests_path
+                        env.TEMP_BUILDS_PATH = deployConfig.config.temp_builds_path
+                        env.DEV_RETENTION_DAYS = deployConfig.config.dev_retention_days.toString()
+                        env.LATEST_VERSIONS_TO_KEEP = deployConfig.config.latest_versions_to_keep.toString()
+                        
+                        env.CONFIG_LOADED = 'true'
+                        echo "[CONFIG] Loaded configuration from deployment-versions.yaml"
+                    } else {
+                        // Use default values if config file doesn't exist
+                        env.DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
+                        env.DOCKER_REPO = 'dockertest-docker'
+                        env.DOCKER_LATEST_PATH = 'docker-latest'
+                        env.DOCKER_DEV_PATH = 'docker-dev'
+                        env.METADATA_PATH = 'metadata'
+                        env.BUILD_MANIFESTS_PATH = 'metadata/build-manifests'
+                        env.TEMP_BUILDS_PATH = 'metadata/temporary-builds'
+                        env.DEV_RETENTION_DAYS = '14'
+                        env.LATEST_VERSIONS_TO_KEEP = '10'
+                        
+                        echo "[CONFIG] Using default configuration (deployment-versions.yaml not found)"
+                    }
+                }
+            }
+        }
+
+        // ================================================================================
+        // STAGE 2: Checkout Code
+        // ================================================================================
+        stage('Checkout') {
+            steps {
+                script {
+                    deleteDir()
+                    
+                    if (params.BRANCH_NAME) {
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: "*/${params.BRANCH_NAME}"]],
+                            extensions: [],
+                            userRemoteConfigs: scm.userRemoteConfigs
+                        ])
+                        env.GIT_BRANCH_NAME = params.BRANCH_NAME
+                    } else {
+                        checkout scm
+                        
+                        try {
+                            env.GIT_BRANCH_NAME = bat(
+                                script: '@git rev-parse --abbrev-ref HEAD',
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (env.GIT_BRANCH_NAME == 'HEAD') {
+                                env.GIT_BRANCH_NAME = bat(
+                                    script: '@git branch -r --contains HEAD',
+                                    returnStdout: true
+                                ).trim()
+                                env.GIT_BRANCH_NAME = env.GIT_BRANCH_NAME.replaceAll('.*origin/', '').trim()
+                            }
+                        } catch (Exception e) {
+                            env.GIT_BRANCH_NAME = 'unknown'
+                        }
+                    }
+
+                    if (env.GIT_BRANCH_NAME.contains('/')) {
+                        def parts = env.GIT_BRANCH_NAME.split('/')
+                        if (parts[0] == 'origin') {
+                            env.GIT_BRANCH_NAME = parts[1..-1].join('/')
+                        }
+                    }
+
+                    // Extract commit information
+                    try {
+                        env.GIT_COMMIT_HASH = bat(
+                            script: '@git rev-parse HEAD',
+                            returnStdout: true
+                        ).trim()
+                        env.GIT_COMMIT_SHORT = bat(
+                            script: '@git rev-parse --short=8 HEAD',
+                            returnStdout: true
+                        ).trim()
+                        env.GIT_COMMIT_MSG = bat(
+                            script: '@git log -1 --pretty=%%B',
+                            returnStdout: true
+                        ).trim()
+                        env.GIT_AUTHOR = bat(
+                            script: '@git log -1 --pretty=%%ae',
+                            returnStdout: true
+                        ).trim()
+                        
+                        // Get previous successful commit for better change detection
+                        env.GIT_PREVIOUS_COMMIT = bat(
+                            script: '@git rev-parse HEAD~1 2>nul || echo ""',
+                            returnStdout: true
+                        ).trim()
+                    } catch (Exception e) {
+                        env.GIT_COMMIT_HASH = "unknown"
+                        env.GIT_COMMIT_SHORT = "unknown-${BUILD_NUMBER}"
+                        env.GIT_COMMIT_MSG = "Unknown"
+                        env.GIT_AUTHOR = "Unknown"
+                        env.GIT_PREVIOUS_COMMIT = ""
+                    }
+
+                    echo "[BRANCH] ${env.GIT_BRANCH_NAME}"
+                    echo "[COMMIT] ${env.GIT_COMMIT_SHORT} (${env.GIT_COMMIT_HASH})"
+                    echo "[AUTHOR] ${env.GIT_AUTHOR}"
+                    
+                    // Reload configuration after checkout
+                    if (fileExists('deployment-versions.yaml')) {
+                        def deployConfig = readYaml file: 'deployment-versions.yaml'
+                        
+                        // Load all config values into environment
+                        env.DOCKER_REGISTRY = deployConfig.config.docker_registry
+                        env.DOCKER_REPO = deployConfig.config.docker_repo
+                        env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
+                        env.DOCKER_DEV_PATH = deployConfig.config.docker_dev_path
+                        env.METADATA_PATH = deployConfig.config.metadata_path
+                        env.BUILD_MANIFESTS_PATH = deployConfig.config.build_manifests_path
+                        env.TEMP_BUILDS_PATH = deployConfig.config.temp_builds_path
+                        env.DEV_RETENTION_DAYS = deployConfig.config.dev_retention_days.toString()
+                        env.LATEST_VERSIONS_TO_KEEP = deployConfig.config.latest_versions_to_keep.toString()
+                        
+                        env.CONFIG_LOADED = 'true'
+                        echo "[CONFIG] Reloaded configuration from deployment-versions.yaml"
+                    }
+
+                    // Determine deployment path based on branch
+                    if (params.DEPLOY_TARGET != 'auto') {
+                        env.DEPLOY_PATH = params.DEPLOY_TARGET == 'docker-latest' ? env.DOCKER_LATEST_PATH : env.DOCKER_DEV_PATH
+                    } else {
+                        if (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master') {
+                            env.DEPLOY_PATH = env.DOCKER_LATEST_PATH
+                            echo "[DEPLOY] Main branch: using ${env.DEPLOY_PATH}"
+                        } else {
+                            env.DEPLOY_PATH = env.DOCKER_DEV_PATH
+                            echo "[DEPLOY] Feature branch: using ${env.DEPLOY_PATH}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================================================================================
+        // STAGE 3: Validate Applications
+        // ================================================================================
+        stage('Validate Applications') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo ">>> MANDATORY FILE VALIDATION"
+                    echo "========================================="
+
+                    def pythonApps = []
+                    def validationErrors = []
+
+                    // Find all Dockerfiles using Windows commands
+                    def dockerfiles = ''
+                    try {
+                        dockerfiles = bat(
+                            script: '@dir /s /b Dockerfile 2>nul || echo ""',
+                            returnStdout: true
+                        ).trim()
+                    } catch (Exception e) {
+                        dockerfiles = ''
+                    }
+
+                    if (dockerfiles) {
+                        dockerfiles.split('\r?\n').each { file ->
+                            if (file && file.trim() && file.contains('Dockerfile')) {
+                                // Convert Windows path to relative path
+                                def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
+                                def parts = relativePath.split('/')
+
+                                // Check if Dockerfile is in a subdirectory (not root)
+                                if (parts.length == 2 && parts[1] == 'Dockerfile') {
+                                    def appName = parts[0]
+                                    // Exclude hidden directories and jenkins directories
+                                    if (!appName.startsWith('.') && !appName.startsWith('@')) {
+                                        pythonApps.add(appName)
+                                        echo "[FOUND] Application: ${appName}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (pythonApps.size() == 0) {
+                        env.NO_APPS = 'true'
+                        env.VALIDATED_APPS = ''  // Set empty string to avoid null
+                        echo "[INFO] No applications with Dockerfiles found"
+                        echo "[DEBUG] Searched in: ${env.WORKSPACE}"
+                        echo "[DEBUG] Raw output: ${dockerfiles}"
+                        return
+                    }
+
+                    echo "[APPS] Found ${pythonApps.size()} applications: ${pythonApps.join(', ')}"
+
+                    // Validate each application has all 4 mandatory files
+                    pythonApps.each { app ->
+                        echo "\n[VALIDATING] ${app}..."
+
+                        def requiredFiles = [
+                            'Dockerfile',
+                            'requirements.txt',
+                            'README.md',
+                            'version.txt'
+                        ]
+
+                        def missingFiles = []
+                        requiredFiles.each { file ->
+                            def filePath = "${app}/${file}"
+                            if (!fileExists(filePath)) {
+                                missingFiles.add(file)
+                                echo "  ❌ Missing: ${file}"
+                            } else {
+                                echo "  ✓ Found: ${file}"
+
+                                // Validate version.txt format if on main branch
+                                if (file == 'version.txt' && (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master')) {
+                                    def version = readFile(filePath).trim()
+                                    if (!version.matches('^\\d+\\.\\d+\\.\\d+$')) {
+                                        validationErrors.add("${app}/version.txt has invalid format: '${version}' (expected: X.Y.Z)")
+                                        echo "  ❌ Invalid version format: ${version}"
+                                    } else {
+                                        echo "  ✓ Version: ${version}"
+                                    }
+                                }
+                            }
+                        }
+
+                        if (missingFiles.size() > 0) {
+                            validationErrors.add("${app} is missing: ${missingFiles.join(', ')}")
+                        }
+                    }
+
+                    // Fail if any validation errors
+                    if (validationErrors.size() > 0) {
+                        env.VALIDATION_FAILED = 'true'
+                        error("""
+                        ========================================
+                        VALIDATION FAILED
+                        ========================================
+                        ${validationErrors.join('\n')}
+
+                        All applications must contain:
+                        • Dockerfile
+                        • requirements.txt
+                        • README.md
+                        • version.txt (format: X.Y.Z)
+                        ========================================
+                        """)
+                    } else {
+                        echo "\n✅ All applications validated successfully"
+                        env.VALIDATED_APPS = pythonApps.join(',')
+                    }
+                }
+            }
+        }
+
+        // ================================================================================
+        // STAGE 4: Detect Changes
+        // ================================================================================
+        stage('Detect Changes') {
+            when {
+                allOf {
+                    expression { env.NO_APPS != 'true' }
+                    expression { env.VALIDATION_FAILED != 'true' }
+                    expression { env.VALIDATED_APPS != null && env.VALIDATED_APPS != '' }
+                }
+            }
+            steps {
+                script {
+                    echo "========================================="
+                    echo ">>> CHANGE DETECTION"
+                    echo "========================================="
+
+                    def pythonApps = env.VALIDATED_APPS.split(',')
+                    def changedApps = []
+
+                    // Determine if this is main branch
+                    def isMainBranch = (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master')
+                    echo "[INFO] Branch type: ${isMainBranch ? 'MAIN BRANCH' : 'FEATURE BRANCH'}"
+                    echo "[INFO] Branch name: ${env.GIT_BRANCH_NAME}"
+                    echo "[INFO] Detection strategy: ${isMainBranch ? 'Build if changed OR new version' : 'Build ONLY if changed'}"
+                    echo ""
+
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        bat "echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin"
+
+                        pythonApps.each { app ->
+                            def needsBuild = false
+                            def reason = ""
+
+                            echo "[ANALYZING] ${app}..."
+                            echo "  Current commit: ${env.GIT_COMMIT_SHORT}"
+                            echo "  Previous commit: ${env.GIT_PREVIOUS_COMMIT ?: 'none'}"
+
+                            // For force build, always rebuild
+                            if (params.FORCE_BUILD) {
+                                needsBuild = true
+                                reason = "Force build requested by user"
+                            } else {
+                                // Check for file changes using enhanced function
+                                def changeResult = checkAppChangedFiles(app)
+                                def changedFiles = changeResult.files ?: []
+                                def detectionMethod = changeResult.method ?: "unknown"
+                                def isFirstBuild = changeResult.firstBuild ?: false
+
+                                echo "  Detection method: ${detectionMethod}"
+                                if (changeResult.error) {
+                                    echo "  Detection error: ${changeResult.error}"
+                                }
+
+                                // Filter out README-only changes
+                                def significantChanges = changedFiles.findAll { !it.endsWith('README.md') }
+                                def hasSignificantChanges = significantChanges.size() > 0
+
+                                // Show what changed
+                                if (hasSignificantChanges) {
+                                    echo "  📝 Files changed in ${app} (${significantChanges.size()} significant):"
+                                    significantChanges.each { file ->
+                                        echo "    - ${file}"
+                                    }
+                                } else if (changedFiles.size() > 0) {
+                                    echo "  📝 Only README changes in ${app} (${changedFiles.size()} total files)"
+                                } else {
+                                    echo "  ✅ No changes detected in ${app}"
+                                }
+
+                                // Determine the image tag
+                                def imageTag = ''
+                                def imageName = ''
+
+                                if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
+                                    // Main branch - use version from version.txt
+                                    def version = readFile("${app}/version.txt").trim()
+                                    imageTag = version
+                                    imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}:${imageTag}"
+                                } else {
+                                    // Feature branch - use branch-commit format
+                                    def cleanBranchName = env.GIT_BRANCH_NAME
+                                        .replaceAll('[^a-zA-Z0-9._-]', '-')
+                                        .toLowerCase()
+                                    imageTag = "${cleanBranchName}-${env.GIT_COMMIT_SHORT}"
+                                    imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_DEV_PATH}/${app}:${imageTag}"
+                                }
+
+                                echo "  Image tag: ${imageTag}"
+
+                                // Check if image already exists in Artifactory
+                                def imageExists = bat(
+                                    script: "docker pull ${imageName} >nul 2>&1",
+                                    returnStatus: true
+                                ) == 0
+
+                                if (imageExists) {
+                                    echo "  Image exists: YES"
+                                    bat "docker rmi ${imageName} 2>nul || exit 0"
+                                } else {
+                                    echo "  Image exists: NO"
+                                }
+
+                                // ===== IMPROVED DECISION LOGIC =====
+                                if (isMainBranch) {
+                                    // MAIN BRANCH: Build if files changed OR image doesn't exist (new version)
+                                    if (hasSignificantChanges) {
+                                        needsBuild = true
+                                        reason = "Files changed (${significantChanges.size()} files modified)"
+                                    } else if (!imageExists) {
+                                        needsBuild = true
+                                        reason = "New version ${imageTag} needs to be built"
+                                    } else {
+                                        needsBuild = false
+                                        reason = "No changes and image already exists"
+                                    }
+                                } else {
+                                    // FEATURE BRANCH: Build if files changed AND image doesn't exist
+                                    // This prevents rebuilding the same commit multiple times
+                                    if (imageExists) {
+                                        needsBuild = false
+                                        reason = "Image already exists for this commit - skipping rebuild"
+                                    } else if (hasSignificantChanges) {
+                                        needsBuild = true
+                                        reason = "Files changed and image doesn't exist (${significantChanges.size()} files modified)"
+                                    } else {
+                                        needsBuild = false
+                                        reason = "No changes in ${app} - skipping build on feature branch"
+                                    }
+                                }
+                            }
+
+                            // Final decision
+                            if (needsBuild) {
+                                echo "  ✓ [BUILD NEEDED] ${app}: ${reason}"
+                                changedApps.add(app)
+                            } else {
+                                echo "  ✗ [SKIP] ${app}: ${reason}"
+                            }
+                            echo ""
+                        }
+
+                        bat "docker logout ${env.DOCKER_REGISTRY}"
+                    }
+
+                    // Summary
+                    echo "========================================="
+                    if (changedApps.size() > 0) {
+                        env.APPS_TO_BUILD = changedApps.join(',')
+                        env.HAS_CHANGES = 'true'
+                        echo "[RESULT] Will build ${changedApps.size()} app(s): ${env.APPS_TO_BUILD}"
+                    } else {
+                        env.HAS_CHANGES = 'false'
+                        echo "[RESULT] No applications need building"
+                    }
+                    echo "========================================="
+                }
+            }
+        }
+
+        // ================================================================================
+        // STAGE 5: Build Docker Images
+        // ================================================================================
+        stage('Build Docker Images') {
+            when {
+                environment name: 'HAS_CHANGES', value: 'true'
+            }
+            steps {
+                script {
+                    echo "========================================="
+                    echo ">>> DOCKER BUILD"
+                    echo "========================================="
+
+                    def apps = env.APPS_TO_BUILD.split(',')
+                    def buildJobs = [:]
+
+                    apps.each { app ->
+                        buildJobs[app] = {
+                            echo "[BUILD START] ${app}"
+
+                            def imageTag = ''
+                            def version = ''
+
+                            if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
+                                // Main branch - use version from version.txt
+                                version = readFile("${app}/version.txt").trim()
+                                imageTag = version
+                            } else {
+                                // Feature branch - use branch-commit format
+                                def cleanBranchName = env.GIT_BRANCH_NAME
+                                    .replaceAll('[^a-zA-Z0-9._-]', '-')
+                                    .toLowerCase()
+                                imageTag = "${cleanBranchName}-${env.GIT_COMMIT_SHORT}"
+                                version = imageTag  // For dev builds, version is the same as tag
+                            }
+
+                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
+
+                            // Sanitize commit message for Docker label
+                            def sanitizedMsg = env.GIT_COMMIT_MSG
+                                .replaceAll('["\\\\]', '')
+                                .replaceAll('[\r\n]+', ' ')
+                                .take(100)
+
+                            try {
+                                // Build Docker image with all required labels (Windows compatible)
+                                def buildCommand = """docker build -t ${imageName}:${imageTag} ^
+                                    --label "jenkins.build.number=${BUILD_NUMBER}" ^
+                                    --label "git.commit.id=${env.GIT_COMMIT_HASH}" ^
+                                    --label "git.commit.author=${env.GIT_AUTHOR}" ^
+                                    --label "git.branch=${env.GIT_BRANCH_NAME}" ^
+                                    --label "app.version=${version}" ^
+                                    --label "build.timestamp=${env.TIMESTAMP}" ^
+                                    --label "jenkins.job.name=${env.JOB_NAME}" ^
+                                    --label "jenkins.build.url=${env.JENKINS_URL}job/${env.JOB_NAME}/${BUILD_NUMBER}/" ^
+                                    --label "app.name=${app}" ^
+                                    -f ${app}/Dockerfile ${app}/"""
+
+                                bat buildCommand.replaceAll('\n', ' ')
+
+                                // For main branch, also tag as latest
+                                if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
+                                    bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
+                                    echo "[TAG] Also tagged as ${imageName}:latest"
+                                }
+
+                                echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag}"
+
+                                // Store tags for push stage
+                                writeFile file: "${app}_tags.txt", text: "${imageTag}${env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ? ',latest' : ''}"
+
+                            } catch (Exception e) {
+                                echo "[BUILD ERROR] ${app}: ${e.message}"
+                                throw e
+                            }
+                        }
+                    }
+
+                    parallel buildJobs
+                    env.BUILD_COMPLETE = 'true'
+                }
+            }
+        }
+
+        // ================================================================================
+        // STAGE 6: Push to Artifactory
+        // ================================================================================
+        stage('Push to Artifactory') {
+            when {
+                environment name: 'BUILD_COMPLETE', value: 'true'
+            }
+            steps {
+                script {
+                    echo "========================================="
+                    echo ">>> ARTIFACTORY PUSH"
+                    echo "========================================="
+
+                    def apps = env.APPS_TO_BUILD.split(',')
+
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        bat "echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin"
+
+                        def pushJobs = [:]
+
+                        apps.each { app ->
+                            pushJobs[app] = {
+                                def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
+                                def tags = readFile("${app}_tags.txt").trim().split(',')
+
+                                tags.each { tag ->
+                                    try {
+                                        bat "docker push ${imageName}:${tag}"
+                                        echo "[PUSH SUCCESS] ${app}: ${imageName}:${tag}"
+                                    } catch (Exception e) {
+                                        echo "[PUSH ERROR] ${app}:${tag}: ${e.message}"
+                                        throw e
+                                    }
+                                }
+
+                                // Create and upload build manifest
+                                createBuildManifest(app, tags[0])
+
+                                env."${app}_PUSHED_TAGS" = tags.join(',')
+                            }
+                        }
+
+                        parallel pushJobs
+                    }
+
+                    bat "docker logout ${env.DOCKER_REGISTRY}"
+                }
+            }
+        }
+
+        // ================================================================================
+        // STAGE 7: Summary
+        // ================================================================================
+        stage('Summary') {
+            steps {
+                script {
+                    echo "\n========================================="
+                    echo ">>> BUILD SUMMARY"
+                    echo "========================================="
+                    echo "Branch: ${env.GIT_BRANCH_NAME}"
+                    echo "Commit: ${env.GIT_COMMIT_SHORT}"
+                    echo "Author: ${env.GIT_AUTHOR}"
+                    echo "Build #: ${env.BUILD_NUMBER}"
+                    echo "Deploy Path: ${env.DEPLOY_PATH}"
+
+                    if (env.NO_APPS == 'true') {
+                        echo "\n[STATUS] No applications found"
+                        echo "Make sure you have application folders with:"
+                        echo "  - Dockerfile"
+                        echo "  - requirements.txt"
+                        echo "  - README.md"
+                        echo "  - version.txt"
+                    } else if (env.VALIDATION_FAILED == 'true') {
+                        echo "\n[STATUS] Validation failed"
+                    } else if (env.HAS_CHANGES == 'true') {
+                        echo "\n>>> APPLICATIONS BUILT AND PUSHED:"
+                        def apps = env.APPS_TO_BUILD.split(',')
+                        apps.each { app ->
+                            def pushedTags = env."${app}_PUSHED_TAGS"
+                            echo "\n  ${app}:"
+                            pushedTags.split(',').each { tag ->
+                                echo "    • ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag}"
+                            }
+                        }
+
+                        echo "\n>>> TO PULL IMAGES:"
+                        apps.each { app ->
+                            def pushedTags = env."${app}_PUSHED_TAGS"
+                            pushedTags.split(',').each { tag ->
+                                echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag}"
+                            }
+                        }
+                    } else {
+                        echo "\n[STATUS] No changes detected"
+                    }
+
+                    echo "========================================="
+
+                    // Update build description
+                    if (env.HAS_CHANGES == 'true') {
+                        currentBuild.description = "${env.DEPLOY_PATH} | ${env.GIT_BRANCH_NAME} | ${env.APPS_TO_BUILD}"
+                    } else if (env.NO_APPS == 'true') {
+                        currentBuild.description = "No apps found | ${env.GIT_BRANCH_NAME}"
+                    } else {
+                        currentBuild.description = "No changes | ${env.GIT_BRANCH_NAME}"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo "[CLEANUP] Starting post-build cleanup..."
+
+                try {
+                    // Remove temporary files (Windows)
+                    bat "del /Q *_tags.txt 2>nul || exit 0"
+
+                    // Clean up Docker images
+                    if (env.APPS_TO_BUILD) {
+                        def apps = env.APPS_TO_BUILD.split(',')
+                        apps.each { app ->
+                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
+
+                            // Remove all tags for this app (Windows)
+                            bat """
+                                for /f "tokens=*" %%i in ('docker images ${imageName} -q 2^>nul') do docker rmi -f %%i 2>nul || exit 0
+                            """
+                        }
+                    }
+
+                    // Prune system
+                    bat "docker image prune -f 2>nul || exit 0"
+                    bat "docker builder prune -f --filter \"until=168h\" 2>nul || exit 0"
+
+                } catch (Exception e) {
+                    echo "[CLEANUP ERROR] ${e.message}"
+                }
+
+                deleteDir()
+            }
+        }
+        success {
+            script {
+                echo "[SUCCESS] Pipeline executed successfully!"
+
+                def successMessage = "Build completed successfully"
+                def details = ""
+
+                if (env.HAS_CHANGES == 'true') {
+                    def apps = env.APPS_TO_BUILD?.split(',') ?: []
+                    details = "Built ${apps.size()} app(s): ${apps.join(', ')}"
+                } else {
+                    details = "No changes detected"
+                }
+
+                if (params.NOTIFY_ON_SUCCESS) {
+                    sendNotification('SUCCESS', successMessage, details)
+                }
+            }
+        }
+        failure {
+            script {
+                echo "[FAILURE] Pipeline failed!"
+
+                def failureReason = "Build failed"
+                if (env.VALIDATION_FAILED == 'true') {
+                    failureReason = "Application validation failed"
+                } else if (env.NO_APPS == 'true') {
+                    failureReason = "No applications found"
+                }
+
+                sendNotification('FAILURE', failureReason, "Check build logs for details")
+            }
+        }
+    }
+}
+
+// ================================================================================
+// HELPER FUNCTIONS
+// ================================================================================
+
+// Robust HTTP call with retry logic and proper error handling
+def makeHttpCall(url, method = 'GET', maxRetries = 3, retryDelay = 5) {
+    def attempt = 0
+    def lastError = null
+
+    while (attempt < maxRetries) {
+        attempt++
+        try {
+            echo "    🌐 HTTP ${method} attempt ${attempt}/${maxRetries}: ${url}"
+
+            def curlCommand = method == 'DELETE' ?
+                "@curl -s -w \"HTTPSTATUS:%{http_code}\" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% -X ${method} \"${url}\"" :
+                "@curl -s -w \"HTTPSTATUS:%{http_code}\" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \"${url}\""
+
+            def response = bat(
+                script: curlCommand,
+                returnStdout: true
+            ).trim()
+
+            def httpStatus = response.contains('HTTPSTATUS:') ?
+                response.split('HTTPSTATUS:')[1] : '000'
+            def responseBody = response.contains('HTTPSTATUS:') ?
+                response.split('HTTPSTATUS:')[0] : response
+
+            // Check if this is a successful response
+            if (httpStatus.startsWith('2') || httpStatus == '404') {
+                echo "    ✅ HTTP ${method} success: ${httpStatus}"
+                return [
+                    success: true,
+                    httpStatus: httpStatus,
+                    response: responseBody,
+                    attempt: attempt
+                ]
+            } else if (httpStatus.startsWith('5') && attempt < maxRetries) {
+                // Server error - retry
+                echo "    ⚠ HTTP ${method} server error: ${httpStatus} - retrying in ${retryDelay}s"
+                sleep(retryDelay)
+                lastError = "HTTP ${httpStatus}: ${responseBody}"
+                continue
+            } else {
+                // Client error or final attempt - don't retry
+                echo "    ❌ HTTP ${method} failed: ${httpStatus}"
+                return [
+                    success: false,
+                    httpStatus: httpStatus,
+                    response: responseBody,
+                    attempt: attempt,
+                    error: "HTTP ${httpStatus}: ${responseBody}"
+                ]
+            }
+        } catch (Exception e) {
+            lastError = e.message
+            echo "    ❌ HTTP ${method} exception on attempt ${attempt}: ${e.message}"
+
+            if (attempt < maxRetries) {
+                echo "    ⏳ Retrying in ${retryDelay} seconds..."
+                sleep(retryDelay)
+            }
+        }
+    }
+
+    // All attempts failed
+    return [
+        success: false,
+        httpStatus: '000',
+        response: '',
+        attempt: attempt,
+        error: "All ${maxRetries} attempts failed. Last error: ${lastError}"
+    ]
+}
+
+// Send notifications (Slack, email, etc.)
+def sendNotification(status, message, details = '') {
+    try {
+        def color = status == 'SUCCESS' ? 'good' : (status == 'FAILURE' ? 'danger' : 'warning')
+        def emoji = status == 'SUCCESS' ? '✅' : (status == 'FAILURE' ? '❌' : '⚠️')
+
+        def buildUrl = "${env.JENKINS_URL}job/${env.JOB_NAME}/${BUILD_NUMBER}/"
+        def gitInfo = "${env.GIT_BRANCH_NAME} (${env.GIT_COMMIT_SHORT})"
+
+        def slackMessage = """
+${emoji} *Jenkins Build ${status}*
+*Job:* ${env.JOB_NAME} #${BUILD_NUMBER}
+*Branch:* ${gitInfo}
+*Message:* ${message}
+${details ? "*Details:* ${details}" : ""}
+*Build URL:* ${buildUrl}
+        """.trim()
+
+        // Send Slack notification if webhook URL is provided
+        if (params.SLACK_WEBHOOK_URL && params.SLACK_WEBHOOK_URL.trim()) {
+            echo "📢 Sending Slack notification: ${status}"
+
+            def payload = groovy.json.JsonOutput.toJson([
+                text: slackMessage,
+                color: color,
+                username: "Jenkins CI/CD",
+                icon_emoji: ":jenkins:"
+            ])
+
+            bat """
+                @curl -s -X POST -H "Content-type: application/json" ^
+                     --data "${payload.replace('"', '\\"')}" ^
+                     "${params.SLACK_WEBHOOK_URL}" || echo "Slack notification failed"
+            """
+        }
+
+        // Log notification for debugging
+        echo "📢 Notification sent: ${status} - ${message}"
+
+    } catch (Exception e) {
+        echo "⚠️ Failed to send notification: ${e.message}"
+    }
+}
+
+// Enhanced change detection function with multiple strategies
+def checkAppChangedFiles(appDir) {
+    try {
+        def changedFiles = []
+        def changeDetectionMethod = "unknown"
+
+        echo "    🔍 Detecting changes for ${appDir}..."
+
+        // Method 1: Jenkins changeset information (most reliable for webhooks)
+        if (currentBuild.changeSets && currentBuild.changeSets.size() > 0) {
+            echo "    📋 Using Jenkins changeset information"
+            changeDetectionMethod = "jenkins-changeset"
+
+            currentBuild.changeSets.each { changeSet ->
+                changeSet.items.each { change ->
+                    change.affectedFiles.each { file ->
+                        if (file.path.startsWith("${appDir}/")) {
+                            changedFiles.add(file.path)
+                            echo "      📄 Changed: ${file.path} (${file.editType})"
+                        }
+                    }
+                }
+            }
+
+            if (changedFiles.size() > 0) {
+                echo "    ✅ Found ${changedFiles.size()} changed files via Jenkins changeset"
+                return [files: changedFiles, method: changeDetectionMethod]
+            }
+        }
+
+        // Method 2: Git diff with improved commit detection
+        def compareCommit = env.GIT_PREVIOUS_COMMIT
+        if (!compareCommit || compareCommit == "") {
+            // Try to get the previous commit from the same branch
+            try {
+                compareCommit = bat(
+                    script: "@git rev-parse HEAD~1 2>nul || echo \"\"",
+                    returnStdout: true
+                ).trim()
+                echo "    📍 Using HEAD~1 as comparison: ${compareCommit}"
+            } catch (Exception e) {
+                echo "    ⚠ Could not determine previous commit: ${e.message}"
+            }
+        }
+
+        if (compareCommit && compareCommit != "") {
+            echo "    🔄 Comparing ${compareCommit}...HEAD for ${appDir}/"
+            changeDetectionMethod = "git-diff"
+
+            def diffOutput = bat(
+                script: "@git diff --name-only ${compareCommit}...HEAD -- ${appDir}/ 2>nul || echo \"\"",
+                returnStdout: true
+            ).trim()
+
+            if (diffOutput) {
+                diffOutput.split('\r?\n').each { file ->
+                    if (file && file.trim()) {
+                        changedFiles.add(file)
+                        echo "      📄 Changed: ${file}"
+                    }
+                }
+            }
+
+            if (changedFiles.size() > 0) {
+                echo "    ✅ Found ${changedFiles.size()} changed files via git diff"
+                return [files: changedFiles, method: changeDetectionMethod]
+            } else {
+                echo "    ✅ No files changed since ${compareCommit}"
+                return [files: [], method: changeDetectionMethod]
+            }
+        }
+
+        // Method 3: Check if this is a completely new app (no previous builds)
+        echo "    🆕 First build or no previous commit - checking if app exists in registry"
+        changeDetectionMethod = "first-build"
+
+        // Return empty files but indicate this is a first build
+        return [files: [], method: changeDetectionMethod, firstBuild: true]
+
+    } catch (Exception e) {
+        echo "    ❌ Error detecting changes: ${e.message}"
+        // Return safe default - empty files, let image existence check decide
+        return [files: [], method: "error", error: e.message]
+    }
+}
+
+// Create and upload build manifest (Windows compatible)
+def createBuildManifest(appName, version) {
+    def manifestPath = env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ?
+        env.BUILD_MANIFESTS_PATH : env.TEMP_BUILDS_PATH
+
+    def manifest = [
+        app: appName,
+        version: version,
+        build_number: env.BUILD_NUMBER,
+        timestamp: env.TIMESTAMP,
+        git_commit: env.GIT_COMMIT_HASH,
+        git_branch: env.GIT_BRANCH_NAME,
+        git_author: env.GIT_AUTHOR,
+        jenkins_job: env.JOB_NAME,
+        docker_image: "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${appName}:${version}"
+    ]
+
+    def manifestJson = groovy.json.JsonOutput.toJson(manifest)
+    def manifestFile = "${appName}-${version}-manifest.json"
+
+    writeFile file: manifestFile, text: groovy.json.JsonOutput.prettyPrint(manifestJson)
+
+    // Upload manifest to Artifactory (Windows curl)
+    withCredentials([usernamePassword(
+        credentialsId: 'artifactory-credentials',
+        usernameVariable: 'ARTIFACTORY_USER',
+        passwordVariable: 'ARTIFACTORY_PASS'
+    )]) {
+        bat """
+            curl -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                 -T ${manifestFile} ^
+                 "https://${env.DOCKER_REGISTRY}/artifactory/${env.DOCKER_REPO}/${manifestPath}/${appName}/${version}.json"
+        """
+    }
+
+    echo "[MANIFEST] Uploaded ${manifestPath}/${appName}/${version}.json"
+}
