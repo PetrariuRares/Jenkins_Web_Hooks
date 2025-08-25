@@ -42,13 +42,22 @@ pipeline {
         TIMESTAMP = "${new Date().format('yyyyMMdd-HHmmss')}"
         JENKINS_URL = "${env.JENKINS_URL ?: 'http://jenkins.local'}"
         JOB_NAME = "${env.JOB_NAME}"
-        
+
         // Pipeline status flags
         NO_APPS = 'false'
         VALIDATION_FAILED = 'false'
-        
-        // Config values will be loaded from deployment-versions.yaml
-        CONFIG_LOADED = 'false'
+
+        // Hardcoded configuration values (same as Jenkinsfile.deploy)
+        DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
+        DOCKER_REPO = 'dockertest-docker'
+        DOCKER_LATEST_PATH = 'docker-latest'
+        DOCKER_DEV_PATH = 'docker-dev'
+        METADATA_PATH = 'metadata'
+        BUILD_MANIFESTS_PATH = 'metadata/build-manifests'
+        TEMP_BUILDS_PATH = 'metadata/temporary-builds'
+        DEV_RETENTION_DAYS = '14'
+        LATEST_VERSIONS_TO_KEEP = '10'
+        CONFIG_LOADED = 'true'
     }
 
     stages {
@@ -67,37 +76,11 @@ pipeline {
                     echo "Force Build: ${params.FORCE_BUILD}"
                     echo "========================================="
                     
-                    // Load configuration from deployment-versions.yaml if it exists
-                    if (fileExists('deployment-versions.yaml')) {
-                        def deployConfig = readYaml file: 'deployment-versions.yaml'
-                        
-                        // Load all config values into environment
-                        env.DOCKER_REGISTRY = deployConfig.config.docker_registry
-                        env.DOCKER_REPO = deployConfig.config.docker_repo
-                        env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
-                        env.DOCKER_DEV_PATH = deployConfig.config.docker_dev_path
-                        env.METADATA_PATH = deployConfig.config.metadata_path
-                        env.BUILD_MANIFESTS_PATH = deployConfig.config.build_manifests_path
-                        env.TEMP_BUILDS_PATH = deployConfig.config.temp_builds_path
-                        env.DEV_RETENTION_DAYS = deployConfig.config.dev_retention_days.toString()
-                        env.LATEST_VERSIONS_TO_KEEP = deployConfig.config.latest_versions_to_keep.toString()
-                        
-                        env.CONFIG_LOADED = 'true'
-                        echo "[CONFIG] Loaded configuration from deployment-versions.yaml"
-                    } else {
-                        // Use default values if config file doesn't exist
-                        env.DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
-                        env.DOCKER_REPO = 'dockertest-docker'
-                        env.DOCKER_LATEST_PATH = 'docker-latest'
-                        env.DOCKER_DEV_PATH = 'docker-dev'
-                        env.METADATA_PATH = 'metadata'
-                        env.BUILD_MANIFESTS_PATH = 'metadata/build-manifests'
-                        env.TEMP_BUILDS_PATH = 'metadata/temporary-builds'
-                        env.DEV_RETENTION_DAYS = '14'
-                        env.LATEST_VERSIONS_TO_KEEP = '10'
-                        
-                        echo "[CONFIG] Using default configuration (deployment-versions.yaml not found)"
-                    }
+                    echo "[CONFIG] Using hardcoded configuration values"
+                    echo "  Registry: ${env.DOCKER_REGISTRY}"
+                    echo "  Repository: ${env.DOCKER_REPO}"
+                    echo "  Latest Path: ${env.DOCKER_LATEST_PATH}"
+                    echo "  Dev Path: ${env.DOCKER_DEV_PATH}"
                 }
             }
         }
@@ -182,24 +165,7 @@ pipeline {
                     echo "[COMMIT] ${env.GIT_COMMIT_SHORT} (${env.GIT_COMMIT_HASH})"
                     echo "[AUTHOR] ${env.GIT_AUTHOR}"
                     
-                    // Reload configuration after checkout
-                    if (fileExists('deployment-versions.yaml')) {
-                        def deployConfig = readYaml file: 'deployment-versions.yaml'
-                        
-                        // Load all config values into environment
-                        env.DOCKER_REGISTRY = deployConfig.config.docker_registry
-                        env.DOCKER_REPO = deployConfig.config.docker_repo
-                        env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
-                        env.DOCKER_DEV_PATH = deployConfig.config.docker_dev_path
-                        env.METADATA_PATH = deployConfig.config.metadata_path
-                        env.BUILD_MANIFESTS_PATH = deployConfig.config.build_manifests_path
-                        env.TEMP_BUILDS_PATH = deployConfig.config.temp_builds_path
-                        env.DEV_RETENTION_DAYS = deployConfig.config.dev_retention_days.toString()
-                        env.LATEST_VERSIONS_TO_KEEP = deployConfig.config.latest_versions_to_keep.toString()
-                        
-                        env.CONFIG_LOADED = 'true'
-                        echo "[CONFIG] Reloaded configuration from deployment-versions.yaml"
-                    }
+                    echo "[CONFIG] Using hardcoded configuration values"
 
                     // Determine deployment path based on branch
                     if (params.DEPLOY_TARGET != 'auto') {
