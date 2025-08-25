@@ -1,6 +1,13 @@
 # Excel Data Generator Application
 FROM trialqlk1tc.jfrog.io/dockertest-docker/python-base:3.11
 
+# Declare build arguments that will be passed from Jenkins
+ARG APP_VERSION=unknown
+ARG BUILD_NUMBER=unknown
+ARG GIT_COMMIT=unknown
+ARG GIT_BRANCH=unknown
+ARG BUILD_TIMESTAMP=unknown
+
 WORKDIR /app
 
 # Copy only requirements first for better layer caching
