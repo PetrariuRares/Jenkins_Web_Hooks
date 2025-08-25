@@ -455,9 +455,7 @@ services:
                         branch: env.GIT_BRANCH_NAME,
                         git_commit: env.GIT_COMMIT_HASH,
                         git_commit_short: env.GIT_COMMIT_SHORT,
-                        versions: deployConfig.production,
-                        update_results: env.UPDATE_RESULTS ? groovy.json.JsonSlurper().parseText(env.UPDATE_RESULTS) : [:],
-                        deployment_status: env.DEPLOYMENT_STATUS ? groovy.json.JsonSlurper().parseText(env.DEPLOYMENT_STATUS) : [:]
+                        versions: deployConfig.production
                     ]
                     
                     // Write deployment record
