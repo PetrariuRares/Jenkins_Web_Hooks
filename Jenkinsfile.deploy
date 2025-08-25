@@ -237,7 +237,6 @@ pipeline {
                     }
                     
                     echo "\n✅ All ${foundImages.size()} production images verified successfully"
-                    env.IMAGE_MANIFESTS = groovy.json.JsonOutput.toJson(imageManifests)
                 }
             }
         }
