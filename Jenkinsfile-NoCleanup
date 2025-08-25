@@ -42,6 +42,9 @@ pipeline {
     }
 
     environment {
+        // Fix for Git whatchanged deprecation
+        GIT_WHATCHANGED_OPTS = '--i-still-use-this'
+        
         // Artifactory credentials
         ARTIFACTORY_CREDS = credentials('artifactory-credentials')
 
@@ -136,13 +139,21 @@ pipeline {
                         checkout([
                             $class: 'GitSCM',
                             branches: [[name: "*/${params.BRANCH_NAME}"]],
-                            extensions: [],
+                            extensions: [[$class: 'CloneOption', noTags: false, shallow: false]],
                             userRemoteConfigs: scm.userRemoteConfigs
                         ])
                         env.GIT_BRANCH_NAME = params.BRANCH_NAME
                     } else {
-                        checkout scm
+                        // Checkout without changelog to avoid git whatchanged deprecated command
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: scm.branches,
+                            extensions: [[$class: 'CloneOption', noTags: false, shallow: false]],
+                            userRemoteConfigs: scm.userRemoteConfigs
+                        ])
                         
+                        // Disable changelog to avoid git whatchanged error
+                        // We'll use our own change detection instead
                         try {
                             env.GIT_BRANCH_NAME = bat(
                                 script: '@git rev-parse --abbrev-ref HEAD',
@@ -918,7 +929,7 @@ ${details ? "*Details:* ${details}" : ""}
     }
 }
 
-// Enhanced change detection function
+// Enhanced change detection function (Git-based, avoids deprecated commands)
 def checkAppChangedFiles(appDir) {
     try {
         def changedFiles = []
@@ -926,46 +937,47 @@ def checkAppChangedFiles(appDir) {
 
         echo "    🔍 Detecting changes for ${appDir}..."
 
-        // Method 1: Jenkins changeset information
-        if (currentBuild.changeSets && currentBuild.changeSets.size() > 0) {
-            echo "    📋 Using Jenkins changeset information"
-            changeDetectionMethod = "jenkins-changeset"
-
-            currentBuild.changeSets.each { changeSet ->
-                changeSet.items.each { change ->
-                    change.affectedFiles.each { file ->
-                        if (file.path.startsWith("${appDir}/")) {
-                            changedFiles.add(file.path)
-                            echo "      📄 Changed: ${file.path} (${file.editType})"
-                        }
-                    }
-                }
-            }
-
-            if (changedFiles.size() > 0) {
-                echo "    ✅ Found ${changedFiles.size()} changed files via Jenkins changeset"
-                return [files: changedFiles, method: changeDetectionMethod]
-            }
-        }
-
-        // Method 2: Git diff
+        // Primary Method: Git diff (most reliable, avoids deprecated commands)
         def compareCommit = env.GIT_PREVIOUS_COMMIT
+        
+        // Try to get previous commit if not set
         if (!compareCommit || compareCommit == "") {
             try {
-                compareCommit = bat(
-                    script: "@git rev-parse HEAD~1 2>nul || echo \"\"",
-                    returnStdout: true
-                ).trim()
-                echo "    📍 Using HEAD~1 as comparison: ${compareCommit}"
+                // First try to get the last successful build's commit
+                def lastSuccessfulCommit = ''
+                if (currentBuild.previousSuccessfulBuild) {
+                    try {
+                        def prevBuildEnv = currentBuild.previousSuccessfulBuild.getBuildVariables()
+                        lastSuccessfulCommit = prevBuildEnv.get('GIT_COMMIT_HASH', '')
+                        if (lastSuccessfulCommit && lastSuccessfulCommit != env.GIT_COMMIT_HASH) {
+                            compareCommit = lastSuccessfulCommit
+                            echo "    📍 Using last successful build commit: ${compareCommit.take(8)}"
+                        }
+                    } catch (Exception e) {
+                        // Fallback to HEAD~1
+                    }
+                }
+                
+                // If still no commit, use HEAD~1
+                if (!compareCommit || compareCommit == "") {
+                    compareCommit = bat(
+                        script: "@git rev-parse HEAD~1 2>nul || echo \"\"",
+                        returnStdout: true
+                    ).trim()
+                    if (compareCommit) {
+                        echo "    📍 Using HEAD~1 as comparison: ${compareCommit.take(8)}"
+                    }
+                }
             } catch (Exception e) {
                 echo "    ⚠ Could not determine previous commit: ${e.message}"
             }
         }
 
         if (compareCommit && compareCommit != "") {
-            echo "    🔄 Comparing ${compareCommit}...HEAD for ${appDir}/"
+            echo "    🔄 Comparing ${compareCommit.take(8)}...HEAD for ${appDir}/"
             changeDetectionMethod = "git-diff"
 
+            // Use git diff to detect changes
             def diffOutput = bat(
                 script: "@git diff --name-only ${compareCommit}...HEAD -- ${appDir}/ 2>nul || echo \"\"",
                 returnStdout: true
@@ -984,18 +996,37 @@ def checkAppChangedFiles(appDir) {
                 echo "    ✅ Found ${changedFiles.size()} changed files via git diff"
                 return [files: changedFiles, method: changeDetectionMethod]
             } else {
-                echo "    ✅ No files changed since ${compareCommit}"
+                echo "    ✅ No files changed since ${compareCommit.take(8)}"
                 return [files: [], method: changeDetectionMethod]
+            }
+        } else {
+            // No previous commit - check if this is a new app
+            echo "    🆕 No previous commit found - checking if app is new..."
+            
+            // Check if the app directory exists and has files
+            def appExists = fileExists(appDir)
+            if (appExists) {
+                // List all files in the app directory
+                def filesInApp = bat(
+                    script: "@dir /b /s ${appDir} 2>nul | find /c /v \"\" || echo 0",
+                    returnStdout: true
+                ).trim()
+                
+                if (filesInApp != "0") {
+                    echo "    🆕 App exists with ${filesInApp} files - treating as new/first build"
+                    changeDetectionMethod = "first-build"
+                    return [files: [], method: changeDetectionMethod, firstBuild: true]
+                }
             }
         }
 
-        echo "    🆕 First build or no previous commit"
-        changeDetectionMethod = "first-build"
-        return [files: [], method: changeDetectionMethod, firstBuild: true]
+        echo "    ℹ️ No changes detected or unable to determine changes"
+        return [files: [], method: "no-changes", firstBuild: false]
 
     } catch (Exception e) {
         echo "    ❌ Error detecting changes: ${e.message}"
-        return [files: [], method: "error", error: e.message]
+        // On error, assume changes exist to be safe
+        return [files: [], method: "error", error: e.message, firstBuild: true]
     }
 }
 

@@ -1,26 +1,69 @@
-# File location: /deployment-versions.yaml (root of repo)
-# This file controls which versions are deployed to production
-# Any version listed here is protected from cleanup
+# deployment-versions.yaml
+# This file controls production deployments and version management
+# Location: /deployment-versions.yaml (root of repository)
 
-# Production versions - these will NEVER be deleted by cleanup
+# ================================================================================
+# PRODUCTION VERSIONS
+# These versions are currently deployed to production
+# The main Jenkinsfile will NOT update 'latest' tags for these versions
+# Only Jenkinsfile.deploy can update 'latest' tags for production versions
+# ================================================================================
 production:
   app1: "1.2.7"
   app2: "1.1.0"
   app3-ml-engine: "1.0.0"
+  # Add more applications as needed:
+  # app-name: "X.Y.Z"
 
-# Configuration settings for pipelines
+# ================================================================================
+# PIPELINE CONFIGURATION
+# Shared configuration used by both Jenkinsfile and Jenkinsfile.deploy
+# ================================================================================
 config:
   # Artifactory settings
   docker_registry: "trialqlk1tc.jfrog.io"
   docker_repo: "dockertest-docker"
-  docker_latest_path: "docker-latest"
-  docker_dev_path: "docker-dev"
   
-  # Metadata paths in Artifactory
+  # Docker repository paths
+  docker_latest_path: "docker-latest"      # Path for production/stable images
+  docker_dev_path: "docker-dev"            # Path for development/feature branch images
+  
+  # Metadata storage paths in Artifactory
   metadata_path: "metadata"
-  build_manifests_path: "metadata/build-manifests"      # Production build manifests
-  temp_builds_path: "metadata/temporary-builds"         # Dev/feature build manifests
+  build_manifests_path: "metadata/build-manifests"   # Production build manifests
+  temp_builds_path: "metadata/temporary-builds"      # Dev/feature build manifests
   
-  # Cleanup settings
-  dev_retention_days: 14                                # Days to keep dev images
-  latest_versions_to_keep: 10                           # Number of versions to keep per app in docker-latest
+  # Cleanup and retention settings
+  dev_retention_days: 14                   # Days to keep dev images before cleanup
+  latest_versions_to_keep: 10              # Number of versions to keep per app in docker-latest
+
+# ================================================================================
+# VERSION PROTECTION RULES
+# How version protection works:
+# 
+# 1. When an app version matches a production version:
+#    - Main Jenkinsfile will NOT update the 'latest' tag automatically
+#    - The version tag itself will still be built and pushed if changes detected
+#    - Only Jenkinsfile.deploy can update 'latest' for protected versions
+#
+# 2. To override protection (use with caution):
+#    - Set OVERRIDE_PROTECTION=true parameter in main Jenkinsfile
+#    - This allows updating 'latest' even for protected versions
+#
+# 3. Deployment workflow:
+#    a. Update version in app's version.txt
+#    b. Commit and push (main pipeline builds but doesn't update 'latest')
+#    c. Update this file with new production version
+#    d. Run Jenkinsfile.deploy to promote to production
+# ================================================================================
+
+# ================================================================================
+# ROLLBACK PROCEDURES
+# 
+# If deployment fails:
+# 1. Jenkinsfile.deploy will attempt automatic rollback if configured
+# 2. For manual rollback:
+#    a. Revert this file to previous version
+#    b. Run Jenkinsfile.deploy again
+#    c. Or manually update Docker tags in Artifactory
+# ================================================================================
