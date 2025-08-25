@@ -29,6 +29,11 @@ CMD ["python", "src/excel_generator.py"]
 
 LABEL maintainer="CI/CD Pipeline" \
       description="Excel Data Generator Application" \
-      version="1.0.0" \
+      version="${APP_VERSION}" \
       app.name="app1" \
-      app.type="excel-generator"
+      app.type="excel-generator" \
+      app.version="${APP_VERSION}" \
+      build.number="${BUILD_NUMBER}" \
+      git.commit="${GIT_COMMIT}" \
+      git.branch="${GIT_BRANCH}" \
+      build.timestamp="${BUILD_TIMESTAMP}"

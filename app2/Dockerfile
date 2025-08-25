@@ -27,6 +27,11 @@ CMD ["python", "processor_main.py"]
 
 LABEL maintainer="CI/CD Pipeline" \
       description="Data Processing Application" \
-      version="1.0.0" \
+      version="${APP_VERSION}" \
       app.name="app2" \
-      app.type="data-processor"
+      app.type="data-processor" \
+      app.version="${APP_VERSION}" \
+      build.number="${BUILD_NUMBER}" \
+      git.commit="${GIT_COMMIT}" \
+      git.branch="${GIT_BRANCH}" \
+      build.timestamp="${BUILD_TIMESTAMP}"
