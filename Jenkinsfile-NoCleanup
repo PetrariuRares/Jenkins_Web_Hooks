@@ -44,6 +44,7 @@ pipeline {
     environment {
         // Fix for Git whatchanged deprecation
         GIT_WHATCHANGED_OPTS = '--i-still-use-this'
+        GIT_PAGER = 'cat'  // Disable pager to avoid issues
         
         // Artifactory credentials
         ARTIFACTORY_CREDS = credentials('artifactory-credentials')
@@ -135,44 +136,45 @@ pipeline {
                 script {
                     deleteDir()
                     
+                    // Simple checkout without changelog to avoid git whatchanged issue
                     if (params.BRANCH_NAME) {
-                        checkout([
+                        checkout scm: [
                             $class: 'GitSCM',
                             branches: [[name: "*/${params.BRANCH_NAME}"]],
-                            extensions: [[$class: 'CloneOption', noTags: false, shallow: false]],
                             userRemoteConfigs: scm.userRemoteConfigs
-                        ])
+                        ], changelog: false, poll: false
+                        
                         env.GIT_BRANCH_NAME = params.BRANCH_NAME
                     } else {
-                        // Checkout without changelog to avoid git whatchanged deprecated command
-                        checkout([
-                            $class: 'GitSCM',
-                            branches: scm.branches,
-                            extensions: [[$class: 'CloneOption', noTags: false, shallow: false]],
-                            userRemoteConfigs: scm.userRemoteConfigs
-                        ])
+                        checkout scm: scm, changelog: false, poll: false
                         
-                        // Disable changelog to avoid git whatchanged error
-                        // We'll use our own change detection instead
+                        // Get branch name
                         try {
                             env.GIT_BRANCH_NAME = bat(
-                                script: '@git rev-parse --abbrev-ref HEAD',
+                                script: '@git rev-parse --abbrev-ref HEAD 2>nul',
                                 returnStdout: true
                             ).trim()
                             
-                            if (env.GIT_BRANCH_NAME == 'HEAD') {
-                                env.GIT_BRANCH_NAME = bat(
-                                    script: '@git branch -r --contains HEAD',
+                            if (!env.GIT_BRANCH_NAME || env.GIT_BRANCH_NAME == 'HEAD') {
+                                // Try alternative method for detached HEAD
+                                def remoteBranch = bat(
+                                    script: '@git branch -r --contains HEAD 2>nul',
                                     returnStdout: true
                                 ).trim()
-                                env.GIT_BRANCH_NAME = env.GIT_BRANCH_NAME.replaceAll('.*origin/', '').trim()
+                                
+                                if (remoteBranch && remoteBranch.contains('origin/')) {
+                                    env.GIT_BRANCH_NAME = remoteBranch.replaceAll('.*origin/', '').trim()
+                                } else {
+                                    env.GIT_BRANCH_NAME = 'unknown'
+                                }
                             }
                         } catch (Exception e) {
                             env.GIT_BRANCH_NAME = 'unknown'
                         }
                     }
 
-                    if (env.GIT_BRANCH_NAME.contains('/')) {
+                    // Clean up branch name if needed
+                    if (env.GIT_BRANCH_NAME && env.GIT_BRANCH_NAME.contains('/')) {
                         def parts = env.GIT_BRANCH_NAME.split('/')
                         if (parts[0] == 'origin') {
                             env.GIT_BRANCH_NAME = parts[1..-1].join('/')
