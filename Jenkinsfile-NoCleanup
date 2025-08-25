@@ -512,8 +512,16 @@ pipeline {
                                 .take(100)
 
                             try {
-                                // Build Docker image with all required labels (Windows compatible)
-                                def buildCommand = """docker build -t ${imageName}:${imageTag} ^
+                                // Login to Docker registry for pulling base images
+                                withCredentials([usernamePassword(
+                                    credentialsId: 'artifactory-credentials',
+                                    usernameVariable: 'ARTIFACTORY_USER',
+                                    passwordVariable: 'ARTIFACTORY_PASS'
+                                )]) {
+                                    bat "echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin"
+
+                                    // Build Docker image with all required labels (Windows compatible)
+                                    def buildCommand = """docker build -t ${imageName}:${imageTag} ^
                                     --build-arg APP_VERSION=${version} ^
                                     --build-arg BUILD_NUMBER=${BUILD_NUMBER} ^
                                     --build-arg GIT_COMMIT=${env.GIT_COMMIT_HASH} ^
@@ -532,11 +540,15 @@ pipeline {
 
                                 bat buildCommand.replaceAll('\n', ' ')
 
-                                echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag}"
+                                    echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag}"
 
-                                // Store tags for push stage - only store the version tag
-                                // The 'latest' tag should only be managed by Jenkinsfile.deploy
-                                writeFile file: "${app}_tags.txt", text: "${imageTag}"
+                                    // Store tags for push stage - only store the version tag
+                                    // The 'latest' tag should only be managed by Jenkinsfile.deploy
+                                    writeFile file: "${app}_tags.txt", text: "${imageTag}"
+
+                                    // Logout from Docker registry
+                                    bat "docker logout ${env.DOCKER_REGISTRY}"
+                                }
 
                             } catch (Exception e) {
                                 echo "[BUILD ERROR] ${app}: ${e.message}"
