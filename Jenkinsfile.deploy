@@ -22,8 +22,13 @@ pipeline {
         )
         booleanParam(
             name: 'ROLLBACK_ON_FAILURE',
+            defaultValue: false,
+            description: 'Automatically rollback on deployment failure (requires backup)'
+        )
+        booleanParam(
+            name: 'SKIP_BACKUP',
             defaultValue: true,
-            description: 'Automatically rollback on deployment failure'
+            description: 'Skip backup stage for testing (disable rollback capability)'
         )
         string(
             name: 'SLACK_WEBHOOK_URL',
@@ -161,26 +166,54 @@ pipeline {
                     
                     // Read the YAML file
                     def deployConfig = readYaml file: 'deployment-versions.yaml'
-                    
+
+                    // Debug: Show what was loaded
+                    echo "\n>>> Debug - YAML content loaded:"
+                    echo "  Full config: ${deployConfig}"
+                    echo "  Config section: ${deployConfig.config}"
+                    echo "  Production section: ${deployConfig.production}"
+
                     // Validate structure
                     if (!deployConfig.production || deployConfig.production.size() == 0) {
                         error("❌ No production versions defined in deployment-versions.yaml")
                     }
-                    
+
                     if (!deployConfig.config) {
                         error("❌ Config section missing in deployment-versions.yaml")
                     }
-                    
-                    // Load config values into environment
-                    env.DOCKER_REGISTRY = deployConfig.config.docker_registry
-                    env.DOCKER_REPO = deployConfig.config.docker_repo
-                    env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
-                    env.BUILD_MANIFESTS_PATH = deployConfig.config.build_manifests_path
-                    
+
+                    // Load config values into environment with explicit null checks and defaults
+                    def config = deployConfig.config
+                    env.DOCKER_REGISTRY = config.docker_registry ?: 'trialqlk1tc.jfrog.io'
+                    env.DOCKER_REPO = config.docker_repo ?: 'dockertest-docker'
+                    env.DOCKER_LATEST_PATH = config.docker_latest_path ?: 'docker-latest'
+                    env.BUILD_MANIFESTS_PATH = config.build_manifests_path ?: 'metadata/build-manifests'
+
+                    // Verify values were set correctly
+                    if (!env.DOCKER_REGISTRY || env.DOCKER_REGISTRY == 'null') {
+                        env.DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
+                        echo "⚠️ Using fallback registry: ${env.DOCKER_REGISTRY}"
+                    }
+                    if (!env.DOCKER_REPO || env.DOCKER_REPO == 'null') {
+                        env.DOCKER_REPO = 'dockertest-docker'
+                        echo "⚠️ Using fallback repo: ${env.DOCKER_REPO}"
+                    }
+                    if (!env.DOCKER_LATEST_PATH || env.DOCKER_LATEST_PATH == 'null') {
+                        env.DOCKER_LATEST_PATH = 'docker-latest'
+                        echo "⚠️ Using fallback path: ${env.DOCKER_LATEST_PATH}"
+                    }
+
                     echo "\n>>> Configuration loaded:"
                     echo "  Registry: ${env.DOCKER_REGISTRY}"
                     echo "  Repository: ${env.DOCKER_REPO}"
                     echo "  Path: ${env.DOCKER_LATEST_PATH}"
+                    echo "  Manifests Path: ${env.BUILD_MANIFESTS_PATH}"
+
+                    // Debug: Show raw config
+                    if (params.VERBOSE_OUTPUT ?: false) {
+                        echo "\n>>> Debug - Raw config section:"
+                        echo "  ${deployConfig.config}"
+                    }
                     
                     echo "\n>>> Applications to deploy:"
                     deployConfig.production.each { app, version ->
@@ -203,29 +236,52 @@ pipeline {
         // ================================================================================
         stage('Backup Current State') {
             when {
-                expression { params.ROLLBACK_ON_FAILURE == true }
+                allOf {
+                    expression { params.ROLLBACK_ON_FAILURE == true }
+                    expression { params.SKIP_BACKUP != true }
+                }
             }
             steps {
                 script {
                     echo "💾 Backing up current 'latest' tags for potential rollback..."
-                    
+
+                    // Validate that we have the required config values
+                    if (!env.DOCKER_REGISTRY || !env.DOCKER_REPO || !env.DOCKER_LATEST_PATH) {
+                        error("❌ Missing configuration values. Registry: ${env.DOCKER_REGISTRY}, Repo: ${env.DOCKER_REPO}, Path: ${env.DOCKER_LATEST_PATH}")
+                    }
+
                     def deployConfig = readYaml file: 'deployment-versions.yaml'
                     def backupInfo = [:]
-                    
+
                     deployConfig.production.each { app, version ->
                         echo "\n  Checking current latest for ${app}..."
-                        
+
                         // Get current latest tag manifest
                         def manifestUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_LATEST_PATH}/${app}/manifests/latest"
-                        
-                        def response = bat(
-                            script: """
-                                @curl -s -u %ARTIFACTORY_CREDS_USR%:%ARTIFACTORY_CREDS_PSW% ^
-                                     -X GET "${manifestUrl}" ^
-                                     -H "Accept: application/vnd.docker.distribution.manifest.v2+json"
-                            """,
-                            returnStdout: true
-                        ).trim()
+                        echo "    URL: ${manifestUrl}"
+
+                        try {
+                            def response = bat(
+                                script: """
+                                    @curl -s -u %ARTIFACTORY_CREDS_USR%:%ARTIFACTORY_CREDS_PSW% ^
+                                         -X GET "${manifestUrl}" ^
+                                         -H "Accept: application/vnd.docker.distribution.manifest.v2+json" ^
+                                         -w "\\nHTTPSTATUS:%%{http_code}"
+                                """,
+                                returnStdout: true
+                            ).trim()
+
+                            def httpStatus = response.contains('HTTPSTATUS:') ?
+                                response.split('HTTPSTATUS:')[1] : '000'
+
+                            if (httpStatus == "200") {
+                                echo "    ✅ Found existing latest tag for ${app}"
+                            } else {
+                                echo "    ⚠️ No existing latest tag for ${app} (HTTP ${httpStatus})"
+                            }
+                        } catch (Exception e) {
+                            echo "    ❌ Error checking ${app}: ${e.message}"
+                        }
                         
                         // Extract config digest to identify the actual version
                         if (response.contains('"config"')) {
