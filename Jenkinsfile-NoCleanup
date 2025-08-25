@@ -500,6 +500,9 @@ pipeline {
 
         // ================================================================================
         // STAGE 5: Build Docker Images
+        // NOTE: This stage builds and pushes ONLY versioned tags (e.g., "1.2.3")
+        // The "latest" tag is managed exclusively by Jenkinsfile.deploy based on
+        // deployment-versions.yaml to ensure production control
         // ================================================================================
         stage('Build Docker Images') {
             when {
@@ -558,16 +561,11 @@ pipeline {
 
                                 bat buildCommand.replaceAll('\n', ' ')
 
-                                // For main branch, also tag as latest
-                                if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
-                                    bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
-                                    echo "[TAG] Also tagged as ${imageName}:latest"
-                                }
-
                                 echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag}"
 
-                                // Store tags for push stage
-                                writeFile file: "${app}_tags.txt", text: "${imageTag}${env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ? ',latest' : ''}"
+                                // Store tags for push stage - only store the version tag
+                                // The 'latest' tag should only be managed by Jenkinsfile.deploy
+                                writeFile file: "${app}_tags.txt", text: "${imageTag}"
 
                             } catch (Exception e) {
                                 echo "[BUILD ERROR] ${app}: ${e.message}"
@@ -677,6 +675,11 @@ pipeline {
                             pushedTags.split(',').each { tag ->
                                 echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag}"
                             }
+                        }
+
+                        if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
+                            echo "\n>>> NOTE: 'latest' tags are managed by Jenkinsfile.deploy"
+                            echo "    Run the deployment pipeline to promote versions to 'latest'"
                         }
                     } else {
                         echo "\n[STATUS] No changes detected"

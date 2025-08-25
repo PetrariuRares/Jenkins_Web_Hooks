@@ -36,34 +36,3 @@ config:
   # Cleanup and retention settings
   dev_retention_days: 14                   # Days to keep dev images before cleanup
   latest_versions_to_keep: 10              # Number of versions to keep per app in docker-latest
-
-# ================================================================================
-# VERSION PROTECTION RULES
-# How version protection works:
-# 
-# 1. When an app version matches a production version:
-#    - Main Jenkinsfile will NOT update the 'latest' tag automatically
-#    - The version tag itself will still be built and pushed if changes detected
-#    - Only Jenkinsfile.deploy can update 'latest' for protected versions
-#
-# 2. To override protection (use with caution):
-#    - Set OVERRIDE_PROTECTION=true parameter in main Jenkinsfile
-#    - This allows updating 'latest' even for protected versions
-#
-# 3. Deployment workflow:
-#    a. Update version in app's version.txt
-#    b. Commit and push (main pipeline builds but doesn't update 'latest')
-#    c. Update this file with new production version
-#    d. Run Jenkinsfile.deploy to promote to production
-# ================================================================================
-
-# ================================================================================
-# ROLLBACK PROCEDURES
-# 
-# If deployment fails:
-# 1. Jenkinsfile.deploy will attempt automatic rollback if configured
-# 2. For manual rollback:
-#    a. Revert this file to previous version
-#    b. Run Jenkinsfile.deploy again
-#    c. Or manually update Docker tags in Artifactory
-# ================================================================================
