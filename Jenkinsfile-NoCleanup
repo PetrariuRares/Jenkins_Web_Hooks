@@ -483,6 +483,14 @@ pipeline {
                     def apps = env.APPS_TO_BUILD.split(',')
                     def buildJobs = [:]
 
+                    // Login to Docker registry for pulling base images
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        bat "echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin"
+
                     apps.each { app ->
                         buildJobs[app] = {
                             echo "[BUILD START] ${app}"
@@ -545,7 +553,12 @@ pipeline {
                         }
                     }
 
-                    parallel buildJobs
+                        parallel buildJobs
+
+                        // Logout from Docker registry
+                        bat "docker logout ${env.DOCKER_REGISTRY}"
+                    }
+
                     env.BUILD_COMPLETE = 'true'
                 }
             }
