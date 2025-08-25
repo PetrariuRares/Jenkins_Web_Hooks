@@ -86,12 +86,45 @@ pipeline {
             steps {
                 checkout scm
                 script {
-                    // Get current branch
-                    env.GIT_BRANCH_NAME = bat(
-                        script: '@git rev-parse --abbrev-ref HEAD',
-                        returnStdout: true
-                    ).trim()
-                    
+                    // Get current branch - handle detached HEAD state in Jenkins
+                    try {
+                        env.GIT_BRANCH_NAME = bat(
+                            script: '@git rev-parse --abbrev-ref HEAD',
+                            returnStdout: true
+                        ).trim()
+
+                        // If in detached HEAD state (common in Jenkins), try alternative methods
+                        if (env.GIT_BRANCH_NAME == 'HEAD') {
+                            // Method 1: Try to get branch from remote tracking
+                            try {
+                                def remoteBranch = bat(
+                                    script: '@git branch -r --contains HEAD 2>nul',
+                                    returnStdout: true
+                                ).trim()
+
+                                if (remoteBranch.contains('origin/main')) {
+                                    env.GIT_BRANCH_NAME = 'main'
+                                } else if (remoteBranch.contains('origin/master')) {
+                                    env.GIT_BRANCH_NAME = 'master'
+                                } else {
+                                    // Method 2: Use Jenkins environment variable if available
+                                    env.GIT_BRANCH_NAME = env.BRANCH_NAME ?: env.GIT_BRANCH ?: 'main'
+                                    if (env.GIT_BRANCH_NAME.contains('origin/')) {
+                                        env.GIT_BRANCH_NAME = env.GIT_BRANCH_NAME.replaceAll('.*origin/', '')
+                                    }
+                                }
+                            } catch (Exception e2) {
+                                echo "⚠️ Could not determine branch from remote: ${e2.message}"
+                                env.GIT_BRANCH_NAME = 'main'  // Default assumption
+                            }
+                        }
+                    } catch (Exception e) {
+                        echo "⚠️ Could not determine branch name: ${e.message}"
+                        env.GIT_BRANCH_NAME = 'main'  // Default assumption for deployment
+                    }
+
+                    echo "🔍 Detected branch: ${env.GIT_BRANCH_NAME}"
+
                     // Only allow deployment from main/master branch
                     if (env.GIT_BRANCH_NAME != 'main' && env.GIT_BRANCH_NAME != 'master') {
                         error("❌ Deployment only allowed from main/master branch. Current branch: ${env.GIT_BRANCH_NAME}")
