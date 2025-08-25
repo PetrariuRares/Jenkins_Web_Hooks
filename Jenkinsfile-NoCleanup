@@ -1,3 +1,6 @@
+// Enhanced Jenkinsfile with Production Version Protection
+// This pipeline reads deployment-versions.yaml and protects production versions
+
 pipeline {
     agent any
 
@@ -16,6 +19,11 @@ pipeline {
             name: 'FORCE_BUILD',
             defaultValue: false,
             description: 'Force rebuild even if no changes detected'
+        )
+        booleanParam(
+            name: 'OVERRIDE_PROTECTION',
+            defaultValue: false,
+            description: 'Override production version protection (USE WITH CAUTION)'
         )
         string(
             name: 'SLACK_WEBHOOK_URL',
@@ -49,6 +57,7 @@ pipeline {
         
         // Config values will be loaded from deployment-versions.yaml
         CONFIG_LOADED = 'false'
+        PRODUCTION_VERSIONS = ''
     }
 
     stages {
@@ -65,6 +74,7 @@ pipeline {
                     echo "Manual Branch Override: ${params.BRANCH_NAME ?: 'none'}"
                     echo "Deploy Target: ${params.DEPLOY_TARGET}"
                     echo "Force Build: ${params.FORCE_BUILD}"
+                    echo "Override Protection: ${params.OVERRIDE_PROTECTION}"
                     echo "========================================="
                     
                     // Load configuration from deployment-versions.yaml if it exists
@@ -82,8 +92,19 @@ pipeline {
                         env.DEV_RETENTION_DAYS = deployConfig.config.dev_retention_days.toString()
                         env.LATEST_VERSIONS_TO_KEEP = deployConfig.config.latest_versions_to_keep.toString()
                         
+                        // Store production versions for protection
+                        env.PRODUCTION_VERSIONS = groovy.json.JsonOutput.toJson(deployConfig.production ?: [:])
+                        
                         env.CONFIG_LOADED = 'true'
                         echo "[CONFIG] Loaded configuration from deployment-versions.yaml"
+                        
+                        // Display protected versions
+                        if (deployConfig.production) {
+                            echo "\n[PROTECTED] Production versions:"
+                            deployConfig.production.each { app, version ->
+                                echo "  • ${app}: ${version}"
+                            }
+                        }
                     } else {
                         // Use default values if config file doesn't exist
                         env.DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
@@ -95,6 +116,7 @@ pipeline {
                         env.TEMP_BUILDS_PATH = 'metadata/temporary-builds'
                         env.DEV_RETENTION_DAYS = '14'
                         env.LATEST_VERSIONS_TO_KEEP = '10'
+                        env.PRODUCTION_VERSIONS = '{}'
                         
                         echo "[CONFIG] Using default configuration (deployment-versions.yaml not found)"
                     }
@@ -165,7 +187,6 @@ pipeline {
                             returnStdout: true
                         ).trim()
                         
-                        // Get previous successful commit for better change detection
                         env.GIT_PREVIOUS_COMMIT = bat(
                             script: '@git rev-parse HEAD~1 2>nul || echo ""',
                             returnStdout: true
@@ -182,11 +203,11 @@ pipeline {
                     echo "[COMMIT] ${env.GIT_COMMIT_SHORT} (${env.GIT_COMMIT_HASH})"
                     echo "[AUTHOR] ${env.GIT_AUTHOR}"
                     
-                    // Reload configuration after checkout
+                    // Reload configuration after checkout to get the latest deployment-versions.yaml
                     if (fileExists('deployment-versions.yaml')) {
                         def deployConfig = readYaml file: 'deployment-versions.yaml'
                         
-                        // Load all config values into environment
+                        // Reload all config values
                         env.DOCKER_REGISTRY = deployConfig.config.docker_registry
                         env.DOCKER_REPO = deployConfig.config.docker_repo
                         env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
@@ -197,8 +218,19 @@ pipeline {
                         env.DEV_RETENTION_DAYS = deployConfig.config.dev_retention_days.toString()
                         env.LATEST_VERSIONS_TO_KEEP = deployConfig.config.latest_versions_to_keep.toString()
                         
+                        // Update production versions
+                        env.PRODUCTION_VERSIONS = groovy.json.JsonOutput.toJson(deployConfig.production ?: [:])
+                        
                         env.CONFIG_LOADED = 'true'
                         echo "[CONFIG] Reloaded configuration from deployment-versions.yaml"
+                        
+                        // Display protected versions
+                        if (deployConfig.production) {
+                            echo "\n[PROTECTED] Production versions after reload:"
+                            deployConfig.production.each { app, version ->
+                                echo "  • ${app}: ${version} (protected)"
+                            }
+                        }
                     }
 
                     // Determine deployment path based on branch
@@ -229,6 +261,7 @@ pipeline {
 
                     def pythonApps = []
                     def validationErrors = []
+                    def productionVersions = groovy.json.JsonSlurper().parseText(env.PRODUCTION_VERSIONS)
 
                     // Find all Dockerfiles using Windows commands
                     def dockerfiles = ''
@@ -244,14 +277,11 @@ pipeline {
                     if (dockerfiles) {
                         dockerfiles.split('\r?\n').each { file ->
                             if (file && file.trim() && file.contains('Dockerfile')) {
-                                // Convert Windows path to relative path
                                 def relativePath = file.replace(env.WORKSPACE + '\\', '').replace('\\', '/')
                                 def parts = relativePath.split('/')
 
-                                // Check if Dockerfile is in a subdirectory (not root)
                                 if (parts.length == 2 && parts[1] == 'Dockerfile') {
                                     def appName = parts[0]
-                                    // Exclude hidden directories and jenkins directories
                                     if (!appName.startsWith('.') && !appName.startsWith('@')) {
                                         pythonApps.add(appName)
                                         echo "[FOUND] Application: ${appName}"
@@ -263,7 +293,7 @@ pipeline {
 
                     if (pythonApps.size() == 0) {
                         env.NO_APPS = 'true'
-                        env.VALIDATED_APPS = ''  // Set empty string to avoid null
+                        env.VALIDATED_APPS = ''
                         echo "[INFO] No applications with Dockerfiles found"
                         echo "[DEBUG] Searched in: ${env.WORKSPACE}"
                         echo "[DEBUG] Raw output: ${dockerfiles}"
@@ -272,7 +302,7 @@ pipeline {
 
                     echo "[APPS] Found ${pythonApps.size()} applications: ${pythonApps.join(', ')}"
 
-                    // Validate each application has all 4 mandatory files
+                    // Validate each application
                     pythonApps.each { app ->
                         echo "\n[VALIDATING] ${app}..."
 
@@ -292,14 +322,23 @@ pipeline {
                             } else {
                                 echo "  ✓ Found: ${file}"
 
-                                // Validate version.txt format if on main branch
-                                if (file == 'version.txt' && (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master')) {
+                                // Validate version.txt format and check protection status
+                                if (file == 'version.txt') {
                                     def version = readFile(filePath).trim()
-                                    if (!version.matches('^\\d+\\.\\d+\\.\\d+$')) {
-                                        validationErrors.add("${app}/version.txt has invalid format: '${version}' (expected: X.Y.Z)")
-                                        echo "  ❌ Invalid version format: ${version}"
-                                    } else {
-                                        echo "  ✓ Version: ${version}"
+                                    
+                                    // Check if this is a protected production version
+                                    if (productionVersions.containsKey(app) && productionVersions[app] == version) {
+                                        echo "  🔒 PROTECTED VERSION: ${version} (production)"
+                                    }
+                                    
+                                    // Validate format on main branch
+                                    if (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master') {
+                                        if (!version.matches('^\\d+\\.\\d+\\.\\d+$')) {
+                                            validationErrors.add("${app}/version.txt has invalid format: '${version}' (expected: X.Y.Z)")
+                                            echo "  ❌ Invalid version format: ${version}"
+                                        } else {
+                                            echo "  ✓ Version: ${version}"
+                                        }
                                     }
                                 }
                             }
@@ -353,8 +392,8 @@ pipeline {
 
                     def pythonApps = env.VALIDATED_APPS.split(',')
                     def changedApps = []
+                    def productionVersions = groovy.json.JsonSlurper().parseText(env.PRODUCTION_VERSIONS)
 
-                    // Determine if this is main branch
                     def isMainBranch = (env.GIT_BRANCH_NAME == 'main' || env.GIT_BRANCH_NAME == 'master')
                     echo "[INFO] Branch type: ${isMainBranch ? 'MAIN BRANCH' : 'FEATURE BRANCH'}"
                     echo "[INFO] Branch name: ${env.GIT_BRANCH_NAME}"
@@ -371,39 +410,43 @@ pipeline {
                         pythonApps.each { app ->
                             def needsBuild = false
                             def reason = ""
+                            def isProtected = false
 
                             echo "[ANALYZING] ${app}..."
-                            echo "  Current commit: ${env.GIT_COMMIT_SHORT}"
-                            echo "  Previous commit: ${env.GIT_PREVIOUS_COMMIT ?: 'none'}"
+                            
+                            // Read current version
+                            def currentVersion = readFile("${app}/version.txt").trim()
+                            echo "  Current version: ${currentVersion}"
+                            
+                            // Check if this version is protected
+                            if (productionVersions.containsKey(app) && productionVersions[app] == currentVersion) {
+                                isProtected = true
+                                echo "  🔒 PROTECTED: This is a production version"
+                            }
 
-                            // For force build, always rebuild
+                            // For force build, check protection
                             if (params.FORCE_BUILD) {
-                                needsBuild = true
-                                reason = "Force build requested by user"
+                                if (isProtected && !params.OVERRIDE_PROTECTION) {
+                                    needsBuild = false
+                                    reason = "Protected production version - use OVERRIDE_PROTECTION to force"
+                                } else {
+                                    needsBuild = true
+                                    reason = "Force build requested by user${isProtected ? ' (protection overridden)' : ''}"
+                                }
                             } else {
-                                // Check for file changes using enhanced function
+                                // Check for file changes
                                 def changeResult = checkAppChangedFiles(app)
                                 def changedFiles = changeResult.files ?: []
-                                def detectionMethod = changeResult.method ?: "unknown"
-                                def isFirstBuild = changeResult.firstBuild ?: false
-
-                                echo "  Detection method: ${detectionMethod}"
-                                if (changeResult.error) {
-                                    echo "  Detection error: ${changeResult.error}"
-                                }
-
-                                // Filter out README-only changes
                                 def significantChanges = changedFiles.findAll { !it.endsWith('README.md') }
                                 def hasSignificantChanges = significantChanges.size() > 0
 
-                                // Show what changed
                                 if (hasSignificantChanges) {
                                     echo "  📝 Files changed in ${app} (${significantChanges.size()} significant):"
                                     significantChanges.each { file ->
                                         echo "    - ${file}"
                                     }
                                 } else if (changedFiles.size() > 0) {
-                                    echo "  📝 Only README changes in ${app} (${changedFiles.size()} total files)"
+                                    echo "  📝 Only README changes in ${app}"
                                 } else {
                                     echo "  ✅ No changes detected in ${app}"
                                 }
@@ -413,12 +456,9 @@ pipeline {
                                 def imageName = ''
 
                                 if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
-                                    // Main branch - use version from version.txt
-                                    def version = readFile("${app}/version.txt").trim()
-                                    imageTag = version
+                                    imageTag = currentVersion
                                     imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}:${imageTag}"
                                 } else {
-                                    // Feature branch - use branch-commit format
                                     def cleanBranchName = env.GIT_BRANCH_NAME
                                         .replaceAll('[^a-zA-Z0-9._-]', '-')
                                         .toLowerCase()
@@ -428,7 +468,7 @@ pipeline {
 
                                 echo "  Image tag: ${imageTag}"
 
-                                // Check if image already exists in Artifactory
+                                // Check if image already exists
                                 def imageExists = bat(
                                     script: "docker pull ${imageName} >nul 2>&1",
                                     returnStatus: true
@@ -441,9 +481,21 @@ pipeline {
                                     echo "  Image exists: NO"
                                 }
 
-                                // ===== IMPROVED DECISION LOGIC =====
-                                if (isMainBranch) {
-                                    // MAIN BRANCH: Build if files changed OR image doesn't exist (new version)
+                                // Decision logic with protection
+                                if (isProtected) {
+                                    if (params.OVERRIDE_PROTECTION) {
+                                        if (hasSignificantChanges || !imageExists) {
+                                            needsBuild = true
+                                            reason = "Protection overridden - ${hasSignificantChanges ? 'files changed' : 'image missing'}"
+                                        } else {
+                                            needsBuild = false
+                                            reason = "Protected version - no changes and image exists"
+                                        }
+                                    } else {
+                                        needsBuild = false
+                                        reason = "Protected production version - managed by deployment pipeline"
+                                    }
+                                } else if (isMainBranch) {
                                     if (hasSignificantChanges) {
                                         needsBuild = true
                                         reason = "Files changed (${significantChanges.size()} files modified)"
@@ -455,17 +507,16 @@ pipeline {
                                         reason = "No changes and image already exists"
                                     }
                                 } else {
-                                    // FEATURE BRANCH: Build if files changed AND image doesn't exist
-                                    // This prevents rebuilding the same commit multiple times
+                                    // Feature branch logic
                                     if (imageExists) {
                                         needsBuild = false
-                                        reason = "Image already exists for this commit - skipping rebuild"
+                                        reason = "Image already exists for this commit"
                                     } else if (hasSignificantChanges) {
                                         needsBuild = true
-                                        reason = "Files changed and image doesn't exist (${significantChanges.size()} files modified)"
+                                        reason = "Files changed and image doesn't exist"
                                     } else {
                                         needsBuild = false
-                                        reason = "No changes in ${app} - skipping build on feature branch"
+                                        reason = "No changes in ${app}"
                                     }
                                 }
                             }
@@ -474,6 +525,11 @@ pipeline {
                             if (needsBuild) {
                                 echo "  ✓ [BUILD NEEDED] ${app}: ${reason}"
                                 changedApps.add(app)
+                                
+                                // Store protection status for later use
+                                if (isProtected) {
+                                    env."${app}_IS_PROTECTED" = 'true'
+                                }
                             } else {
                                 echo "  ✗ [SKIP] ${app}: ${reason}"
                             }
@@ -513,6 +569,7 @@ pipeline {
 
                     def apps = env.APPS_TO_BUILD.split(',')
                     def buildJobs = [:]
+                    def productionVersions = groovy.json.JsonSlurper().parseText(env.PRODUCTION_VERSIONS)
 
                     apps.each { app ->
                         buildJobs[app] = {
@@ -520,18 +577,30 @@ pipeline {
 
                             def imageTag = ''
                             def version = ''
+                            def shouldTagLatest = false
 
                             if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
-                                // Main branch - use version from version.txt
                                 version = readFile("${app}/version.txt").trim()
                                 imageTag = version
+                                
+                                // Check if this is a protected version
+                                def isProtected = productionVersions.containsKey(app) && productionVersions[app] == version
+                                
+                                // Only tag as latest if:
+                                // 1. It's not a protected version, OR
+                                // 2. Protection is overridden
+                                shouldTagLatest = !isProtected || params.OVERRIDE_PROTECTION
+                                
+                                if (isProtected && !shouldTagLatest) {
+                                    echo "[PROTECTION] Will NOT update 'latest' tag for protected version ${version}"
+                                }
                             } else {
-                                // Feature branch - use branch-commit format
                                 def cleanBranchName = env.GIT_BRANCH_NAME
                                     .replaceAll('[^a-zA-Z0-9._-]', '-')
                                     .toLowerCase()
                                 imageTag = "${cleanBranchName}-${env.GIT_COMMIT_SHORT}"
-                                version = imageTag  // For dev builds, version is the same as tag
+                                version = imageTag
+                                shouldTagLatest = false  // Never tag latest for dev builds
                             }
 
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
@@ -543,7 +612,7 @@ pipeline {
                                 .take(100)
 
                             try {
-                                // Build Docker image with all required labels (Windows compatible)
+                                // Build Docker image with all required labels
                                 def buildCommand = """docker build -t ${imageName}:${imageTag} ^
                                     --label "jenkins.build.number=${BUILD_NUMBER}" ^
                                     --label "git.commit.id=${env.GIT_COMMIT_HASH}" ^
@@ -554,20 +623,21 @@ pipeline {
                                     --label "jenkins.job.name=${env.JOB_NAME}" ^
                                     --label "jenkins.build.url=${env.JENKINS_URL}job/${env.JOB_NAME}/${BUILD_NUMBER}/" ^
                                     --label "app.name=${app}" ^
+                                    --label "production.protected=${env."${app}_IS_PROTECTED" ?: 'false'}" ^
                                     -f ${app}/Dockerfile ${app}/"""
 
                                 bat buildCommand.replaceAll('\n', ' ')
 
-                                // For main branch, also tag as latest
-                                if (env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
-                                    bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
-                                    echo "[TAG] Also tagged as ${imageName}:latest"
-                                }
-
                                 echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag}"
 
-                                // Store tags for push stage
-                                writeFile file: "${app}_tags.txt", text: "${imageTag}${env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ? ',latest' : ''}"
+                                // Tag as latest only if appropriate
+                                if (shouldTagLatest && env.DEPLOY_PATH == env.DOCKER_LATEST_PATH) {
+                                    bat "docker tag ${imageName}:${imageTag} ${imageName}:latest"
+                                    echo "[TAG] Also tagged as ${imageName}:latest"
+                                    writeFile file: "${app}_tags.txt", text: "${imageTag},latest"
+                                } else {
+                                    writeFile file: "${app}_tags.txt", text: "${imageTag}"
+                                }
 
                             } catch (Exception e) {
                                 echo "[BUILD ERROR] ${app}: ${e.message}"
@@ -596,6 +666,7 @@ pipeline {
                     echo "========================================="
 
                     def apps = env.APPS_TO_BUILD.split(',')
+                    def productionVersions = groovy.json.JsonSlurper().parseText(env.PRODUCTION_VERSIONS)
 
                     withCredentials([usernamePassword(
                         credentialsId: 'artifactory-credentials',
@@ -610,11 +681,19 @@ pipeline {
                             pushJobs[app] = {
                                 def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
                                 def tags = readFile("${app}_tags.txt").trim().split(',')
+                                
+                                // Check protection status
+                                def version = readFile("${app}/version.txt").trim()
+                                def isProtected = productionVersions.containsKey(app) && productionVersions[app] == version
 
                                 tags.each { tag ->
                                     try {
-                                        bat "docker push ${imageName}:${tag}"
-                                        echo "[PUSH SUCCESS] ${app}: ${imageName}:${tag}"
+                                        if (tag == 'latest' && isProtected && !params.OVERRIDE_PROTECTION) {
+                                            echo "[SKIP PUSH] Not pushing 'latest' tag for protected version"
+                                        } else {
+                                            bat "docker push ${imageName}:${tag}"
+                                            echo "[PUSH SUCCESS] ${app}: ${imageName}:${tag}"
+                                        }
                                     } catch (Exception e) {
                                         echo "[PUSH ERROR] ${app}:${tag}: ${e.message}"
                                         throw e
@@ -622,7 +701,7 @@ pipeline {
                                 }
 
                                 // Create and upload build manifest
-                                createBuildManifest(app, tags[0])
+                                createBuildManifest(app, tags[0], isProtected)
 
                                 env."${app}_PUSHED_TAGS" = tags.join(',')
                             }
@@ -651,13 +730,10 @@ pipeline {
                     echo "Build #: ${env.BUILD_NUMBER}"
                     echo "Deploy Path: ${env.DEPLOY_PATH}"
 
+                    def productionVersions = groovy.json.JsonSlurper().parseText(env.PRODUCTION_VERSIONS)
+
                     if (env.NO_APPS == 'true') {
                         echo "\n[STATUS] No applications found"
-                        echo "Make sure you have application folders with:"
-                        echo "  - Dockerfile"
-                        echo "  - requirements.txt"
-                        echo "  - README.md"
-                        echo "  - version.txt"
                     } else if (env.VALIDATION_FAILED == 'true') {
                         echo "\n[STATUS] Validation failed"
                     } else if (env.HAS_CHANGES == 'true') {
@@ -665,9 +741,16 @@ pipeline {
                         def apps = env.APPS_TO_BUILD.split(',')
                         apps.each { app ->
                             def pushedTags = env."${app}_PUSHED_TAGS"
-                            echo "\n  ${app}:"
+                            def version = readFile("${app}/version.txt").trim()
+                            def isProtected = productionVersions.containsKey(app) && productionVersions[app] == version
+                            
+                            echo "\n  ${app}${isProtected ? ' 🔒 (PROTECTED)' : ''}:"
                             pushedTags.split(',').each { tag ->
-                                echo "    • ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag}"
+                                if (tag == 'latest' && isProtected && !params.OVERRIDE_PROTECTION) {
+                                    echo "    • ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag} (NOT UPDATED - PROTECTED)"
+                                } else {
+                                    echo "    • ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag}"
+                                }
                             }
                         }
 
@@ -678,6 +761,26 @@ pipeline {
                                 echo "  docker pull ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}:${tag}"
                             }
                         }
+                        
+                        // Show protection notice if any protected versions were involved
+                        def protectedApps = apps.findAll { app ->
+                            def version = readFile("${app}/version.txt").trim()
+                            productionVersions.containsKey(app) && productionVersions[app] == version
+                        }
+                        
+                        if (protectedApps.size() > 0) {
+                            echo "\n>>> PROTECTION NOTICE:"
+                            echo "The following apps have protected production versions:"
+                            protectedApps.each { app ->
+                                echo "  • ${app}: ${productionVersions[app]}"
+                            }
+                            if (!params.OVERRIDE_PROTECTION) {
+                                echo "  'latest' tags were NOT updated for these versions."
+                                echo "  Use Jenkinsfile.deploy to manage production 'latest' tags."
+                            } else {
+                                echo "  ⚠️ Protection was OVERRIDDEN - 'latest' tags were updated."
+                            }
+                        }
                     } else {
                         echo "\n[STATUS] No changes detected"
                     }
@@ -686,7 +789,8 @@ pipeline {
 
                     // Update build description
                     if (env.HAS_CHANGES == 'true') {
-                        currentBuild.description = "${env.DEPLOY_PATH} | ${env.GIT_BRANCH_NAME} | ${env.APPS_TO_BUILD}"
+                        def protectionStatus = params.OVERRIDE_PROTECTION ? " [OVERRIDE]" : ""
+                        currentBuild.description = "${env.DEPLOY_PATH} | ${env.GIT_BRANCH_NAME} | ${env.APPS_TO_BUILD}${protectionStatus}"
                     } else if (env.NO_APPS == 'true') {
                         currentBuild.description = "No apps found | ${env.GIT_BRANCH_NAME}"
                     } else {
@@ -703,7 +807,7 @@ pipeline {
                 echo "[CLEANUP] Starting post-build cleanup..."
 
                 try {
-                    // Remove temporary files (Windows)
+                    // Remove temporary files
                     bat "del /Q *_tags.txt 2>nul || exit 0"
 
                     // Clean up Docker images
@@ -711,8 +815,6 @@ pipeline {
                         def apps = env.APPS_TO_BUILD.split(',')
                         apps.each { app ->
                             def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${app}"
-
-                            // Remove all tags for this app (Windows)
                             bat """
                                 for /f "tokens=*" %%i in ('docker images ${imageName} -q 2^>nul') do docker rmi -f %%i 2>nul || exit 0
                             """
@@ -740,6 +842,10 @@ pipeline {
                 if (env.HAS_CHANGES == 'true') {
                     def apps = env.APPS_TO_BUILD?.split(',') ?: []
                     details = "Built ${apps.size()} app(s): ${apps.join(', ')}"
+                    
+                    if (params.OVERRIDE_PROTECTION) {
+                        details += " (PROTECTION OVERRIDDEN)"
+                    }
                 } else {
                     details = "No changes detected"
                 }
@@ -770,78 +876,7 @@ pipeline {
 // HELPER FUNCTIONS
 // ================================================================================
 
-// Robust HTTP call with retry logic and proper error handling
-def makeHttpCall(url, method = 'GET', maxRetries = 3, retryDelay = 5) {
-    def attempt = 0
-    def lastError = null
-
-    while (attempt < maxRetries) {
-        attempt++
-        try {
-            echo "    🌐 HTTP ${method} attempt ${attempt}/${maxRetries}: ${url}"
-
-            def curlCommand = method == 'DELETE' ?
-                "@curl -s -w \"HTTPSTATUS:%{http_code}\" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% -X ${method} \"${url}\"" :
-                "@curl -s -w \"HTTPSTATUS:%{http_code}\" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \"${url}\""
-
-            def response = bat(
-                script: curlCommand,
-                returnStdout: true
-            ).trim()
-
-            def httpStatus = response.contains('HTTPSTATUS:') ?
-                response.split('HTTPSTATUS:')[1] : '000'
-            def responseBody = response.contains('HTTPSTATUS:') ?
-                response.split('HTTPSTATUS:')[0] : response
-
-            // Check if this is a successful response
-            if (httpStatus.startsWith('2') || httpStatus == '404') {
-                echo "    ✅ HTTP ${method} success: ${httpStatus}"
-                return [
-                    success: true,
-                    httpStatus: httpStatus,
-                    response: responseBody,
-                    attempt: attempt
-                ]
-            } else if (httpStatus.startsWith('5') && attempt < maxRetries) {
-                // Server error - retry
-                echo "    ⚠ HTTP ${method} server error: ${httpStatus} - retrying in ${retryDelay}s"
-                sleep(retryDelay)
-                lastError = "HTTP ${httpStatus}: ${responseBody}"
-                continue
-            } else {
-                // Client error or final attempt - don't retry
-                echo "    ❌ HTTP ${method} failed: ${httpStatus}"
-                return [
-                    success: false,
-                    httpStatus: httpStatus,
-                    response: responseBody,
-                    attempt: attempt,
-                    error: "HTTP ${httpStatus}: ${responseBody}"
-                ]
-            }
-        } catch (Exception e) {
-            lastError = e.message
-            echo "    ❌ HTTP ${method} exception on attempt ${attempt}: ${e.message}"
-
-            if (attempt < maxRetries) {
-                echo "    ⏳ Retrying in ${retryDelay} seconds..."
-                sleep(retryDelay)
-            }
-        }
-    }
-
-    // All attempts failed
-    return [
-        success: false,
-        httpStatus: '000',
-        response: '',
-        attempt: attempt,
-        error: "All ${maxRetries} attempts failed. Last error: ${lastError}"
-    ]
-}
-
-// Send notifications (Slack, email, etc.)
+// Send notifications
 def sendNotification(status, message, details = '') {
     try {
         def color = status == 'SUCCESS' ? 'good' : (status == 'FAILURE' ? 'danger' : 'warning')
@@ -859,7 +894,6 @@ ${details ? "*Details:* ${details}" : ""}
 *Build URL:* ${buildUrl}
         """.trim()
 
-        // Send Slack notification if webhook URL is provided
         if (params.SLACK_WEBHOOK_URL && params.SLACK_WEBHOOK_URL.trim()) {
             echo "📢 Sending Slack notification: ${status}"
 
@@ -877,7 +911,6 @@ ${details ? "*Details:* ${details}" : ""}
             """
         }
 
-        // Log notification for debugging
         echo "📢 Notification sent: ${status} - ${message}"
 
     } catch (Exception e) {
@@ -885,7 +918,7 @@ ${details ? "*Details:* ${details}" : ""}
     }
 }
 
-// Enhanced change detection function with multiple strategies
+// Enhanced change detection function
 def checkAppChangedFiles(appDir) {
     try {
         def changedFiles = []
@@ -893,7 +926,7 @@ def checkAppChangedFiles(appDir) {
 
         echo "    🔍 Detecting changes for ${appDir}..."
 
-        // Method 1: Jenkins changeset information (most reliable for webhooks)
+        // Method 1: Jenkins changeset information
         if (currentBuild.changeSets && currentBuild.changeSets.size() > 0) {
             echo "    📋 Using Jenkins changeset information"
             changeDetectionMethod = "jenkins-changeset"
@@ -915,10 +948,9 @@ def checkAppChangedFiles(appDir) {
             }
         }
 
-        // Method 2: Git diff with improved commit detection
+        // Method 2: Git diff
         def compareCommit = env.GIT_PREVIOUS_COMMIT
         if (!compareCommit || compareCommit == "") {
-            // Try to get the previous commit from the same branch
             try {
                 compareCommit = bat(
                     script: "@git rev-parse HEAD~1 2>nul || echo \"\"",
@@ -957,22 +989,18 @@ def checkAppChangedFiles(appDir) {
             }
         }
 
-        // Method 3: Check if this is a completely new app (no previous builds)
-        echo "    🆕 First build or no previous commit - checking if app exists in registry"
+        echo "    🆕 First build or no previous commit"
         changeDetectionMethod = "first-build"
-
-        // Return empty files but indicate this is a first build
         return [files: [], method: changeDetectionMethod, firstBuild: true]
 
     } catch (Exception e) {
         echo "    ❌ Error detecting changes: ${e.message}"
-        // Return safe default - empty files, let image existence check decide
         return [files: [], method: "error", error: e.message]
     }
 }
 
-// Create and upload build manifest (Windows compatible)
-def createBuildManifest(appName, version) {
+// Create and upload build manifest with protection status
+def createBuildManifest(appName, version, isProtected = false) {
     def manifestPath = env.DEPLOY_PATH == env.DOCKER_LATEST_PATH ?
         env.BUILD_MANIFESTS_PATH : env.TEMP_BUILDS_PATH
 
@@ -985,7 +1013,9 @@ def createBuildManifest(appName, version) {
         git_branch: env.GIT_BRANCH_NAME,
         git_author: env.GIT_AUTHOR,
         jenkins_job: env.JOB_NAME,
-        docker_image: "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${appName}:${version}"
+        docker_image: "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DEPLOY_PATH}/${appName}:${version}",
+        production_protected: isProtected,
+        protection_overridden: isProtected && params.OVERRIDE_PROTECTION
     ]
 
     def manifestJson = groovy.json.JsonOutput.toJson(manifest)
@@ -993,7 +1023,6 @@ def createBuildManifest(appName, version) {
 
     writeFile file: manifestFile, text: groovy.json.JsonOutput.prettyPrint(manifestJson)
 
-    // Upload manifest to Artifactory (Windows curl)
     withCredentials([usernamePassword(
         credentialsId: 'artifactory-credentials',
         usernameVariable: 'ARTIFACTORY_USER',
@@ -1006,5 +1035,5 @@ def createBuildManifest(appName, version) {
         """
     }
 
-    echo "[MANIFEST] Uploaded ${manifestPath}/${appName}/${version}.json"
+    echo "[MANIFEST] Uploaded ${manifestPath}/${appName}/${version}.json (protected: ${isProtected})"
 }
