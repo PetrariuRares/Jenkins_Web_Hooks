@@ -186,46 +186,44 @@ pipeline {
             steps {
                 script {
                     echo "🔍 Verifying all production images exist in Artifactory..."
-                    
+
                     def deployConfig = readYaml file: 'deployment-versions.yaml'
                     def missingImages = []
                     def foundImages = []
-                    def imageManifests = [:]
-                    
-                    deployConfig.production.each { app, version ->
-                        echo "\n  Checking ${app}:${version}..."
-                        
-                        // Check if image exists and get its manifest
-                        def checkUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_LATEST_PATH}/${app}/manifests/${version}"
-                        
-                        def response = bat(
-                            script: """
-                                @curl -s -u %ARTIFACTORY_CREDS_USR%:%ARTIFACTORY_CREDS_PSW% ^
-                                     -X GET "${checkUrl}" ^
-                                     -w "\\nHTTPSTATUS:%%{http_code}"
-                            """,
-                            returnStdout: true
-                        ).trim()
-                        
-                        def httpStatus = response.contains('HTTPSTATUS:') ? 
-                            response.split('HTTPSTATUS:')[1] : '000'
-                        
-                        if (httpStatus == "200") {
-                            echo "    ✅ Found: ${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}:${version}"
-                            foundImages.add("${app}:${version}")
-                            
-                            // Extract and verify image labels
-                            if (response.contains('"config"')) {
-                                def configMatch = response =~ /"config":\s*\{[^}]*"digest":\s*"([^"]+)"/
-                                if (configMatch) {
-                                    imageManifests[app] = configMatch[0][1]
-                                    echo "    📋 Manifest digest: ${configMatch[0][1]}"
-                                }
+
+                    // Login to Docker registry first
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        bat "echo %ARTIFACTORY_PASS% | docker login %DOCKER_REGISTRY% -u %ARTIFACTORY_USER% --password-stdin"
+
+                        deployConfig.production.each { app, version ->
+                            echo "\n  Checking ${app}:${version}..."
+
+                            def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}:${version}"
+                            echo "    Image: ${imageName}"
+
+                            // Use docker pull to check if image exists (same method as Jenkinsfile-NoCleanup)
+                            def imageExists = bat(
+                                script: "docker pull ${imageName} >nul 2>&1",
+                                returnStatus: true
+                            ) == 0
+
+                            if (imageExists) {
+                                echo "    ✅ Found: ${imageName}"
+                                foundImages.add("${app}:${version}")
+
+                                // Clean up the pulled image to save space
+                                bat "docker rmi ${imageName} 2>nul || exit 0"
+                            } else {
+                                echo "    ❌ NOT FOUND: ${imageName}"
+                                missingImages.add("${app}:${version}")
                             }
-                        } else {
-                            echo "    ❌ NOT FOUND: ${app}:${version} (HTTP ${httpStatus})"
-                            missingImages.add("${app}:${version}")
                         }
+
+                        bat "docker logout ${env.DOCKER_REGISTRY}"
                     }
                     
                     if (missingImages.size() > 0) {
