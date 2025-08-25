@@ -9,9 +9,8 @@
 # Only Jenkinsfile.deploy can update 'latest' tags for production versions
 # ================================================================================
 production:
-  app1: "1.2.7"
-  app2: "1.1.0"
-  app3-ml-engine: "1.0.0"
+  app1: "1.3.0"
+  app2: "1.3.1"
   # Add more applications as needed:
   # app-name: "X.Y.Z"
 
