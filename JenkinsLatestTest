@@ -1,0 +1,314 @@
+// Simple Jenkins Job Script to Test Latest Tag Management
+// This script helps verify that Jenkinsfile-NoCleanup doesn't touch 'latest' tags
+// and shows what images are currently tagged as 'latest'
+
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['CHECK_LATEST_TAGS', 'SIMULATE_COMMIT_BUILD', 'SIMULATE_DEPLOY', 'CLEANUP_TEST_IMAGES'],
+            description: 'What action to perform'
+        )
+        string(
+            name: 'TEST_APP',
+            defaultValue: 'app1',
+            description: 'Application to test (must have version.txt)'
+        )
+        string(
+            name: 'TEST_VERSION',
+            defaultValue: '',
+            description: 'Version to test (leave empty to read from version.txt)'
+        )
+        booleanParam(
+            name: 'VERBOSE_OUTPUT',
+            defaultValue: true,
+            description: 'Show detailed output'
+        )
+    }
+    
+    environment {
+        // Load from deployment-versions.yaml or use defaults
+        DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
+        DOCKER_REPO = 'dockertest-docker'
+        DOCKER_LATEST_PATH = 'docker-latest'
+        ARTIFACTORY_CREDS = credentials('artifactory-credentials')
+    }
+    
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    echo "========================================="
+                    echo ">>> LATEST TAG TESTING UTILITY"
+                    echo "========================================="
+                    echo "Action: ${params.ACTION}"
+                    echo "Test App: ${params.TEST_APP}"
+                    echo "Test Version: ${params.TEST_VERSION ?: 'auto-detect'}"
+                    echo "Verbose: ${params.VERBOSE_OUTPUT}"
+                    echo "========================================="
+                    
+                    // Load config if available
+                    if (fileExists('deployment-versions.yaml')) {
+                        def deployConfig = readYaml file: 'deployment-versions.yaml'
+                        env.DOCKER_REGISTRY = deployConfig.config.docker_registry
+                        env.DOCKER_REPO = deployConfig.config.docker_repo
+                        env.DOCKER_LATEST_PATH = deployConfig.config.docker_latest_path
+                        echo "✅ Loaded config from deployment-versions.yaml"
+                    } else {
+                        echo "⚠️ Using default config (deployment-versions.yaml not found)"
+                    }
+                    
+                    // Get test version
+                    if (params.TEST_VERSION) {
+                        env.TEST_VERSION = params.TEST_VERSION
+                    } else if (fileExists("${params.TEST_APP}/version.txt")) {
+                        env.TEST_VERSION = readFile("${params.TEST_APP}/version.txt").trim()
+                    } else {
+                        env.TEST_VERSION = "1.0.0"
+                        echo "⚠️ No version.txt found, using default: ${env.TEST_VERSION}"
+                    }
+                    
+                    echo "Using version: ${env.TEST_VERSION}"
+                }
+            }
+        }
+        
+        stage('Check Latest Tags') {
+            when {
+                expression { params.ACTION == 'CHECK_LATEST_TAGS' }
+            }
+            steps {
+                script {
+                    echo "🔍 Checking current 'latest' tags in Artifactory..."
+                    
+                    def apps = []
+                    if (fileExists('deployment-versions.yaml')) {
+                        def deployConfig = readYaml file: 'deployment-versions.yaml'
+                        apps = deployConfig.production.keySet().toList()
+                    } else {
+                        apps = [params.TEST_APP]
+                    }
+                    
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        
+                        apps.each { app ->
+                            echo "\n📋 Checking ${app}:latest..."
+                            
+                            def manifestUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_LATEST_PATH}/${app}/manifests/latest"
+                            
+                            def response = bat(
+                                script: """
+                                    @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                         -X GET "${manifestUrl}" ^
+                                         -H "Accept: application/vnd.docker.distribution.manifest.v2+json" ^
+                                         -w "\\nHTTPSTATUS:%%{http_code}"
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            
+                            def httpStatus = response.contains('HTTPSTATUS:') ? 
+                                response.split('HTTPSTATUS:')[1] : '000'
+                            
+                            if (httpStatus == "200") {
+                                echo "  ✅ ${app}:latest EXISTS"
+                                
+                                if (params.VERBOSE_OUTPUT) {
+                                    // Try to extract creation date from labels
+                                    if (response.contains('"config"')) {
+                                        def configMatch = response =~ /"config":\s*\{[^}]*"digest":\s*"([^"]+)"/
+                                        if (configMatch) {
+                                            echo "  📋 Manifest digest: ${configMatch[0][1]}"
+                                        }
+                                    }
+                                    
+                                    // Get image details
+                                    def imageUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_LATEST_PATH}/${app}/tags/list"
+                                    def tagsResponse = bat(
+                                        script: "@curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \"${imageUrl}\"",
+                                        returnStdout: true
+                                    ).trim()
+                                    
+                                    if (tagsResponse.contains('"tags"')) {
+                                        echo "  🏷️ Available tags: ${tagsResponse}"
+                                    }
+                                }
+                            } else if (httpStatus == "404") {
+                                echo "  ❌ ${app}:latest NOT FOUND"
+                            } else {
+                                echo "  ⚠️ ${app}:latest - HTTP ${httpStatus}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Simulate Commit Build') {
+            when {
+                expression { params.ACTION == 'SIMULATE_COMMIT_BUILD' }
+            }
+            steps {
+                script {
+                    echo "🔨 Simulating what Jenkinsfile-NoCleanup would do..."
+                    echo "This should NOT create or update any 'latest' tags"
+                    
+                    def app = params.TEST_APP
+                    def version = env.TEST_VERSION
+                    def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}"
+                    
+                    echo "\n>>> SIMULATION RESULTS:"
+                    echo "  App: ${app}"
+                    echo "  Version from version.txt: ${version}"
+                    echo "  Would build: ${imageName}:${version}"
+                    echo "  Would push: ${imageName}:${version}"
+                    echo "  Would NOT create: ${imageName}:latest"
+                    echo "  Would NOT push: ${imageName}:latest"
+                    
+                    echo "\n✅ EXPECTED BEHAVIOR:"
+                    echo "  - Only versioned tag gets created and pushed"
+                    echo "  - 'latest' tag remains unchanged"
+                    echo "  - Only Jenkinsfile.deploy can update 'latest'"
+                    
+                    // Check if latest would be affected
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        def manifestUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_LATEST_PATH}/${app}/manifests/latest"
+                        
+                        def beforeStatus = bat(
+                            script: """
+                                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                     -X GET "${manifestUrl}" ^
+                                     -w "HTTPSTATUS:%%{http_code}" ^
+                                     -o nul
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        def httpStatus = beforeStatus.contains('HTTPSTATUS:') ? 
+                            beforeStatus.split('HTTPSTATUS:')[1] : '000'
+                        
+                        echo "\n📊 CURRENT STATE:"
+                        if (httpStatus == "200") {
+                            echo "  ${app}:latest currently EXISTS"
+                            echo "  After commit build: ${app}:latest should remain UNCHANGED"
+                        } else {
+                            echo "  ${app}:latest currently DOES NOT EXIST"
+                            echo "  After commit build: ${app}:latest should remain NON-EXISTENT"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Simulate Deploy') {
+            when {
+                expression { params.ACTION == 'SIMULATE_DEPLOY' }
+            }
+            steps {
+                script {
+                    echo "🚀 Simulating what Jenkinsfile.deploy would do..."
+                    echo "This SHOULD update the 'latest' tag"
+                    
+                    def app = params.TEST_APP
+                    def version = env.TEST_VERSION
+                    def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}"
+                    
+                    echo "\n>>> SIMULATION RESULTS:"
+                    echo "  App: ${app}"
+                    echo "  Production version: ${version}"
+                    echo "  Would pull: ${imageName}:${version}"
+                    echo "  Would tag: ${imageName}:${version} as ${imageName}:latest"
+                    echo "  Would push: ${imageName}:latest"
+                    
+                    echo "\n✅ EXPECTED BEHAVIOR:"
+                    echo "  - Pull the specific production version"
+                    echo "  - Tag it as 'latest'"
+                    echo "  - Push the updated 'latest' tag"
+                    echo "  - This is the ONLY way 'latest' should be updated"
+                    
+                    // Check if the version exists
+                    withCredentials([usernamePassword(
+                        credentialsId: 'artifactory-credentials',
+                        usernameVariable: 'ARTIFACTORY_USER',
+                        passwordVariable: 'ARTIFACTORY_PASS'
+                    )]) {
+                        def versionUrl = "https://${env.DOCKER_REGISTRY}/artifactory/api/docker/${env.DOCKER_REPO}/v2/${env.DOCKER_LATEST_PATH}/${app}/manifests/${version}"
+                        
+                        def versionStatus = bat(
+                            script: """
+                                @curl -s -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% ^
+                                     -X GET "${versionUrl}" ^
+                                     -w "HTTPSTATUS:%%{http_code}" ^
+                                     -o nul
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        def httpStatus = versionStatus.contains('HTTPSTATUS:') ? 
+                            versionStatus.split('HTTPSTATUS:')[1] : '000'
+                        
+                        echo "\n📊 PREREQUISITE CHECK:"
+                        if (httpStatus == "200") {
+                            echo "  ✅ ${app}:${version} EXISTS - deployment would succeed"
+                        } else {
+                            echo "  ❌ ${app}:${version} NOT FOUND - deployment would fail"
+                            echo "     Need to run commit build first to create this version"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Cleanup Test Images') {
+            when {
+                expression { params.ACTION == 'CLEANUP_TEST_IMAGES' }
+            }
+            steps {
+                script {
+                    echo "🧹 Cleaning up any test images from local Docker..."
+                    
+                    def app = params.TEST_APP
+                    def imageName = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPO}/${env.DOCKER_LATEST_PATH}/${app}"
+                    
+                    try {
+                        bat """
+                            docker images ${imageName} -q 2>nul | for /f %%i in ('more') do docker rmi -f %%i 2>nul || exit 0
+                            docker system prune -f 2>nul || exit 0
+                        """
+                        echo "✅ Local cleanup completed"
+                    } catch (Exception e) {
+                        echo "⚠️ Cleanup completed with warnings: ${e.message}"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo "\n========================================="
+                echo ">>> TEST SUMMARY"
+                echo "========================================="
+                echo "Action performed: ${params.ACTION}"
+                echo "Test app: ${params.TEST_APP}"
+                echo "Test version: ${env.TEST_VERSION}"
+                
+                echo "\n>>> REMEMBER:"
+                echo "✅ Jenkinsfile-NoCleanup should ONLY create versioned tags"
+                echo "✅ Jenkinsfile.deploy should be the ONLY way to update 'latest'"
+                echo "✅ Check deployment-versions.yaml for production versions"
+                echo "========================================="
+            }
+        }
+    }
+}
