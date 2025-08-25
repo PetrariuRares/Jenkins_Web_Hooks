@@ -31,12 +31,13 @@ pipeline {
     }
     
     environment {
-        // These will be loaded from deployment-versions.yaml config section
-        DOCKER_REGISTRY = ''
-        DOCKER_REPO = ''
-        DOCKER_LATEST_PATH = ''
+        // Hardcoded configuration values for reliability
+        DOCKER_REGISTRY = 'trialqlk1tc.jfrog.io'
+        DOCKER_REPO = 'dockertest-docker'
+        DOCKER_LATEST_PATH = 'docker-latest'
+        BUILD_MANIFESTS_PATH = 'metadata/build-manifests'
         ARTIFACTORY_CREDS = credentials('artifactory-credentials')
-        
+
 
     }
     
@@ -135,12 +136,12 @@ pipeline {
         }
         
         // ================================================================================
-        // STAGE 3: Read and Validate Configuration
+        // STAGE 3: Read Production Versions
         // ================================================================================
-        stage('Read Configuration') {
+        stage('Read Production Versions') {
             steps {
                 script {
-                    echo "📖 Reading deployment-versions.yaml..."
+                    echo "📖 Reading production versions from deployment-versions.yaml..."
                     
                     if (!fileExists('deployment-versions.yaml')) {
                         error("❌ deployment-versions.yaml not found in repository root")
@@ -156,34 +157,11 @@ pipeline {
                         error("❌ No production versions defined in deployment-versions.yaml")
                     }
 
-                    if (!deployConfig.config) {
-                        error("❌ Config section missing in deployment-versions.yaml")
-                    }
-
-                    // Load config values using string access (more reliable in Jenkins)
-                    def config = deployConfig.config
-                    env.DOCKER_REGISTRY = config['docker_registry'] ?: 'trialqlk1tc.jfrog.io'
-                    env.DOCKER_REPO = config['docker_repo'] ?: 'dockertest-docker'
-                    env.DOCKER_LATEST_PATH = config['docker_latest_path'] ?: 'docker-latest'
-                    env.BUILD_MANIFESTS_PATH = config['build_manifests_path'] ?: 'metadata/build-manifests'
-
-                    // Double-check with explicit string conversion
-                    env.DOCKER_REGISTRY = env.DOCKER_REGISTRY.toString()
-                    env.DOCKER_REPO = env.DOCKER_REPO.toString()
-                    env.DOCKER_LATEST_PATH = env.DOCKER_LATEST_PATH.toString()
-                    env.BUILD_MANIFESTS_PATH = env.BUILD_MANIFESTS_PATH.toString()
-
-                    echo "\n>>> Configuration loaded:"
+                    echo "\n>>> Configuration (hardcoded in pipeline):"
                     echo "  Registry: ${env.DOCKER_REGISTRY}"
                     echo "  Repository: ${env.DOCKER_REPO}"
                     echo "  Path: ${env.DOCKER_LATEST_PATH}"
                     echo "  Manifests Path: ${env.BUILD_MANIFESTS_PATH}"
-
-                    // Debug: Show raw config
-                    if (params.VERBOSE_OUTPUT ?: false) {
-                        echo "\n>>> Debug - Raw config section:"
-                        echo "  ${deployConfig.config}"
-                    }
                     
                     echo "\n>>> Applications to deploy:"
                     deployConfig.production.each { app, version ->

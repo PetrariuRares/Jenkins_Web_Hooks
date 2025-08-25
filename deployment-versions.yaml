@@ -1,37 +1,15 @@
 # deployment-versions.yaml
 # This file controls production deployments and version management
-# Location: /deployment-versions.yaml (root of repository)
+# Only contains the versions to be deployed to production
+# Configuration is hardcoded in the Jenkinsfile.deploy for reliability
 
 # ================================================================================
 # PRODUCTION VERSIONS
-# These versions are currently deployed to production
-# The main Jenkinsfile will NOT update 'latest' tags for these versions
-# Only Jenkinsfile.deploy can update 'latest' tags for production versions
+# These are the versions that should be promoted to 'latest' tags
+# Only Jenkinsfile.deploy can update 'latest' tags for these versions
 # ================================================================================
 production:
   app1: "1.3.0"
   app2: "1.3.1"
   # Add more applications as needed:
   # app-name: "X.Y.Z"
-
-# ================================================================================
-# PIPELINE CONFIGURATION
-# Shared configuration used by both Jenkinsfile and Jenkinsfile.deploy
-# ================================================================================
-config:
-  # Artifactory settings
-  docker_registry: "trialqlk1tc.jfrog.io"
-  docker_repo: "dockertest-docker"
-  
-  # Docker repository paths
-  docker_latest_path: "docker-latest"      # Path for production/stable images
-  docker_dev_path: "docker-dev"            # Path for development/feature branch images
-  
-  # Metadata storage paths in Artifactory
-  metadata_path: "metadata"
-  build_manifests_path: "metadata/build-manifests"   # Production build manifests
-  temp_builds_path: "metadata/temporary-builds"      # Dev/feature build manifests
-  
-  # Cleanup and retention settings
-  dev_retention_days: 14                   # Days to keep dev images before cleanup
-  latest_versions_to_keep: 10              # Number of versions to keep per app in docker-latest
