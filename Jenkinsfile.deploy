@@ -513,16 +513,24 @@ services:
                 Latest tags have been updated successfully.
                 """
                 
-                // Log deployment success details
-                def deployConfig = readYaml file: 'deployment-versions.yaml'
-                def appVersions = deployConfig.production.collect { k, v -> "${k}:${v}" }.join(', ')
+                // Log deployment success details using stored environment variable
+                def appVersions = ""
+                try {
+                    if (env.DEPLOY_CONFIG_JSON) {
+                        def deployConfig = readJSON text: env.DEPLOY_CONFIG_JSON
+                        appVersions = deployConfig.collect { k, v -> "${k}:${v}" }.join(', ')
+                    }
+                } catch (Exception e) {
+                    echo "Could not parse deployment config: ${e.message}"
+                    appVersions = "See deployment record for details"
+                }
                 
                 echo """
                 [DEPLOYMENT SUCCESS]
                 Build: #${env.BUILD_NUMBER}
                 Deployed By: ${env.BUILD_USER ?: 'Jenkins'}
                 Applications: ${appVersions}
-                Commit: ${env.GIT_COMMIT_SHORT}
+                Commit: ${env.GIT_COMMIT_SHORT ?: 'unknown'}
                 """
             }
         }
