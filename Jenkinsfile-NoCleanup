@@ -17,16 +17,6 @@ pipeline {
             defaultValue: false,
             description: 'Force rebuild even if no changes detected'
         )
-        string(
-            name: 'SLACK_WEBHOOK_URL',
-            defaultValue: '',
-            description: 'Slack webhook URL for notifications (optional)'
-        )
-        booleanParam(
-            name: 'NOTIFY_ON_SUCCESS',
-            defaultValue: false,
-            description: 'Send notifications on successful builds (default: failures only)'
-        )
     }
 
     triggers {
@@ -538,7 +528,7 @@ pipeline {
                                     --label "app.name=${app}" ^
                                     -f ${app}/Dockerfile ${app}/"""
 
-                                bat buildCommand.replaceAll('\n', ' ')
+                                    bat buildCommand.replaceAll('\n', ' ')
 
                                     echo "[BUILD SUCCESS] ${app}: ${imageName}:${imageTag}"
 
@@ -730,9 +720,7 @@ pipeline {
                     details = "No changes detected"
                 }
 
-                if (params.NOTIFY_ON_SUCCESS) {
-                    sendNotification('SUCCESS', successMessage, details)
-                }
+                echo "[BUILD] ${successMessage} - ${details}"
             }
         }
         failure {
@@ -746,7 +734,7 @@ pipeline {
                     failureReason = "No applications found"
                 }
 
-                sendNotification('FAILURE', failureReason, "Check build logs for details")
+                echo "[BUILD] ${failureReason} - Check build logs for details"
             }
         }
     }
@@ -755,121 +743,6 @@ pipeline {
 // ================================================================================
 // HELPER FUNCTIONS
 // ================================================================================
-
-// Robust HTTP call with retry logic and proper error handling
-def makeHttpCall(url, method = 'GET', maxRetries = 3, retryDelay = 5) {
-    def attempt = 0
-    def lastError = null
-
-    while (attempt < maxRetries) {
-        attempt++
-        try {
-            echo "    🌐 HTTP ${method} attempt ${attempt}/${maxRetries}: ${url}"
-
-            def curlCommand = method == 'DELETE' ?
-                "@curl -s -w \"HTTPSTATUS:%{http_code}\" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% -X ${method} \"${url}\"" :
-                "@curl -s -w \"HTTPSTATUS:%{http_code}\" -u %ARTIFACTORY_USER%:%ARTIFACTORY_PASS% \"${url}\""
-
-            def response = bat(
-                script: curlCommand,
-                returnStdout: true
-            ).trim()
-
-            def httpStatus = response.contains('HTTPSTATUS:') ?
-                response.split('HTTPSTATUS:')[1] : '000'
-            def responseBody = response.contains('HTTPSTATUS:') ?
-                response.split('HTTPSTATUS:')[0] : response
-
-            // Check if this is a successful response
-            if (httpStatus.startsWith('2') || httpStatus == '404') {
-                echo "    ✅ HTTP ${method} success: ${httpStatus}"
-                return [
-                    success: true,
-                    httpStatus: httpStatus,
-                    response: responseBody,
-                    attempt: attempt
-                ]
-            } else if (httpStatus.startsWith('5') && attempt < maxRetries) {
-                // Server error - retry
-                echo "    ⚠ HTTP ${method} server error: ${httpStatus} - retrying in ${retryDelay}s"
-                sleep(retryDelay)
-                lastError = "HTTP ${httpStatus}: ${responseBody}"
-                continue
-            } else {
-                // Client error or final attempt - don't retry
-                echo "    ❌ HTTP ${method} failed: ${httpStatus}"
-                return [
-                    success: false,
-                    httpStatus: httpStatus,
-                    response: responseBody,
-                    attempt: attempt,
-                    error: "HTTP ${httpStatus}: ${responseBody}"
-                ]
-            }
-        } catch (Exception e) {
-            lastError = e.message
-            echo "    ❌ HTTP ${method} exception on attempt ${attempt}: ${e.message}"
-
-            if (attempt < maxRetries) {
-                echo "    ⏳ Retrying in ${retryDelay} seconds..."
-                sleep(retryDelay)
-            }
-        }
-    }
-
-    // All attempts failed
-    return [
-        success: false,
-        httpStatus: '000',
-        response: '',
-        attempt: attempt,
-        error: "All ${maxRetries} attempts failed. Last error: ${lastError}"
-    ]
-}
-
-// Send notifications (Slack, email, etc.)
-def sendNotification(status, message, details = '') {
-    try {
-        def color = status == 'SUCCESS' ? 'good' : (status == 'FAILURE' ? 'danger' : 'warning')
-        def emoji = status == 'SUCCESS' ? '✅' : (status == 'FAILURE' ? '❌' : '⚠️')
-
-        def buildUrl = "${env.JENKINS_URL}job/${env.JOB_NAME}/${BUILD_NUMBER}/"
-        def gitInfo = "${env.GIT_BRANCH_NAME} (${env.GIT_COMMIT_SHORT})"
-
-        def slackMessage = """
-${emoji} *Jenkins Build ${status}*
-*Job:* ${env.JOB_NAME} #${BUILD_NUMBER}
-*Branch:* ${gitInfo}
-*Message:* ${message}
-${details ? "*Details:* ${details}" : ""}
-*Build URL:* ${buildUrl}
-        """.trim()
-
-        // Send Slack notification if webhook URL is provided
-        if (params.SLACK_WEBHOOK_URL && params.SLACK_WEBHOOK_URL.trim()) {
-            echo "📢 Sending Slack notification: ${status}"
-
-            def payload = groovy.json.JsonOutput.toJson([
-                text: slackMessage,
-                color: color,
-                username: "Jenkins CI/CD",
-                icon_emoji: ":jenkins:"
-            ])
-
-            bat """
-                @curl -s -X POST -H "Content-type: application/json" ^
-                     --data "${payload.replace('"', '\\"')}" ^
-                     "${params.SLACK_WEBHOOK_URL}" || echo "Slack notification failed"
-            """
-        }
-
-        // Log notification for debugging
-        echo "📢 Notification sent: ${status} - ${message}"
-
-    } catch (Exception e) {
-        echo "⚠️ Failed to send notification: ${e.message}"
-    }
-}
 
 // Enhanced change detection function with multiple strategies
 def checkAppChangedFiles(appDir) {
