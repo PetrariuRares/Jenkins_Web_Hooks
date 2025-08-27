@@ -15,12 +15,6 @@ pipeline {
             defaultValue: true,
             description: 'Update the "latest" tags to point to production versions'
         )
-
-        string(
-            name: 'SLACK_WEBHOOK_URL',
-            defaultValue: '',
-            description: 'Slack webhook URL for deployment notifications'
-        )
     }
     
     options {
@@ -37,8 +31,6 @@ pipeline {
         DOCKER_LATEST_PATH = 'docker-latest'
         BUILD_MANIFESTS_PATH = 'metadata/build-manifests'
         ARTIFACTORY_CREDS = credentials('artifactory-credentials')
-
-
     }
     
     // NO TRIGGERS - This pipeline is manual only
@@ -149,8 +141,6 @@ pipeline {
                     
                     // Read the YAML file
                     def deployConfig = readYaml file: 'deployment-versions.yaml'
-
-
 
                     // Validate structure
                     if (!deployConfig.production || deployConfig.production.size() == 0) {
@@ -510,7 +500,6 @@ services:
                 }
             }
         }
-
     }
     
     post {
@@ -524,32 +513,17 @@ services:
                 Latest tags have been updated successfully.
                 """
                 
-                // Send success notification
-                if (params.SLACK_WEBHOOK_URL && params.SLACK_WEBHOOK_URL.trim()) {
-                    def deployConfig = readYaml file: 'deployment-versions.yaml'
-                    def appVersions = deployConfig.production.collect { k, v -> "${k}:${v}" }.join(', ')
-                    
-                    def payload = groovy.json.JsonOutput.toJson([
-                        text: "✅ *Production Deployment Successful*",
-                        attachments: [[
-                            color: "good",
-                            fields: [
-                                [title: "Build", value: "#${env.BUILD_NUMBER}", short: true],
-                                [title: "Deployed By", value: env.BUILD_USER ?: 'Jenkins', short: true],
-                                [title: "Applications", value: appVersions, short: false],
-                                [title: "Commit", value: env.GIT_COMMIT_SHORT, short: true]
-                            ],
-                            footer: "Jenkins CI/CD",
-                            ts: System.currentTimeMillis() / 1000
-                        ]]
-                    ])
-                    
-                    bat """
-                        @curl -s -X POST -H "Content-type: application/json" ^
-                             --data "${payload.replace('"', '\\"')}" ^
-                             "${params.SLACK_WEBHOOK_URL}"
-                    """
-                }
+                // Log deployment success details
+                def deployConfig = readYaml file: 'deployment-versions.yaml'
+                def appVersions = deployConfig.production.collect { k, v -> "${k}:${v}" }.join(', ')
+                
+                echo """
+                [DEPLOYMENT SUCCESS]
+                Build: #${env.BUILD_NUMBER}
+                Deployed By: ${env.BUILD_USER ?: 'Jenkins'}
+                Applications: ${appVersions}
+                Commit: ${env.GIT_COMMIT_SHORT}
+                """
             }
         }
         
@@ -564,28 +538,12 @@ services:
                 MANUAL INTERVENTION MAY BE REQUIRED
                 """
                 
-                // Send failure notification
-                if (params.SLACK_WEBHOOK_URL && params.SLACK_WEBHOOK_URL.trim()) {
-                    def payload = groovy.json.JsonOutput.toJson([
-                        text: "❌ *Production Deployment FAILED*",
-                        attachments: [[
-                            color: "danger",
-                            fields: [
-                                [title: "Build", value: "#${env.BUILD_NUMBER}", short: true],
-                                [title: "Failed By", value: env.BUILD_USER ?: 'Jenkins', short: true],
-                                [title: "Status", value: "FAILED - Manual intervention required", short: false]
-                            ],
-                            footer: "Jenkins CI/CD",
-                            ts: System.currentTimeMillis() / 1000
-                        ]]
-                    ])
-                    
-                    bat """
-                        @curl -s -X POST -H "Content-type: application/json" ^
-                             --data "${payload.replace('"', '\\"')}" ^
-                             "${params.SLACK_WEBHOOK_URL}"
-                    """
-                }
+                echo """
+                [DEPLOYMENT FAILURE]
+                Build: #${env.BUILD_NUMBER}
+                Failed By: ${env.BUILD_USER ?: 'Jenkins'}
+                Status: FAILED - Manual intervention required
+                """
             }
         }
         
